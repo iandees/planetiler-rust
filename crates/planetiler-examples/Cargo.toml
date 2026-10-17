@@ -1,0 +1,13 @@
+[package]
+name = "planetiler-examples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+planetiler-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+indexmap.workspace = true
+geo.workspace = true
+geo-types.workspace = true

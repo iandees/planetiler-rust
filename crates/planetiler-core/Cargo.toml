@@ -1,0 +1,55 @@
+[package]
+name = "planetiler-core"
+description = "Rust port of Planetiler: flexible tool to build planet-scale vector tilesets from OpenStreetMap data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+geo.workspace = true
+geo-types.workspace = true
+rstar.workspace = true
+i_overlay.workspace = true
+wkb.workspace = true
+proj4rs.workspace = true
+prost.workspace = true
+flate2.workspace = true
+zstd.workspace = true
+brotli.workspace = true
+rusqlite.workspace = true
+rmp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+shapefile.workspace = true
+parquet.workspace = true
+arrow.workspace = true
+csv.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+memmap2.workspace = true
+num_cpus.workspace = true
+libc.workspace = true
+sysinfo.workspace = true
+indexmap.workspace = true
+hashbrown.workspace = true
+ahash.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+chrono.workspace = true
+ureq.workspace = true
+tempfile.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+approx.workspace = true
+tempfile.workspace = true

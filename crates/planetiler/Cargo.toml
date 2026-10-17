@@ -1,0 +1,13 @@
+[package]
+name = "planetiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+planetiler-core.workspace = true
+planetiler-custommap.workspace = true
+planetiler-openmaptiles.workspace = true
+planetiler-examples.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
