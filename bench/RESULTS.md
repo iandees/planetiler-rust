@@ -7,8 +7,14 @@ Numbers are the best of the repeated runs each benchmark prints.
 
 | Benchmark | Java | Rust | Rust/Java |
 |-----------|------|------|-----------|
-| BenchmarkTileCoord (z0-z14 encode/decode) | 898M/s | | |
-| BenchmarkVarInt (100M varints) | 181M/s | | |
+| BenchmarkTileCoord (z0-z14 encode/decode) | 835M/s | 1.3B/s | 1.56x |
+| BenchmarkVarInt (100M varints) | 184M/s | 239M/s | 1.30x |
+
+Notes:
+- TileCoord: the first straight port ran at 604M/s (0.72x Java). Replacing the zoom-start lookup table + linear scan
+  with the closed form `(4^z - 1) / 3` / `leading_zeros`, and `/`,`%` by a power of two with shifts/masks, gave 1.3B/s.
+  (The same change would likely help Java too; this compares the ports as they exist.)
+- Run back-to-back under the same background load (~16).
 
 ## End-to-end
 

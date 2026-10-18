@@ -3,7 +3,6 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::LazyLock;
 
 use geo_types::Coord;
 
@@ -13,27 +12,19 @@ use crate::geo::geo_utils;
 use crate::geo::tile_extents::TileExtents;
 use crate::util::hilbert;
 
-static ZOOM_START_INDEX: LazyLock<[u64; MAX_MAXZOOM as usize + 1]> = LazyLock::new(|| {
-    let mut result = [0u64; MAX_MAXZOOM as usize + 1];
-    let mut idx = 0u64;
-    for (z, slot) in result.iter_mut().enumerate() {
-        *slot = idx;
-        idx += 1u64 << (2 * z);
-    }
-    result
-});
-
-fn start_index_for_zoom(z: u32) -> u64 {
-    ZOOM_START_INDEX[z as usize]
+/// Index of the first tile at zoom `z`: `sum(4^i for i < z) = (4^z - 1) / 3`.
+#[inline]
+const fn start_index_for_zoom(z: u32) -> u64 {
+    ((1u64 << (2 * z)) - 1) / 3
 }
 
+/// Inverse of [`start_index_for_zoom`]: the zoom level containing tile index `idx`.
+#[inline]
 fn zoom_for_index(idx: u64) -> u32 {
-    for z in (0..=MAX_MAXZOOM).rev() {
-        if ZOOM_START_INDEX[z as usize] <= idx {
-            return z;
-        }
-    }
-    panic!("Bad index: {idx}")
+    // start(z) <= idx  <=>  4^z <= 3 * idx + 1
+    let z = (63 - (3 * idx + 1).leading_zeros()) / 2;
+    assert!(z <= MAX_MAXZOOM, "Bad index: {idx}");
+    z
 }
 
 /// The coordinate of a slippy map tile.
@@ -49,11 +40,13 @@ pub struct TileCoord {
 }
 
 impl TileCoord {
+    #[inline]
     pub fn of_xyz(x: u32, y: u32, z: u32) -> TileCoord {
         debug_assert!(z <= MAX_MAXZOOM);
         TileCoord { encoded: Self::encode(x, y, z), x, y, z }
     }
 
+    #[inline]
     pub fn decode(encoded: u64) -> TileCoord {
         let z = zoom_for_index(encoded);
         let xy = Self::tms_position_to_xy(z, encoded - start_index_for_zoom(z));
@@ -74,6 +67,7 @@ impl TileCoord {
         TileCoord::of_xyz(x.floor() as u32, y.floor() as u32, zoom)
     }
 
+    #[inline]
     pub fn encode(x: u32, y: u32, z: u32) -> u64 {
         start_index_for_zoom(z) + Self::tms_xy_to_position(z, x, y)
     }
@@ -138,14 +132,14 @@ impl TileCoord {
             return 0;
         }
         let dim = 1u64 << z;
-        let x = pos / dim;
-        let y = dim - 1 - (pos % dim);
+        let x = pos >> z;
+        let y = dim - 1 - (pos & (dim - 1));
         (x << 32) | y
     }
 
     pub fn tms_xy_to_position(z: u32, x: u32, y: u32) -> u64 {
         let dim = 1u64 << z;
-        x as u64 * dim + (dim - 1 - y as u64)
+        ((x as u64) << z) + (dim - 1 - y as u64)
     }
 
     pub fn parent(&self) -> TileCoord {
@@ -225,5 +219,24 @@ mod tests {
     #[test]
     fn debug_url() {
         assert_eq!("0.5/0/0", TileCoord::of_xyz(0, 0, 0).get_debug_url("{z}/{lat}/{lon}"));
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    #[test]
+    fn zoom_start_indices() {
+        let mut idx = 0u64;
+        for z in 0..=MAX_MAXZOOM {
+            assert_eq!(idx, start_index_for_zoom(z));
+            assert_eq!(z, zoom_for_index(idx));
+            if idx > 0 {
+                assert_eq!(z - 1, zoom_for_index(idx - 1));
+            }
+            idx += 1u64 << (2 * z);
+        }
+        assert_eq!(MAX_MAXZOOM, zoom_for_index(idx - 1));
     }
 }
