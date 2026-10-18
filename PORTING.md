@@ -48,7 +48,7 @@ See the table at the bottom of this file; update it as modules are completed.
 | Area | Status |
 |------|--------|
 | Foundation types (`value`, `geo::{envelope, geometry_type, geometry_exception, tile_coord, tile_extents}`, `util::hilbert`, `stats` trait, `config` struct) | done |
-| `vector_tile` (VectorTile, VectorGeometry, VectorGeometryMerger, Feature, encode/decode), `util::{tile_size_stats, layer_attr_stats, tileset_summary_statistics}` | done (MLT encoding/stats, `TileSizeStats.main` CLI, TileWeights integration deferred: see `TODO(port)`) |
+| `vector_tile` (VectorTile, VectorGeometry, VectorGeometryMerger, Feature, encode/decode), `util::{tile_size_stats, layer_attr_stats, tileset_summary_statistics}` | done (MLT encoding/stats, `TileSizeStats.main` CLI deferred: see `TODO(port)`) |
 | `reader::{structs, with_tags, with_geometry_type, json_conversion}` (dotted keys via `WithTags::get_tag_nested`; `get_tag` stays a direct lookup) | done (TODO: switch `with_tags::parse_shim` to `util::parse`; Struct has no Instant/LocalDate/UUID variants) |
 | `reader::osm::{pbf_decoder, pbf_field_decoder, osm_element, osm_header, osm_input_file, osm_block_source, poly_file_reader}` (raw/zlib/lz4/zstd, eager or mmap lazy reads; hand-written zero-copy protobuf decoder, zlib via libdeflate) | done |
 | `expression::{expression, multi_expression, data_type, simplifiable}` (input trait `ExpressionInput`) | done |
@@ -65,6 +65,7 @@ See the table at the bottom of this file; update it as modules are completed.
 | `reader::osm::{osm_multipolygon, osm_way_splitter, osm_node_bounds_provider}` | done (`NodeLocationProvider` trait lives in `osm_multipolygon` until `OsmReader` is ported; bounds provider does not use `OsmPhaser` yet) |
 | `util::{translations, language_utils, thread_local_transliterator, wikidata}` | done (`Wikidata` takes a `Fn(&OsmElement) -> bool` filter instead of `Profile`: see `TODO(port)`) |
 | Feature pipeline spine: `profile` (`Profile`, `NullProfile`), `feature_processor`, `forwarding_profile`, `feature_collector`, `reader::{source_feature, simple_feature}`, `reader::osm::osm_relation_info` (+ `RelationMember`), `render::{feature_renderer, tiled_geometry, geometry_coordinate_sequences, rendered_feature}`, `collection::feature_group` | done (see notes below) |
+| `archive::tile_archive_writer` (`TileArchiveWriter.writeOutput`), `validator::{schema_specification, base_schema_validator, java_profile_validator}`, `testing` harness + `tests/planetiler_tests*.rs` (the `runWithReaderFeatures` subset of `PlanetilerTests`), benchmark `benchmark_tile_archive_writer` | done (MLT output errors; OSM/orchestrator tests listed as `TODO(port)` in `tests/planetiler_tests.rs`) |
 
 ### `geo` notes
 
@@ -208,3 +209,43 @@ for tile in &mut tiles {
 tiles.join()?;
 ```
 `TileFeatures` is `Send + 'static` (holds an `Arc` of shared state), so it can be handed to encoder threads.
+
+### Archive writer notes (TileArchiveWriter)
+
+How the `Planetiler` orchestrator runs the archive stage (Java `TileArchiveWriter.writeOutput`):
+```rust
+feature_group.prepare()?;                                  // optional, write_output prepares if needed
+let mut archive = tile_archives::new_writer(&output_config, &config)?;   // Box<dyn WriteableTileArchive>
+tile_archive_writer::write_output(
+    &mut feature_group,                                    // &mut FeatureGroup
+    archive.as_mut(),                                      // &mut dyn WriteableTileArchive
+    Arc::new(output_size),                                 // Arc<dyn DiskBacked + Send + Sync>, progress logs only
+    &TileArchiveMetadata::from_profile(&*profile, &config),
+    layer_stats_path.as_deref(),                           // Some(path) required when config.output_layer_stats
+    &config,                                               // &PlanetilerConfig
+    &stats,                                                // &StatsRef
+)?;                                                        // starts/stops the "archive" stage timer
+archive.close()?;                                          // caller closes (Java try-with-resources)
+```
+`write_output` calls `initialize()`, writes all tiles, then `finish(metadata.with_layer_stats(..))`. Threads are
+scoped (`archive_read-1`/`archive_merge-1`, `archive_encode-N`, `archive_write-N`, `archive_stats-1`, plus `read-N`
+from `FeatureGroup::parallel_iterator` when `feature_read_threads > 1`) and registered for per-thread CPU logging; queue
+and counter names match Java (`archive_reader_queue`, `archive_writer_queue`, `archive_layerstats_queue`,
+`archive_tiles_written{zoom}`, `archive_memoized_tiles`, `archive_features_processed`). Each batch's result goes from
+the encoder to the writer through a one-shot channel (Java's `CompletableFuture`), so writers consume batches in
+order. Any failure aborts every queue; `MLT` tile format and `UNKNOWN` compression return an error up front.
+Encoding uses `VectorTile::encode_with_layer_stats` (same stats as `tile_size_stats::compute_tile_stats` without
+building prost structs) and `util::gzip::gzip` (thread-local libdeflate, level 6; bytes differ from Java's zlib but
+sizes are within ~0.5%). `TileWeights` implements `TileWeightSource`.
+
+**Testing harness** (`planetiler_core::testing`, not cfg-gated): `run_with_reader_features(&[("threads", "1")],
+vec![SimpleFeature..], |source, features| { .. })` (and `_and_post_process`, `_profile`, generic `run(args, |ctx|
+process_reader_features(ctx, &features), Arc<dyn Profile>)`) returns `PlanetilerResults { tiles: BTreeMap<TileCoord,
+Vec<ComparableFeature>>, metadata, tile_data_count }`. Expected features: `feature(geom, tags!{..})`,
+`feature_in_layer`, `feature_with_id`, `ComparableFeature::new(GeometryComparison::{Norm,Round,Exact,Topo}(..), ..)`;
+compare with `assert_submap(&tile_map([((x, y, z), vec![..])]), &results.tiles)`. `TestProfile` builds a profile from
+closures. For OSM tests, a runner can drive the OSM reader into `ctx.feature_group` once it is ported.
+
+**Validators.** `base_schema_validator::validate(&dyn Profile, &SchemaSpecification, &config) -> ValidationResult`,
+`assert_valid(profile, &spec)` / `assert_valid_str` for tests (Java `TestUtils.validateProfile`),
+`SchemaSpecification::load(path)` / `load_str`, `java_profile_validator::ProfileValidator` (CLI + `--watch`).
