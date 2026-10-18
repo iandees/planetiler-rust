@@ -819,8 +819,26 @@ fn extract_adjacency_list(geometries: &[Geometry<f64>], min_dist: f64) -> Vec<Ve
     // Every candidate pair is usually visited from both sides; remember the (symmetric) distance test result of pairs
     // whose other side has not been queried yet so it is computed once.
     let mut pending: hashbrown::HashMap<(usize, usize), bool, foldhash::fast::FixedState> = Default::default();
-    for (i, a) in geometries.iter().enumerate() {
-        let env_a = &envelopes[i];
+    let vertices: Vec<std::cell::OnceCell<Vec<(u64, u64)>>> =
+        (0..geometries.len()).map(|_| Default::default()).collect();
+    let is_within_distance = |i: usize, j: usize| {
+        let (a, b) = (&geometries[i], &geometries[j]);
+        if envelope_distance(&envelopes[i], &envelopes[j]) > min_dist {
+            return false;
+        }
+        // Cheap cases where the geometries intersect, so their distance is 0: they share a vertex (adjacent
+        // polygons), or a vertex of one is inside the other polygon. Only the full distance computation can say
+        // `false`.
+        if min_dist >= 0.0 {
+            let va = vertices[i].get_or_init(|| sorted_vertices(a));
+            let vb = vertices[j].get_or_init(|| sorted_vertices(b));
+            if share_element(va, vb) || first_vertex_in_polygon(a, b) || first_vertex_in_polygon(b, a) {
+                return true;
+            }
+        }
+        Euclidean.distance(a, b) <= min_dist
+    };
+    for (i, env_a) in envelopes.iter().enumerate() {
         if env_a.is_null() {
             continue;
         }
@@ -833,10 +851,10 @@ fn extract_adjacency_list(geometries: &[Geometry<f64>], min_dist: f64) -> Vec<Ve
             } else if j < i {
                 match pending.remove(&(j, i)) {
                     Some(within) => within,
-                    None => is_within_distance(a, env_a, &geometries[j], &envelopes[j], min_dist),
+                    None => is_within_distance(i, j),
                 }
             } else {
-                let within = is_within_distance(a, env_a, &geometries[j], &envelopes[j], min_dist);
+                let within = is_within_distance(i, j);
                 if j > i {
                     pending.insert((i, j), within);
                 }
@@ -851,12 +869,43 @@ fn extract_adjacency_list(geometries: &[Geometry<f64>], min_dist: f64) -> Vec<Ve
     result
 }
 
-/// JTS `Geometry.isWithinDistance`.
-fn is_within_distance(a: &Geometry<f64>, env_a: &Envelope, b: &Geometry<f64>, env_b: &Envelope, dist: f64) -> bool {
-    if envelope_distance(env_a, env_b) > dist {
-        return false;
+/// Sorted, deduplicated bit patterns of every vertex of `geom` (with `-0.0` as `0.0`, so equal keys mean equal
+/// coordinates).
+fn sorted_vertices(geom: &Geometry<f64>) -> Vec<(u64, u64)> {
+    use geo::CoordsIter;
+    let key = |v: f64| if v == 0.0 { 0u64 } else { v.to_bits() };
+    let mut out: Vec<(u64, u64)> = geom.coords_iter().map(|c| (key(c.x), key(c.y))).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// True if the sorted slices `a` and `b` have an element in common.
+fn share_element(a: &[(u64, u64)], b: &[(u64, u64)]) -> bool {
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if small.len() * 8 < large.len() {
+        return small.iter().any(|k| large.binary_search(k).is_ok());
     }
-    Euclidean.distance(a, b) <= dist
+    let (mut i, mut j) = (0, 0);
+    while i < small.len() && j < large.len() {
+        match small[i].cmp(&large[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
+/// True if `polygon` is polygonal and the first vertex of `other` is inside or on it (so the two intersect).
+fn first_vertex_in_polygon(polygon: &Geometry<f64>, other: &Geometry<f64>) -> bool {
+    use geo::{CoordsIter, Intersects};
+    match polygon {
+        Geometry::Polygon(_) | Geometry::MultiPolygon(_) => {
+            other.coords_iter().next().is_some_and(|c| polygon.intersects(&c))
+        }
+        _ => false,
+    }
 }
 
 /// Returns the connected components of the graph with `num_items` nodes and edges from `adjacency_list` (indexed by
