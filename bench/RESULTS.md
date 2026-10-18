@@ -32,8 +32,10 @@ Notes:
 - PMTiles: Java's numbers include JIT warmup + GC across 3 rounds; the per-round rate is the fairer comparison.
 - VectorTile is slower in Rust so far: candidate fixes are `Arc<Tags>` in `Feature` (avoid cloning tag maps),
   avoiding per-feature `Vec` allocations in the geometry encoder, and a faster hasher for key/value interning.
-- LoopLineMerger and Douglas-Peucker are slower than Java; candidates for a geometry perf pass (allocation in
-  inner loops, `Vec<Coord>` copies, hashing of node keys).
+- LoopLineMerger, Douglas-Peucker and VW rows above predate the geometry perf pass (edge-pair coordinate arena,
+  inline node edge lists, one hash map, reusable scratch buffers, 4-lane DP scan, thread-local VW buffers); they
+  need re-measuring on a quiet machine. Rust-only A/B with `benchmark_geometry_cpu` (thread CPU time per op):
+  LoopLineMerger 2.6-3.6x less CPU and 13-1000x fewer allocations, DP 0-22% less, VW 1 allocation instead of 7.
 - OsmRead is at parity: Rust decodes via prost-generated structs (allocates per block); a hand-written zero-copy
   PBF decoder is the next step.
 

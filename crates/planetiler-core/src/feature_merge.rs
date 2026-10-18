@@ -335,8 +335,7 @@ pub fn merge_nearby_polygons_with(
                     // #1 is faster on average, but can become very slow and use a lot of memory when there is a large
                     // overlap between buffered polygons (i.e. most of them are smaller than the buffer amount) so we
                     // use #2 to avoid spinning for a very long time on very dense tiles.
-                    let owned: Vec<Geometry<f64>> = polygon_group.iter().map(|g| (*g).clone()).collect();
-                    buffer_union_unbuffer(buffer, &owned, stats)?
+                    buffer_union_unbuffer(buffer, &polygon_group, stats)?
                 } else {
                     let collection =
                         geo_utils::create_geometry_collection(polygon_group.iter().map(|g| (*g).clone()).collect());
@@ -510,9 +509,9 @@ mod smallvec_lite {
 
 /// Merges nearby polygons by expanding each individual polygon by `buffer`, unioning them, and contracting the
 /// result.
-pub fn buffer_union_unbuffer(
+pub fn buffer_union_unbuffer<G: std::borrow::Borrow<Geometry<f64>>>(
     buffer: f64,
-    polygon_group: &[Geometry<f64>],
+    polygon_group: &[G],
     stats: &dyn Stats,
 ) -> GeometryResult<Geometry<f64>> {
     // A simpler alternative that might initially appear faster would be:
@@ -527,6 +526,7 @@ pub fn buffer_union_unbuffer(
     let mut buffered: Vec<Geometry<f64>> = Vec::with_capacity(polygon_group.len());
     let mut max_area_before: f64 = 0.0;
     for geometry in polygon_group {
+        let geometry = geometry.borrow();
         max_area_before = max_area_before.max(geometry.unsigned_area());
         buffered.push(buffer_geometry(buffer, geometry)?);
     }
@@ -551,7 +551,8 @@ pub fn buffer_union_unbuffer(
             if area_after2 < max_area_before * 0.95 {
                 stats.data_error("buffer_union_unbuffer_still_too_small");
                 // and if that still fails, just union all of the input polygons without buffer/unbuffering
-                return polygon_overlay::union_all(&geo_utils::create_geometry_collection(polygon_group.to_vec()));
+                let all = polygon_group.iter().map(|g| g.borrow().clone()).collect();
+                return polygon_overlay::union_all(&geo_utils::create_geometry_collection(all));
             } else {
                 stats.data_error("buffer_union_unbuffer_too_small");
             }

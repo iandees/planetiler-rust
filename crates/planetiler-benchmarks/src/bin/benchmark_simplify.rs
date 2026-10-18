@@ -84,7 +84,9 @@ fn geo_vw(geom: &Geometry<f64>, tolerance: f64) -> Geometry<f64> {
 
 fn main() {
     let mut bench = Bench { num_lines: 0 };
-    for _ in 0..10 {
+    // BENCH_ITERS overrides the number of rounds (default 10, like Java)
+    let iters: usize = std::env::var("BENCH_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    for _ in 0..iters {
         bench.time("    DP(0.1)", &|g| douglas_peucker_simplifier::simplify(g, 0.1));
         bench.time("      DP(1)", &|g| douglas_peucker_simplifier::simplify(g, 1.0));
         bench.time("     DP(20)", &|g| douglas_peucker_simplifier::simplify(g, 20.0));

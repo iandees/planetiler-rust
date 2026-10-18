@@ -231,7 +231,9 @@ fn make_lines(lines: usize, parts: usize) -> Geometry<f64> {
 }
 
 fn main() {
-    for _ in 0..10 {
+    // BENCH_ITERS overrides the number of rounds (default 10, like Java)
+    let iters: usize = std::env::var("BENCH_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    for _ in 0..iters {
         time("       JTS", &|geom| {
             let mut lm = LineMerger::new();
             lm.add(geom);
