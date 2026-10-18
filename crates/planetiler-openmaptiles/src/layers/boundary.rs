@@ -1210,7 +1210,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO(port): also needs the park and place layers, which are ported separately"]
     fn test_indigenous_land() {
         let t = LayerTest::new();
         assert_features(
