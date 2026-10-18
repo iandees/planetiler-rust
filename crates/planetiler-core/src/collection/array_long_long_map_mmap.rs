@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
 use anyhow::Context;
-use memmap2::{Mmap, MmapMut, MmapOptions};
+use memmap2::{Mmap, MmapOptions, MmapRaw};
 use parking_lot::Mutex;
 
 use super::append_store_mmap::map_read_only;
@@ -26,11 +26,15 @@ use super::long_long_map::{LongLongMap, LongLongMapWriter, MISSING_VALUE};
 const DEFAULT_SEGMENT_BITS: u32 = 30;
 /// Smallest segment we map: 64KB is a multiple of the page size on all supported platforms.
 const MIN_SEGMENT_BITS: u32 = 16;
+/// Largest segment we accept (1TB) so that `1 << segment_bits` and `index << segment_bits` can't overflow.
+const MAX_SEGMENT_BITS: u32 = 40;
 
 struct WriteState {
     file: Option<File>,
     file_len: u64,
-    segments: Vec<Option<MmapMut>>,
+    /// Writable segments. `MmapRaw` hands out raw pointers without ever creating a `&mut [u8]`, so concurrent
+    /// writers storing through those pointers never alias a unique reference.
+    segments: Vec<Option<MmapRaw>>,
 }
 
 /// Parallel-write long-long map stored in a memory-mapped file, see
@@ -56,6 +60,9 @@ impl ArrayLongLongMapMmap {
     pub fn with_segment_bits(path: &Path, segment_bits: u32, madvise: bool) -> anyhow::Result<ArrayLongLongMapMmap> {
         if segment_bits < 3 {
             anyhow::bail!("Segment size must be a multiple of 8, got 2^{segment_bits}");
+        }
+        if segment_bits > MAX_SEGMENT_BITS {
+            anyhow::bail!("Segment size must be at most 2^{MAX_SEGMENT_BITS}, got 2^{segment_bits}");
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -99,13 +106,16 @@ impl ArrayLongLongMapMmap {
                 file.set_len(needed).with_context(|| format!("Unable to grow {:?}", self.path))?;
                 state.file_len = needed;
             }
-            // SAFETY: the file is private to this map, is at least `offset + seg_bytes` long and is never truncated
-            // while mapped. Writers access the mapping only through atomics (see `Writer::put`).
-            let map = unsafe { MmapOptions::new().offset(offset).len(seg_bytes as usize).map_mut(file) }
+            // The file is private to this map, is at least `offset + seg_bytes` long and is never truncated while
+            // mapped. Writers access the mapping only through atomics on raw pointers (see `Writer::put`).
+            let map = MmapOptions::new()
+                .offset(offset)
+                .len(seg_bytes as usize)
+                .map_raw(file)
                 .with_context(|| format!("Unable to map segment {index} of {:?}", self.path))?;
             state.segments[idx] = Some(map);
         }
-        Ok(state.segments[idx].as_mut().unwrap().as_mut_ptr() as *mut i64)
+        Ok(state.segments[idx].as_ref().unwrap().as_mut_ptr() as *mut i64)
     }
 
     fn read_map(&self) -> Option<&Mmap> {
@@ -114,8 +124,10 @@ impl ArrayLongLongMapMmap {
         }
         self.read
             .get_or_init(|| {
-                assert_eq!(0, self.active_writers.load(Ordering::Acquire), "cannot read while writers are still open");
+                // Check the writer count and seal under the same lock `new_writer` registers writers under, so no
+                // writer can be created (and map a segment) between the check and the unmapping below.
                 let mut state = self.write.lock();
+                assert_eq!(0, self.active_writers.load(Ordering::Acquire), "cannot read while writers are still open");
                 self.sealed.store(true, Ordering::Release);
                 // dropping writable mappings is safe: no writers exist, and data stays in the shared page cache
                 state.segments.clear();
@@ -155,7 +167,8 @@ impl LongLongMapWriter for Writer<'_> {
         let offset = (key & ((1u64 << elem_bits) - 1)) as usize;
         // SAFETY: `base` is the start of a live, page-aligned writable mapping of 2^segment_bits bytes, so `offset`
         // (< 2^(segment_bits-3)) is in bounds and 8-byte aligned. The mapping is not unmapped while this writer exists
-        // (`read_map` asserts there are no active writers before dropping mappings). Other writers may write the same
+        // (`read_map` asserts there are no active writers before dropping mappings, under the same lock that
+        // `new_writer` registers writers under). Other writers may write the same
         // memory concurrently, so the store is atomic to avoid a data race.
         unsafe { (*(self.base.add(offset) as *const AtomicI64)).store(value, Ordering::Relaxed) };
         Ok(())
@@ -170,6 +183,9 @@ impl Drop for Writer<'_> {
 
 impl LongLongMap for ArrayLongLongMapMmap {
     fn new_writer(&self) -> Box<dyn LongLongMapWriter + '_> {
+        // Register under the write lock so `read_map` can't seal between its writer-count check and unmapping. A
+        // writer created after sealing never gets a segment pointer: its first `put` fails in `segment_ptr`.
+        let _state = self.write.lock();
         self.active_writers.fetch_add(1, Ordering::AcqRel);
         Box::new(Writer { map: self, last_segment: u64::MAX, base: std::ptr::null_mut() })
     }
@@ -318,5 +334,68 @@ pub(crate) mod tests {
             assert!(path.exists());
         }
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn rejects_huge_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ArrayLongLongMapMmap::with_segment_bits(&dir.path().join("a.db"), 64, false).is_err());
+        assert!(ArrayLongLongMapMmap::with_segment_bits(&dir.path().join("b.db"), MAX_SEGMENT_BITS, false).is_ok());
+    }
+
+    #[test]
+    fn writer_created_after_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = ArrayLongLongMapMmap::with_segment_bits(&dir.path().join("node.db"), 16, false).unwrap();
+        map.new_writer().put(1, 2).unwrap();
+        assert_eq!(2, map.get(1));
+        let mut writer = map.new_writer();
+        assert!(writer.put(3, 4).is_err());
+        drop(writer);
+        assert_eq!(MISSING_VALUE, map.get(3));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot read while writers are still open")]
+    fn read_with_open_writer_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = ArrayLongLongMapMmap::with_segment_bits(&dir.path().join("node.db"), 16, false).unwrap();
+        let mut writer = map.new_writer();
+        writer.put(1, 2).unwrap();
+        map.get(1);
+    }
+
+    /// Readers racing against writers that are being created must never let a writer store into a segment that has
+    /// been unmapped: every outcome is either a failed `put`, or a read that panics because writers are open.
+    #[test]
+    fn racing_read_and_new_writer_is_safe() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let map = ArrayLongLongMapMmap::with_segment_bits(&dir.path().join("node.db"), 16, false).unwrap();
+            let start = Barrier::new(2);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    start.wait();
+                    for i in 0..2000 {
+                        let mut writer = map.new_writer();
+                        for j in 0..10 {
+                            if writer.put(i * 10 + j, 1).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+                s.spawn(|| {
+                    start.wait();
+                    loop {
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| map.get(0)));
+                        if r.is_ok() {
+                            break;
+                        }
+                    }
+                });
+            });
+            assert!(map.new_writer().put(0, 1).is_err());
+        }
     }
 }
