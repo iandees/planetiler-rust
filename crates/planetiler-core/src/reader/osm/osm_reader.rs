@@ -106,15 +106,52 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
     }
 }
 
-/// Returns the slice of `(key, value)` pairs with `key` from a list sorted by key.
-#[inline]
-fn lookup(pairs: &[(i64, i64)], key: i64) -> &[(i64, i64)] {
-    if pairs.is_empty() {
-        return pairs;
+/// The `(key, value)` pairs for one key of a list sorted by key, iterated in the order Java's
+/// `SparseUnorderedBinarySearchMultimap.get` returns them: from the entry `Arrays.binarySearch` lands on forwards,
+/// then backwards from the entry before it. This matters because it decides the order of a way's relations (e.g. the
+/// `route_N_*` attributes OpenMapTiles assigns).
+#[derive(Clone, Copy)]
+struct Matches<'a> {
+    run: &'a [(i64, i64)],
+    split: usize,
+}
+
+impl<'a> Matches<'a> {
+    fn is_empty(&self) -> bool {
+        self.run.is_empty()
     }
-    let start = pairs.partition_point(|p| p.0 < key);
-    let len = pairs[start..].partition_point(|p| p.0 == key);
-    &pairs[start..start + len]
+
+    fn len(&self) -> usize {
+        self.run.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &'a (i64, i64)> + 'a {
+        self.run[self.split..].iter().chain(self.run[..self.split].iter().rev())
+    }
+}
+
+/// Returns the pairs with `key` from a list sorted by key (see [`Matches`]).
+#[inline]
+fn lookup(pairs: &[(i64, i64)], key: i64) -> Matches<'_> {
+    // Java's Arrays.binarySearch
+    let (mut low, mut high) = (0isize, pairs.len() as isize - 1);
+    let mut mid = None;
+    while low <= high {
+        let m = ((low + high) as usize) >> 1;
+        let v = pairs[m].0;
+        if v < key {
+            low = m as isize + 1;
+        } else if v > key {
+            high = m as isize - 1;
+        } else {
+            mid = Some(m);
+            break;
+        }
+    }
+    let Some(mid) = mid else { return Matches { run: &[], split: 0 } };
+    let start = pairs[..mid].partition_point(|p| p.0 < key);
+    let end = mid + pairs[mid..].partition_point(|p| p.0 == key);
+    Matches { run: &pairs[start..end], split: mid - start }
 }
 
 /// Relation data collected in pass 1 (Java `relationInfo`, `wayToRelations`, `relationToParentRelations`, `roleIds`).
@@ -167,17 +204,17 @@ impl RelationState {
         (&self.roles[role], encoded & NOT_ROLE_MASK)
     }
 
-    fn parent_relations(&self, relation_id: i64) -> &[(i64, i64)] {
+    fn parent_relations(&self, relation_id: i64) -> Matches<'_> {
         lookup(&self.relation_to_parent_relations, relation_id)
     }
 
-    fn get_relation_memberships(&self, memberships: &[(i64, i64)]) -> Vec<RelationMember<dyn OsmRelationInfo>> {
+    fn get_relation_memberships(&self, memberships: Matches<'_>) -> Vec<RelationMember<dyn OsmRelationInfo>> {
         let mut rels = Vec::new();
         if memberships.is_empty() {
             return rels;
         }
         rels.reserve(memberships.len());
-        for &(_, encoded) in memberships {
+        for &(_, encoded) in memberships.iter() {
             // encoded ID uses the upper few bits of the long to encode the role
             let (role, relation_id) = self.decode_relation_membership(encoded);
             if let Some(rel) = self.relation_info.get(&relation_id) {
@@ -189,7 +226,7 @@ impl RelationState {
             }
             let mut visited = HashSet::new();
             visited.insert(relation_id);
-            for &(_, parent) in parents {
+            for &(_, parent) in parents.iter() {
                 self.get_relation_infos_for_relation_id(parent, &mut visited, &[relation_id], &mut rels);
             }
         }
@@ -214,7 +251,7 @@ impl RelationState {
         if !parents.is_empty() {
             let mut path = parent_relation_path.to_vec();
             path.push(relation_id);
-            for &(_, parent) in parents {
+            for &(_, parent) in parents.iter() {
                 self.get_relation_infos_for_relation_id(parent, visited, &path, out);
             }
         }
@@ -1510,6 +1547,18 @@ mod tests {
     use crate::reader::source_feature::SourceFeatureExt;
     use crate::stats::stats::InMemoryStats;
     use crate::tags;
+
+    #[test]
+    fn lookup_matches_java_multimap_order() {
+        // Java's SparseUnorderedBinarySearchMultimap.get: forwards from Arrays.binarySearch's hit, then backwards
+        let pairs = [(1, 10), (1, 11), (1, 12), (2, 20), (3, 30), (3, 31)];
+        let get = |key| lookup(&pairs, key).iter().map(|p| p.1).collect::<Vec<_>>();
+        assert_eq!(vec![12, 11, 10], get(1));
+        assert_eq!(vec![20], get(2));
+        assert_eq!(vec![30, 31], get(3));
+        assert!(get(4).is_empty());
+        assert!(lookup(&[], 1).is_empty());
+    }
 
     type RelationFn = dyn Fn(&Relation) -> Option<Vec<Arc<dyn OsmRelationInfo>>> + Send + Sync;
 
