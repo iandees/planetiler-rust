@@ -23,8 +23,6 @@ Numbers are the best of the repeated runs each benchmark prints.
 | BenchmarkLineMerge JTS LineMerger (2 timings, lower is better) | 0.30s/0.34s | 0.18s/0.21s | 1.6x |
 | BenchmarkSimplify DP(1) (circles of 2/10/50/100/10k pts) | 39M/14M/4.5M/2.3M/25k | 39M/14M/3.4M/1.8M/21k | **0.75-1.0x** |
 | BenchmarkSimplify VW(0) (Planetiler's VW) | 13M/4.4M/1M/548k/3.2k | 9.8M/6.7M/2M/1.1M/5.8k | 0.75x small, ~2x large |
-| BenchmarkTileArchiveWriter archive stage (2M synthetic features -> 8.27M rendered, 37,975 tiles, 15 threads, best of 5) | 1.38s wall, 17.3s CPU (2.2s / 25s 1st round) | 0.59s wall, 7.6s CPU | **2.3x wall / 2.3x CPU** |
-| BenchmarkTileArchiveWriter render (not the target; same pipeline both sides) / sort | 2.79s wall 34.7s CPU / 1.14s | 2.75s wall 34.3s CPU / 0.39s | 1.0x / 2.9x |
 
 Notes:
 - TileCoord: the first straight port ran at 604M/s (0.72x Java). Replacing the zoom-start lookup table + linear scan
@@ -47,15 +45,6 @@ Notes:
   (decompression from 1.8s to 1.15s). The rest of the CPU time goes to building `Tags` (`String` keys, SipHash
   `IndexMap`), `Arc<str>` refcounts, and the benchmark's per-node `encode_flat_location` (sin + ln).
   The lazy (mmap) and eager read modes cost about the same in sys time.
-- TileArchiveWriter (`bench/java/BenchmarkTileArchiveWriter.java` vs `benchmark_tile_archive_writer`): one large
-  water polygon + 1M points (z10-14), 600k 6-point lines (z6-14), 400k 8-vertex polygons (z8-14) in a Switzerland-sized
-  bbox, rendered into a disk-backed FeatureGroup, sorted, then `writeOutput` into a compact mbtiles 5 times. Both write
-  the same 37,975 tiles (255.5 MB Rust vs 256.6 MB Java; Rust gzips with libdeflate level 6 instead of zlib). Rust
-  encode threads ran ~88% busy; Java's encoders ~55-72% with the writer waiting. Wins come from the direct protobuf
-  encoder computing layer stats in its size pass (no prost structs), libdeflate gzip, and memoizing repeated fills.
-  Measured with load average ~15-18 from concurrent agent builds. Commands:
-  `./target/release/benchmark_tile_archive_writer 2000000 5 /tmp/ptbench` and
-  `java -Xmx16g -cp planetiler-dist-*-with-deps.jar bench/java/BenchmarkTileArchiveWriter.java 2000000 5 /tmp/ptbench`.
 - LoopLineMerger and Douglas-Peucker are slower than Java; candidates for a geometry perf pass (allocation in
   inner loops, `Vec<Coord>` copies, hashing of node keys).
 
