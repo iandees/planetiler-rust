@@ -118,7 +118,9 @@ fn build_geometry_with_kinds(geoms: Vec<Geometry<f64>>, kinds: &[Kind]) -> Geome
 }
 
 enum RingResult {
-    /// JTS null or empty ring
+    /// JTS `null` (only produced when [`GeometryTransformer::remove_degenerate_rings`] is set)
+    Null,
+    /// an empty linear ring
     Empty,
     /// sequence of 1-3 points (JTS downgrades it to a `LineString`)
     Line(Vec<Coord<f64>>),
@@ -132,7 +134,8 @@ fn transform_ring<T: GeometryTransformer + ?Sized>(t: &mut T, ring: &LineString<
         Some(seq) if seq.len() < 4 => RingResult::Line(seq),
         Some(seq) => RingResult::Ring(seq),
     };
-    if t.remove_degenerate_rings() && !matches!(result, RingResult::Ring(_)) { RingResult::Empty } else { result }
+    // planetiler's simplifiers return null for rings that are no longer linear rings
+    if t.remove_degenerate_rings() && matches!(result, RingResult::Line(_)) { RingResult::Null } else { result }
 }
 
 fn transform_polygon<T: GeometryTransformer + ?Sized>(t: &mut T, poly: &Polygon<f64>) -> Option<Geometry<f64>> {
@@ -143,14 +146,11 @@ fn transform_polygon<T: GeometryTransformer + ?Sized>(t: &mut T, poly: &Polygon<
         return Some(Geometry::Polygon(empty_polygon()));
     }
     let shell = transform_ring(t, poly.exterior());
-    if matches!(shell, RingResult::Empty) {
-        return Some(Geometry::Polygon(empty_polygon()));
-    }
     let mut all_valid = matches!(shell, RingResult::Ring(_));
     let mut holes = Vec::with_capacity(poly.interiors().len());
     for hole in poly.interiors() {
         match transform_ring(t, hole) {
-            RingResult::Empty => {}
+            RingResult::Empty | RingResult::Null => {}
             r @ RingResult::Line(_) => {
                 all_valid = false;
                 holes.push(r);
@@ -180,11 +180,15 @@ fn transform_polygon<T: GeometryTransformer + ?Sized>(t: &mut T, poly: &Polygon<
                     geoms.push(Geometry::LineString(LineString(s)));
                     kinds.push(Kind::LinearRing);
                 }
+                RingResult::Empty => {
+                    geoms.push(Geometry::LineString(LineString(vec![])));
+                    kinds.push(Kind::LinearRing);
+                }
                 RingResult::Line(s) => {
                     geoms.push(Geometry::LineString(LineString(s)));
                     kinds.push(Kind::LineString);
                 }
-                RingResult::Empty => {}
+                RingResult::Null => {}
             }
         }
         Some(build_geometry_with_kinds(geoms, &kinds))
@@ -216,6 +220,9 @@ pub fn transform_geometry<T: GeometryTransformer + ?Sized>(t: &mut T, geom: &Geo
             for p in &mp.0 {
                 push_non_empty(&mut out, transform_point(t, p));
             }
+            if out.is_empty() {
+                return Some(Geometry::MultiPoint(MultiPoint(vec![])));
+            }
             Some(build_geometry(out))
         }
         Geometry::MultiLineString(mls) => {
@@ -224,12 +231,18 @@ pub fn transform_geometry<T: GeometryTransformer + ?Sized>(t: &mut T, geom: &Geo
                 let coords = t.transform_coordinates(&l.0, false).unwrap_or_default();
                 push_non_empty(&mut out, Some(Geometry::LineString(LineString(coords))));
             }
+            if out.is_empty() {
+                return Some(Geometry::MultiLineString(MultiLineString(vec![])));
+            }
             Some(build_geometry(out))
         }
         Geometry::MultiPolygon(mp) => {
             let mut out = Vec::with_capacity(mp.0.len());
             for p in &mp.0 {
                 push_non_empty(&mut out, transform_polygon(t, p));
+            }
+            if out.is_empty() {
+                return Some(Geometry::MultiPolygon(MultiPolygon(vec![])));
             }
             Some(build_geometry(out))
         }
