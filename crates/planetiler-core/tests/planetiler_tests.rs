@@ -3,9 +3,8 @@
 //! TileArchiveWriter -> in-memory mbtiles -> decoded tiles.
 //!
 //! Tests that need `OsmReader` live in `tests/planetiler_osm_tests.rs`; orchestrator tests (testPlanetilerRunner*,
-//! testPlanetilerMemoryCheck*) in `tests/planetiler_runner_tests.rs` and testDefaultLanguages in `src/planetiler.rs`.
-//! TODO(port): testReuseFeatureDb, testPlanetilerRunnerShapefile/GeoPackage/Parquet/OvertureSource and the simple
-//! sources in testPlanetilerRunner wait on the simple readers being wired into the `Planetiler` runner.
+//! testPlanetilerMemoryCheck*, testReuseFeatureDb) in `tests/planetiler_runner_tests.rs` and testDefaultLanguages in
+//! `src/planetiler.rs`.
 
 use std::sync::Arc;
 
