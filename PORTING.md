@@ -550,7 +550,9 @@ returns an error). List / map / bytes attribute values become strings, as MVT do
   Switzerland (23,922 tiles, 5.6M features), every tile is **byte-identical** for: default, `exclude_ids`,
   `fastpfor`, `fsst`, `fsst`+`fastpfor` (`mlt_advanced`), `shared_dict`, `reorder_features`, `tessellate`,
   `tessellate`+`outline`, `fsst`+`fastpfor`+`shared_dict`, and everything at once. `mlt_reference encode` also
-  checks that decoding each tile gives back the MVT features.
+  checks that decoding each tile gives back the MVT features. Uncompressed Switzerland totals (same on both sides):
+  default 457.7 MB, `exclude_ids` 436.5 MB, `fastpfor` 453.3 MB, `fsst` 444.4 MB, `mlt_advanced` 440.4 MB,
+  `shared_dict` 379.2 MB, `fsst`+`fastpfor`+`shared_dict` 370.0 MB, `tessellate`+`outline` 639.8 MB.
 - End to end, Monaco with Java `planetiler-dist` vs Rust `planetiler`, `--tile_format=mlt` and also
   `--mlt_advanced=true`: `planetiler compare` finds equivalent normalized content in all 23 tiles. 3 of 23 are
   byte-identical (uncompressed). The other 20 differ only because the two pipelines' *MVT-level* tiles already
