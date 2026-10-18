@@ -164,8 +164,8 @@ impl TileWriter for CsvTileWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::tile_archive_config::ArchiveOptions;
     use crate::archive::tile_archive_metadata::TileArchiveMetadata;
+    use crate::config::arguments::Arguments;
     use crate::geo::tile_coord::TileCoord;
 
     fn tile(x: u32, y: u32, z: u32, data: &[u8]) -> TileEncodingResult {
@@ -238,7 +238,7 @@ mod tests {
     fn test_tile_options(options: &[(&str, &str)], expected: &str) {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("out.csv");
-        let config = StreamArchiveConfig::new(false, ArchiveOptions::of_pairs(options));
+        let config = StreamArchiveConfig::new(false, Arguments::of_pairs(options.iter().copied()));
         let mut archive = WriteableCsvArchive::new_write_to_file(Format::Csv, &file, config).unwrap();
         archive.initialize().unwrap();
         {

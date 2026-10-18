@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use planetiler_core::archive::readable_tile_archive::ReadableTileArchive;
-use planetiler_core::archive::tile_archive_config::ArchiveOptions;
+
 use planetiler_core::archive::tile_compression::TileCompression;
 use planetiler_core::config::arguments::Arguments;
 use planetiler_core::feature_collector::FeatureCollector;
@@ -51,7 +51,7 @@ fn read_tiles(
     let archive: Box<dyn ReadableTileArchive> = match format {
         "mbtiles" => Box::new(Mbtiles::new_read_only_database(output).unwrap()),
         "pmtiles" => Box::new(ReadablePmtiles::new_read_from_file(output).unwrap()),
-        "files" => Box::new(ReadableFilesArchive::new_reader(output, &ArchiveOptions::empty()).unwrap()),
+        "files" => Box::new(ReadableFilesArchive::new_reader(output, &Arguments::of()).unwrap()),
         other => panic!("unsupported {other}"),
     };
     let tiles = get_tile_map_with_compression(archive.as_ref(), compression).unwrap();

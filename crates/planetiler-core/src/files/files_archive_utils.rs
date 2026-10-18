@@ -2,14 +2,14 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::archive::tile_archive_config::ArchiveOptions;
+use crate::config::arguments::Arguments;
 use crate::files::tile_scheme_encoding::{TileSchemeEncoding, X_TEMPLATE, Y_TEMPLATE, Z_TEMPLATE};
 
 pub const OPTION_METADATA_PATH: &str = "metadata_path";
 pub const OPTION_TILE_SCHEME: &str = "tile_scheme";
 
 /// Path to the metadata file of a files archive at `base_path`, or `None` if disabled via `metadata_path=none`.
-pub fn metadata_path(base_path: &Path, options: &ArchiveOptions) -> Option<PathBuf> {
+pub fn metadata_path(base_path: &Path, options: &Arguments) -> Option<PathBuf> {
     let raw =
         options.get_string(OPTION_METADATA_PATH, "path to the metadata - use \"none\" to disable", "metadata.json");
     if raw == "none" {
@@ -20,7 +20,7 @@ pub fn metadata_path(base_path: &Path, options: &ArchiveOptions) -> Option<PathB
 }
 
 pub fn tiles_scheme_encoding(
-    options: &ArchiveOptions,
+    options: &Arguments,
     base_path: &Path,
     default_tile_scheme: &str,
 ) -> anyhow::Result<TileSchemeEncoding> {
@@ -42,7 +42,7 @@ pub struct BasePathWithTileSchemeEncoding {
 /// Splits a path like `tiles/{z}/{x}/{y}.pbf` into the base path (`tiles`) and tile scheme, with the tile scheme
 /// option taking precedence over the one in the path.
 pub fn base_path_with_tile_scheme_encoding(
-    options: &ArchiveOptions,
+    options: &Arguments,
     base_path: &Path,
 ) -> anyhow::Result<BasePathWithTileSchemeEncoding> {
     let (base, scheme) = split_shortcut_path(base_path);
@@ -122,7 +122,7 @@ mod tests {
                     base_path: actual_path.clone(),
                     tile_scheme_encoding: TileSchemeEncoding::new(scheme, &actual_path).unwrap(),
                 },
-                base_path_with_tile_scheme_encoding(&ArchiveOptions::empty(), &shortcut_path).unwrap(),
+                base_path_with_tile_scheme_encoding(&Arguments::of(), &shortcut_path).unwrap(),
                 "{shortcut}"
             );
         }
@@ -139,7 +139,7 @@ mod tests {
                 base_path: base.clone(),
                 tile_scheme_encoding: TileSchemeEncoding::new(shortcut_scheme, &base).unwrap(),
             },
-            base_path_with_tile_scheme_encoding(&ArchiveOptions::empty(), &shortcut_path).unwrap()
+            base_path_with_tile_scheme_encoding(&Arguments::of(), &shortcut_path).unwrap()
         );
         assert_eq!(
             BasePathWithTileSchemeEncoding {
@@ -147,7 +147,7 @@ mod tests {
                 tile_scheme_encoding: TileSchemeEncoding::new(arg_scheme, &base).unwrap(),
             },
             base_path_with_tile_scheme_encoding(
-                &ArchiveOptions::of_pairs(&[(OPTION_TILE_SCHEME, arg_scheme)]),
+                &Arguments::of_pairs([(OPTION_TILE_SCHEME, arg_scheme)]),
                 &shortcut_path
             )
             .unwrap()

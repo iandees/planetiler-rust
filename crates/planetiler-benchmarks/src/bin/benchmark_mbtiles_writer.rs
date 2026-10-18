@@ -13,9 +13,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::time::Instant;
 
 use indexmap::IndexMap;
-use planetiler_core::archive::tile_archive_config::ArchiveOptions;
 use planetiler_core::archive::tile_encoding_result::TileEncodingResult;
 use planetiler_core::archive::writeable_tile_archive::{TileWriter, WriteableTileArchive};
+use planetiler_core::config::arguments::Arguments;
 use planetiler_core::geo::tile_coord::TileCoord;
 use planetiler_core::mbtiles::mbtiles::Mbtiles;
 
@@ -140,7 +140,7 @@ fn main() -> anyhow::Result<()> {
 
     let distinct_tile_data = create_filled_byte_array(distinct_tile_data_size as usize);
     let dupe_tile_data = create_filled_byte_array(dupe_tile_data_size as usize);
-    let options = ArchiveOptions::of_map(args.clone());
+    let options = Arguments::of_map(args.clone());
 
     let mut stats: Vec<f64> = Vec::new();
     for _ in 0..repetitions {

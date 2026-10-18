@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail};
 
 use crate::archive::readable_tile_archive::ReadableTileArchive;
-use crate::archive::tile_archive_config::{ArchiveOptions, Format, TileArchiveConfig};
+use crate::archive::tile_archive_config::{Format, TileArchiveConfig};
 use crate::archive::writeable_tile_archive::WriteableTileArchive;
 use crate::config::planetiler_config::PlanetilerConfig;
 use crate::files::readable_files_archive::ReadableFilesArchive;
@@ -56,10 +56,11 @@ pub fn new_writer(
         // pass-through legacy arguments for fallback
         Format::Mbtiles => Box::new(Mbtiles::new_write_to_file_database(
             &path,
-            &options.or_else(ArchiveOptions::from_arguments_subset(
-                config.arguments.clone(),
-                &[mbtiles::LEGACY_VACUUM_ANALYZE, mbtiles::LEGACY_COMPACT_DB, mbtiles::LEGACY_SKIP_INDEX_CREATION],
-            )),
+            &options.or_else(config.arguments.subset(&[
+                mbtiles::LEGACY_VACUUM_ANALYZE,
+                mbtiles::LEGACY_COMPACT_DB,
+                mbtiles::LEGACY_SKIP_INDEX_CREATION,
+            ])),
         )?),
         Format::Pmtiles => Box::new(WriteablePmtiles::new_write_to_file(&path)?),
         format @ (Format::Csv | Format::Tsv) => Box::new(WriteableCsvArchive::new_write_to_file(

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use geo_types::{Coord, Geometry, LineString, Point, Polygon};
-use planetiler_core::archive::tile_archive_config::ArchiveOptions;
+
 use planetiler_core::archive::tile_archive_metadata::TileArchiveMetadata;
 use planetiler_core::archive::tile_archive_writer;
 use planetiler_core::archive::writeable_tile_archive::WriteableTileArchive;
@@ -232,8 +232,7 @@ fn main() -> anyhow::Result<()> {
     let metadata = TileArchiveMetadata::from_profile(&*profile, &config);
     for round in 0..rounds {
         let path = tmp.path().join(format!("output{round}.mbtiles"));
-        let mut archive =
-            Mbtiles::new_write_to_file_database(&path, &ArchiveOptions::from_arguments(config.arguments.clone()))?;
+        let mut archive = Mbtiles::new_write_to_file_database(&path, &config.arguments.clone())?;
         let (start, cpu_start) = (Instant::now(), cpu());
         tile_archive_writer::write_output(
             &mut group,

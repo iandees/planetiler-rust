@@ -21,11 +21,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, bail};
 use tracing::info;
 
-use crate::archive::tile_archive_config::ArchiveOptions;
 use crate::archive::tile_archive_metadata::TileArchiveMetadata;
 use crate::archive::tile_archive_metadata_de_ser;
 use crate::archive::tile_encoding_result::TileEncodingResult;
 use crate::archive::writeable_tile_archive::{TileWriter, WriteableTileArchive};
+use crate::config::arguments::Arguments;
 use crate::files::files_archive_utils;
 use crate::files::tile_scheme_encoding::TileSchemeEncoding;
 use crate::geo::tile_order::TileOrder;
@@ -51,7 +51,7 @@ fn create_validate_directory(p: &Path) -> anyhow::Result<()> {
 impl WriteableFilesArchive {
     pub fn new_writer(
         base_path: &Path,
-        options: &ArchiveOptions,
+        options: &Arguments,
         overwrite_metadata: bool,
     ) -> anyhow::Result<WriteableFilesArchive> {
         let path_and_scheme = files_archive_utils::base_path_with_tile_scheme_encoding(options, base_path)?;
@@ -165,7 +165,7 @@ mod tests {
     fn test_write() {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
-        let mut archive = WriteableFilesArchive::new_writer(&tiles_dir, &ArchiveOptions::empty(), false).unwrap();
+        let mut archive = WriteableFilesArchive::new_writer(&tiles_dir, &Arguments::of(), false).unwrap();
         archive.initialize().unwrap();
         {
             let mut writer = archive.new_tile_writer().unwrap();
@@ -202,7 +202,7 @@ mod tests {
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let tiles_dir = tmp.path().join("tiles");
-            let options = ArchiveOptions::of_pairs(&[(OPTION_TILE_SCHEME, scheme)]);
+            let options = Arguments::of_pairs([(OPTION_TILE_SCHEME, scheme)]);
             let archive = WriteableFilesArchive::new_writer(&tiles_dir, &options, false).unwrap();
             let mut writer = archive.new_tile_writer().unwrap();
             writer.write(tile(1, 2, 3, 1, None)).unwrap();
@@ -223,7 +223,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let test_base = tmp.path().join("tiles");
             let mut archive =
-                WriteableFilesArchive::new_writer(&test_base.join(shortcut), &ArchiveOptions::empty(), false).unwrap();
+                WriteableFilesArchive::new_writer(&test_base.join(shortcut), &Arguments::of(), false).unwrap();
             {
                 let mut writer = archive.new_tile_writer().unwrap();
                 writer.write(tile(1, 2, 3, 1, None)).unwrap();
@@ -235,7 +235,7 @@ mod tests {
         }
     }
 
-    fn test_metadata_write(options: ArchiveOptions, output: &Path, metadata_path: &Path) {
+    fn test_metadata_write(options: Arguments, output: &Path, metadata_path: &Path) {
         let mut archive = WriteableFilesArchive::new_writer(output, &options, false).unwrap();
         archive.initialize().unwrap();
         archive.finish(&max_metadata_deserialized()).unwrap();
@@ -247,18 +247,14 @@ mod tests {
     fn test_metadata_write_default() {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
-        test_metadata_write(ArchiveOptions::empty(), &tiles_dir, &tiles_dir.join("metadata.json"));
+        test_metadata_write(Arguments::of(), &tiles_dir, &tiles_dir.join("metadata.json"));
     }
 
     #[test]
     fn test_metadata_write_relative() {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
-        test_metadata_write(
-            ArchiveOptions::of_pairs(&[(OPTION_METADATA_PATH, "x.y")]),
-            &tiles_dir,
-            &tiles_dir.join("x.y"),
-        );
+        test_metadata_write(Arguments::of_pairs([(OPTION_METADATA_PATH, "x.y")]), &tiles_dir, &tiles_dir.join("x.y"));
     }
 
     #[test]
@@ -267,14 +263,14 @@ mod tests {
         let tiles_dir = tmp.path().join("tiles");
         std::fs::create_dir(tmp.path().join("abs")).unwrap();
         let p = tmp.path().join("abs").join("abc.json");
-        test_metadata_write(ArchiveOptions::of_pairs(&[(OPTION_METADATA_PATH, &p.to_string_lossy())]), &tiles_dir, &p);
+        test_metadata_write(Arguments::of_pairs([(OPTION_METADATA_PATH, &p.to_string_lossy())]), &tiles_dir, &p);
     }
 
     #[test]
     fn test_metadata_write_none() {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
-        let options = ArchiveOptions::of_pairs(&[(OPTION_METADATA_PATH, "none")]);
+        let options = Arguments::of_pairs([(OPTION_METADATA_PATH, "none")]);
         let mut archive = WriteableFilesArchive::new_writer(&tiles_dir, &options, false).unwrap();
         archive.initialize().unwrap();
         archive.finish(&max_metadata_deserialized()).unwrap();
@@ -285,7 +281,7 @@ mod tests {
     fn test_metadata_fails_if_not_file() {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
-        let options = ArchiveOptions::of_pairs(&[(OPTION_METADATA_PATH, &tiles_dir.to_string_lossy())]);
+        let options = Arguments::of_pairs([(OPTION_METADATA_PATH, &tiles_dir.to_string_lossy())]);
         assert!(WriteableFilesArchive::new_writer(&tiles_dir, &options, false).is_err());
     }
 
@@ -295,7 +291,7 @@ mod tests {
         let tiles_dir = tmp.path().join("tiles");
         std::fs::create_dir(&tiles_dir).unwrap();
         std::fs::write(tiles_dir.join("metadata.json"), "something").unwrap();
-        assert!(WriteableFilesArchive::new_writer(&tiles_dir, &ArchiveOptions::empty(), false).is_err());
+        assert!(WriteableFilesArchive::new_writer(&tiles_dir, &Arguments::of(), false).is_err());
     }
 
     #[test]
@@ -305,7 +301,7 @@ mod tests {
         let metadata_path = tiles_dir.join("metadata.json");
         std::fs::create_dir(&tiles_dir).unwrap();
         std::fs::write(&metadata_path, "something").unwrap();
-        let mut archive = WriteableFilesArchive::new_writer(&tiles_dir, &ArchiveOptions::empty(), true).unwrap();
+        let mut archive = WriteableFilesArchive::new_writer(&tiles_dir, &Arguments::of(), true).unwrap();
         archive.initialize().unwrap();
         archive.finish(&max_metadata_deserialized()).unwrap();
         assert_same_json(MAX_METADATA_SERIALIZED, &std::fs::read_to_string(&metadata_path).unwrap());
@@ -315,7 +311,7 @@ mod tests {
     fn test_creates_path_if_not_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
-        let archive = WriteableFilesArchive::new_writer(&tiles_dir, &ArchiveOptions::empty(), false).unwrap();
+        let archive = WriteableFilesArchive::new_writer(&tiles_dir, &Arguments::of(), false).unwrap();
         let mut writer = archive.new_tile_writer().unwrap();
         writer.write(tile(0, 0, 0, 0, None)).unwrap();
         writer.close().unwrap();
@@ -327,7 +323,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
         std::fs::write(&tiles_dir, b"").unwrap();
-        assert!(WriteableFilesArchive::new_writer(&tiles_dir, &ArchiveOptions::empty(), false).is_err());
+        assert!(WriteableFilesArchive::new_writer(&tiles_dir, &Arguments::of(), false).is_err());
     }
 
     #[test]
@@ -335,7 +331,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
         std::fs::create_dir_all(tiles_dir.join("0/0/0.pbf")).unwrap();
-        let archive = WriteableFilesArchive::new_writer(&tiles_dir, &ArchiveOptions::empty(), false).unwrap();
+        let archive = WriteableFilesArchive::new_writer(&tiles_dir, &Arguments::of(), false).unwrap();
         let mut writer = archive.new_tile_writer().unwrap();
         assert!(writer.write(tile(0, 0, 0, 0, None)).is_err());
     }
@@ -346,7 +342,7 @@ mod tests {
         let tiles_dir = tmp.path().join("tiles");
         std::fs::create_dir_all(&tiles_dir).unwrap();
         std::fs::write(tiles_dir.join("0"), b"").unwrap();
-        let archive = WriteableFilesArchive::new_writer(&tiles_dir, &ArchiveOptions::empty(), false).unwrap();
+        let archive = WriteableFilesArchive::new_writer(&tiles_dir, &Arguments::of(), false).unwrap();
         let mut writer = archive.new_tile_writer().unwrap();
         assert!(writer.write(tile(0, 0, 0, 0, None)).is_err());
     }
@@ -356,7 +352,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
         std::fs::create_dir_all(&tiles_dir).unwrap();
-        let archive = WriteableFilesArchive::new_writer(&tiles_dir, &ArchiveOptions::empty(), false).unwrap();
+        let archive = WriteableFilesArchive::new_writer(&tiles_dir, &Arguments::of(), false).unwrap();
         assert!(!archive.deduplicates());
         assert_eq!(TileOrder::Tms, archive.tile_order());
     }

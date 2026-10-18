@@ -145,9 +145,9 @@ pub fn compare(db_path0: &Path, db_path1: &Path, fail_on_feature_diff: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::tile_archive_config::ArchiveOptions;
     use crate::archive::tile_encoding_result::TileEncodingResult;
     use crate::archive::writeable_tile_archive::WriteableTileArchive;
+    use crate::config::arguments::Arguments;
     use crate::util::gzip::gzip_zlib as gzip;
 
     fn tile(value: &str) -> Vec<u8> {
@@ -177,7 +177,7 @@ mod tests {
     }
 
     fn write(path: &Path, value: &str) {
-        let mut db = Mbtiles::new_write_to_file_database(path, &ArchiveOptions::empty()).unwrap();
+        let mut db = Mbtiles::new_write_to_file_database(path, &Arguments::of()).unwrap();
         db.initialize().unwrap();
         let mut w = db.new_tile_writer().unwrap();
         w.write(TileEncodingResult::new(TileCoord::of_xyz(0, 0, 0), tile(value), None)).unwrap();

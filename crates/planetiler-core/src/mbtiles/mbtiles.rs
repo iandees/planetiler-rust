@@ -16,11 +16,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::archive::readable_tile_archive::{ArchiveIter, ReadableTileArchive};
 use crate::archive::tile::Tile;
-use crate::archive::tile_archive_config::ArchiveOptions;
 use crate::archive::tile_archive_metadata::TileArchiveMetadata;
 use crate::archive::tile_archive_metadata_de_ser;
 use crate::archive::tile_encoding_result::TileEncodingResult;
 use crate::archive::writeable_tile_archive::{TileWriter, WriteableTileArchive};
+use crate::config::arguments::Arguments;
 use crate::geo::tile_coord::TileCoord;
 use crate::geo::tile_order::TileOrder;
 
@@ -122,7 +122,7 @@ pub struct Mbtiles {
 }
 
 impl Mbtiles {
-    fn new(connection: Connection, arguments: &ArchiveOptions, path: Option<PathBuf>) -> Mbtiles {
+    fn new(connection: Connection, arguments: &Arguments, path: Option<PathBuf>) -> Mbtiles {
         Mbtiles {
             connection: Mutex::new(connection),
             compact_db: arguments.get_boolean(
@@ -144,7 +144,7 @@ impl Mbtiles {
         }
     }
 
-    fn configure(conn: &Connection, defaults: &[(&str, String)], args: &ArchiveOptions) -> anyhow::Result<()> {
+    fn configure(conn: &Connection, defaults: &[(&str, String)], args: &Arguments) -> anyhow::Result<()> {
         let mut pragmas: Vec<(String, String)> = defaults.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
         for pragma in PRAGMAS {
             if let Some(value) = args.get_arg(pragma) {
@@ -161,7 +161,7 @@ impl Mbtiles {
 
     /// Returns a new mbtiles file that won't get written to disk. Useful for toy use-cases like unit tests.
     pub fn new_in_memory_database(compact_db: bool) -> Mbtiles {
-        Self::new_in_memory_database_with_options(&ArchiveOptions::of_pairs(&[(
+        Self::new_in_memory_database_with_options(&Arguments::of_pairs([(
             COMPACT_DB,
             if compact_db { "true" } else { "false" },
         )]))
@@ -169,7 +169,7 @@ impl Mbtiles {
     }
 
     /// Returns an in-memory database with extra mbtiles and pragma options set from `options`.
-    pub fn new_in_memory_database_with_options(options: &ArchiveOptions) -> anyhow::Result<Mbtiles> {
+    pub fn new_in_memory_database_with_options(options: &Arguments) -> anyhow::Result<Mbtiles> {
         let conn = Connection::open_in_memory()?;
         Self::configure(&conn, &[("application_id", MBTILES_APPLICATION_ID.to_string())], options)?;
         Ok(Self::new(conn, options, None))
@@ -177,7 +177,7 @@ impl Mbtiles {
 
     /// Returns a new connection to an mbtiles file optimized for fast bulk writes with extra mbtiles and pragma
     /// options set from `options`.
-    pub fn new_write_to_file_database(path: &Path, options: &ArchiveOptions) -> anyhow::Result<Mbtiles> {
+    pub fn new_write_to_file_database(path: &Path, options: &Arguments) -> anyhow::Result<Mbtiles> {
         let conn = Connection::open(path).with_context(|| format!("Unable to open {}", path.display()))?;
         Self::configure(
             &conn,
@@ -196,12 +196,12 @@ impl Mbtiles {
 
     /// Returns a new connection to an mbtiles file optimized for reads.
     pub fn new_read_only_database(path: &Path) -> anyhow::Result<Mbtiles> {
-        Self::new_read_only_database_with_options(path, &ArchiveOptions::empty())
+        Self::new_read_only_database_with_options(path, &Arguments::of())
     }
 
     /// Returns a new connection to an mbtiles file optimized for reads with extra mbtiles and pragma options set from
     /// `options`.
-    pub fn new_read_only_database_with_options(path: &Path, options: &ArchiveOptions) -> anyhow::Result<Mbtiles> {
+    pub fn new_read_only_database_with_options(path: &Path, options: &Arguments) -> anyhow::Result<Mbtiles> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
@@ -747,7 +747,7 @@ mod tests {
         optimize: bool,
         compact_db: bool,
     ) {
-        let options = ArchiveOptions::of_pairs(&[("compact", if compact_db { "true" } else { "false" })]);
+        let options = Arguments::of_pairs([("compact", if compact_db { "true" } else { "false" })]);
         let db = match path {
             None => Mbtiles::new_in_memory_database_with_options(&options).unwrap(),
             Some(p) => Mbtiles::new_write_to_file_database(p, &options).unwrap(),
@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_custom_pragma() {
-        let db = Mbtiles::new_in_memory_database_with_options(&ArchiveOptions::of_pairs(&[
+        let db = Mbtiles::new_in_memory_database_with_options(&Arguments::of_pairs([
             ("cache-size", "123"),
             ("garbage", "456"),
         ]))
@@ -973,7 +973,7 @@ mod tests {
     fn test_writeable_lifecycle() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("out.mbtiles");
-        let mut db = Mbtiles::new_write_to_file_database(&path, &ArchiveOptions::empty()).unwrap();
+        let mut db = Mbtiles::new_write_to_file_database(&path, &Arguments::of()).unwrap();
         db.initialize().unwrap();
         {
             let mut w = db.new_tile_writer().unwrap();
