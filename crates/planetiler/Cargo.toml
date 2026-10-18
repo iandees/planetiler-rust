@@ -10,6 +10,7 @@ planetiler-custommap.workspace = true
 planetiler-openmaptiles.workspace = true
 planetiler-examples.workspace = true
 anyhow.workspace = true
+geo-types.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 mimalloc = { workspace = true, optional = true }

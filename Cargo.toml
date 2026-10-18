@@ -45,6 +45,8 @@ parquet = "60"
 arrow = "60"
 csv = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# pure-Rust port of XZ for Java (what Java Planetiler uses) for the openstreetmap.org tile logs
+lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "xz", "optimization"] }
 
 # infra
 anyhow = "1"
