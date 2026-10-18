@@ -130,6 +130,30 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+/// Decodes standard base64 with optional padding (Java `Base64.getDecoder()`). Returns `None` on invalid input.
+pub fn base64_decode(data: &str) -> Option<Vec<u8>> {
+    let data = data.trim_end_matches('=').as_bytes();
+    if data.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() * 3 / 4);
+    for chunk in data.chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            let v = BASE64_CHARS.iter().position(|&b| b == c)? as u32;
+            n |= v << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Lowercase hex encoding (Java `HexFormat.of().formatHex`).
 pub fn hex_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len() * 2);
@@ -167,5 +191,11 @@ mod tests {
         assert_eq!("AAEC", base64_encode(&[0, 1, 2]));
         assert_eq!("", base64_encode(&[]));
         assert_eq!("0001ff", hex_encode(&[0, 1, 255]));
+        for data in [&[][..], &[0], &[0, 1], &[0, 1, 2], &[255, 254, 253, 252, 0, 7, 9]] {
+            assert_eq!(Some(data.to_vec()), base64_decode(&base64_encode(data)));
+        }
+        assert_eq!(Some(vec![0, 1]), base64_decode("AAE"));
+        assert_eq!(None, base64_decode("A"));
+        assert_eq!(None, base64_decode("A*=="));
     }
 }
