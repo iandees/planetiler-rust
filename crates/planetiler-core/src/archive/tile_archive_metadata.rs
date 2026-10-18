@@ -335,8 +335,10 @@ mod tests {
     #[test]
     fn test_add_metadata_small_bounds() {
         let bounds = Envelope::new(-73.6632, -69.7598, 41.1274, 43.0185);
-        let metadata =
-            TileArchiveMetadata::from_profile(&NullProfile, &config(&[("bounds", "-73.6632,41.1274,-69.7598,43.0185")]));
+        let metadata = TileArchiveMetadata::from_profile(
+            &NullProfile,
+            &config(&[("bounds", "-73.6632,41.1274,-69.7598,43.0185")]),
+        );
         assert_eq!(Some(bounds), metadata.bounds);
         let center = metadata.center.unwrap();
         assert!((-71.7115 - center.x).abs() < 1e-5);

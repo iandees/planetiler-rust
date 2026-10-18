@@ -181,3 +181,67 @@ macro_rules! impl_source_feature_traits {
 pub fn describe(feature: &dyn SourceFeature) -> String {
     format!("{:?}", feature.base())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geo::test_utils::new_point;
+    use crate::reader::simple_feature::SimpleFeature;
+    use crate::tags;
+
+    #[derive(Debug, PartialEq)]
+    struct Route(i64);
+    impl OsmRelationInfo for Route {
+        fn id(&self) -> i64 {
+            self.0
+        }
+    }
+
+    #[derive(Debug)]
+    struct Other(i64);
+    impl OsmRelationInfo for Other {
+        fn id(&self) -> i64 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn relation_info() {
+        let feature = SimpleFeature::create_fake_osm_feature(
+            new_point(0.0, 0.0),
+            tags! {"a" => "b"},
+            "osm",
+            "layer",
+            5,
+            vec![
+                RelationMember::new("r1", Arc::new(Route(1))).erase(),
+                RelationMember::new("r2", Arc::new(Other(2))).erase(),
+                RelationMember::with_path("r3", Arc::new(Route(3)), vec![4]).erase(),
+            ],
+            None,
+        );
+        let dyn_feature: &dyn SourceFeature = &feature;
+        assert!(dyn_feature.has_relation_info());
+        let routes = dyn_feature.relation_info::<Route>();
+        assert_eq!(1, routes.len());
+        assert_eq!("r1", routes[0].role());
+        assert_eq!(&Route(1), routes[0].relation());
+        let with_super = dyn_feature.relation_info_with_super::<Route>(true);
+        assert_eq!(vec![1, 3], with_super.iter().map(|r| r.relation().id()).collect::<Vec<_>>());
+        assert!(with_super[1].is_super_relation());
+        assert_eq!(1, dyn_feature.relation_info::<Other>().len());
+        assert_eq!(Some("osm"), dyn_feature.source());
+        assert_eq!(Some("layer"), dyn_feature.source_layer());
+        assert_eq!(5, dyn_feature.id());
+        assert_eq!(50, dyn_feature.vector_tile_feature_id(10, false));
+        assert!(dyn_feature.as_any_feature().downcast_ref::<SimpleFeature>().is_some());
+        assert!(dyn_feature.as_with_geometry_type().unwrap().is_point());
+
+        let plain = SimpleFeature::from_world_geometry(new_point(0.5, 0.5));
+        let plain: &dyn SourceFeature = &plain;
+        assert!(!plain.has_relation_info());
+        assert!(plain.relation_info::<Route>().is_empty());
+        assert!(plain.original_element().is_none());
+        assert_eq!(None, plain.source());
+    }
+}
