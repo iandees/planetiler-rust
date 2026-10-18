@@ -138,7 +138,8 @@ See the table at the bottom of this file; update it as modules are completed.
 
 - **EPSG codes** (`EPSG:2056`, `epsg:2056`, `urn:ogc:def:crs:EPSG::2056`, `urn:ogc:def:crs:EPSG:9.9:2056`,
   `http://www.opengis.net/def/crs/EPSG/0/2056`, `http://www.opengis.net/gml/srs/epsg.xml#2056`) come from an
-  embedded table (`geo/crs/epsg.tsv.zst`, 52 KB, ~900 KB uncompressed, decompressed on first use) of all 6,490 2D
+  embedded table (`geo/crs/epsg.tsv.zst`, 52 KB, ~900 KB uncompressed, decompressed on first use; the whole CRS
+  support adds ~180 KB to the stripped release binary) of all 6,490 2D
   geographic and projected CRS that GeoTools' `gt-epsg-hsql` 35.1 (EPSG dataset 11.031) can decode. It is generated
   from GeoTools itself: `tools/crs/DumpEpsg.java` dumps each CRS as WKT plus the datum shift GeoTools actually
   applies to get to WGS84 (Bursa-Wolf parameters, Molodensky, geocentric-only or identity, read from the
