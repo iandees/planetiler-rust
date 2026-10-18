@@ -593,12 +593,120 @@ fn buffer_geometry(distance: f64, geom: &Geometry<f64>) -> GeometryResult<Geomet
                 .collect();
     }
     let style = BufferStyle::new(distance).line_join(LineJoin::Miter(mitre_angle()));
+    let tolerance = collinear_tolerance(&polys, distance);
     let result = if polys.len() == 1 {
         polys.pop().unwrap().buffer_with_style(style)
     } else {
         MultiPolygon(polys).buffer_with_style(style)
     };
-    Ok(polygon_overlay::to_polygonal(result.0))
+    let result = result.0.into_iter().filter_map(|p| remove_near_collinear_vertices(p, tolerance)).collect();
+    Ok(polygon_overlay::to_polygonal(result))
+}
+
+/// Tolerance for [`remove_near_collinear_vertices`] on the buffer output of `polys` by `distance`.
+///
+/// geo's `Buffer` (i_overlay) works on an integer grid fitted to the output bounds; its mitre joins emit the two ends
+/// of the adjacent offset segments plus the mitre point, and the two ends are rounded to that grid independently, so
+/// they end up a few grid units off the true (straight) edge. `H * 2^-25` with `H = 0.5 * max(width, height) + 6|d|`
+/// is about 16-32 grid units: well above that rounding error, and far below the offset of any real vertex on the
+/// 1/16 px tile grid.
+fn collinear_tolerance(polys: &[Polygon<f64>], distance: f64) -> f64 {
+    let mut min = Coord { x: f64::INFINITY, y: f64::INFINITY };
+    let mut max = Coord { x: f64::NEG_INFINITY, y: f64::NEG_INFINITY };
+    for c in polys.iter().flat_map(|p| p.exterior().0.iter()) {
+        min = Coord { x: min.x.min(c.x), y: min.y.min(c.y) };
+        max = Coord { x: max.x.max(c.x), y: max.y.max(c.y) };
+    }
+    let half_extent = 0.5 * (max.x - min.x).max(max.y - min.y);
+    (half_extent + 6.0 * distance.abs()) * 2f64.powi(-25)
+}
+
+/// Removes vertices that lie within `tolerance` of the line through their neighbors from the rings of a `geo::Buffer`
+/// output polygon (JTS buffer output never has collinear vertices). Spikes (where the path doubles back) are kept.
+/// Returns `None` if the exterior ring collapses; collapsed holes are dropped.
+fn remove_near_collinear_vertices(poly: Polygon<f64>, tolerance: f64) -> Option<Polygon<f64>> {
+    let (exterior, interiors) = poly.into_inner();
+    let exterior = remove_near_collinear_ring(exterior, tolerance)?;
+    let interiors = interiors.into_iter().filter_map(|r| remove_near_collinear_ring(r, tolerance)).collect();
+    Some(Polygon::new(exterior, interiors))
+}
+
+/// Distance of `b` from the line through `a` and `c`, or `None` if `b` is not between them (a spike, where the path
+/// doubles back at `b`, or a degenerate `a == c`).
+fn collinear_deviation(a: Coord<f64>, b: Coord<f64>, c: Coord<f64>) -> Option<f64> {
+    let (ab, ac, bc) = (b - a, c - a, c - b);
+    let len = ac.x.hypot(ac.y);
+    if len == 0.0 || ab.x * bc.x + ab.y * bc.y <= 0.0 {
+        return None;
+    }
+    Some((ab.x * ac.y - ab.y * ac.x).abs() / len)
+}
+
+/// Removes vertices within `tolerance` of the line through their (remaining) neighbors, smallest deviation first.
+///
+/// Going smallest-first matters at very shallow outside corners: there geo emits three vertices (the two offset
+/// segment ends and the mitre point) that are all within `tolerance` of each other's lines, but only the two ends lie
+/// on the true edges. Removing greedily leaves one of the three (all within `d * tan(angle / 2)` of the corner), which
+/// is then far from the line through the next real vertices on either side and is kept, like the single vertex JTS
+/// emits for such corners.
+fn remove_near_collinear_ring(ring: LineString<f64>, tolerance: f64) -> Option<LineString<f64>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let mut pts = ring.0;
+    if pts.len() > 1 && pts.first() == pts.last() {
+        pts.pop();
+    }
+    let n = pts.len();
+    if n < 3 {
+        return None;
+    }
+    let mut prev: Vec<usize> = (0..n).map(|i| (i + n - 1) % n).collect();
+    let mut next: Vec<usize> = (0..n).map(|i| (i + 1) % n).collect();
+    let mut version = vec![0u32; n];
+    let mut alive = vec![true; n];
+    let mut remaining = n;
+    // deviations are non-negative, so their bit patterns sort like the values
+    let mut heap: BinaryHeap<Reverse<(u64, usize, u32)>> = BinaryHeap::new();
+    let push = |heap: &mut BinaryHeap<_>, i: usize, prev: &[usize], next: &[usize], version: &[u32]| {
+        if let Some(dev) = collinear_deviation(pts[prev[i]], pts[i], pts[next[i]])
+            && dev <= tolerance
+        {
+            heap.push(Reverse((dev.to_bits(), i, version[i])));
+        }
+    };
+    for i in 0..n {
+        push(&mut heap, i, &prev, &next, &version);
+    }
+    while let Some(Reverse((_, i, v))) = heap.pop() {
+        if !alive[i] || v != version[i] {
+            continue;
+        }
+        if remaining <= 3 {
+            return None;
+        }
+        alive[i] = false;
+        remaining -= 1;
+        let (p, q) = (prev[i], next[i]);
+        next[p] = q;
+        prev[q] = p;
+        for j in [p, q] {
+            version[j] += 1;
+            push(&mut heap, j, &prev, &next, &version);
+        }
+    }
+    let start = (0..n).find(|&i| alive[i])?;
+    let mut out = Vec::with_capacity(remaining + 1);
+    let mut i = start;
+    loop {
+        out.push(pts[i]);
+        i = next[i];
+        if i == start {
+            break;
+        }
+    }
+    out.push(pts[start]);
+    Some(LineString(out))
 }
 
 /// Puts all polygons within `geom` over `min_area` into `result`, removing holes under `min_hole_area`.
@@ -1727,5 +1835,88 @@ mod tests {
             assert!(crate::geo::is_valid::is_valid(&decoded));
             assert!(!decoded.intersects(&should_be_island));
         }
+    }
+
+    fn rotated(poly: &Polygon<f64>, degrees: f64, origin: (f64, f64)) -> Polygon<f64> {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let rotate =
+            |c: &Coord<f64>| Coord { x: origin.0 + c.x * cos - c.y * sin, y: origin.1 + c.x * sin + c.y * cos };
+        Polygon::new(LineString(poly.exterior().0.iter().map(rotate).collect()), vec![])
+    }
+
+    fn merged_exterior(polys: &[Polygon<f64>]) -> Polygon<f64> {
+        let features = polys.iter().enumerate().map(|(i, p)| feature(i as i64 + 1, p.clone(), a1())).collect();
+        let merged = merge_nearby(features, 0.0, 0.0, 0.5, 0.5);
+        assert_eq!(1, merged.len());
+        let Geometry::Polygon(poly) = merged[0].geometry.decode().unwrap() else { panic!("not a polygon") };
+        poly
+    }
+
+    /// geo's mitre buffer emits 3 vertices per outside corner where JTS emits 1; after buffer/union/unbuffer the 2
+    /// extra (near-collinear) points survive on every concave corner of non-axis-aligned shapes unless they are
+    /// removed (docs/analysis-merge-vertices.md). Expected output is Java's
+    /// `FeatureMerge.mergeNearbyPolygons(features, 0, 0, 0.5, 0.5)` on the same input (some keep a vertex or two
+    /// where rounding the input to the tile grid left the bridged edges slightly non-collinear). Before the fix the
+    /// 30° L had 11 points instead of 8.
+    #[test]
+    fn merge_rotated_polygons_match_java() {
+        /// (rotation, L point count, L from Java, rectangles point count, rectangles from Java)
+        type JavaCase = (f64, usize, &'static [f64], usize, &'static [f64]);
+        #[rustfmt::skip]
+        let cases: [JavaCase; 5] = [
+            (0.0,
+             7, &[100.0, 100.0, 120.0, 100.0, 120.0, 108.0, 108.0, 108.0, 108.0, 120.0, 100.0, 120.0, 100.0, 100.0],
+             5, &[100.0, 100.0, 130.0, 100.0, 130.0, 120.0, 100.0, 120.0, 100.0, 100.0]),
+            (30.0,
+             8, &[95.875, 107.125, 100.0, 100.0, 117.3125, 110.0, 113.3125, 116.9375, 102.9375, 110.9375, 96.9375,
+                  121.3125, 90.0, 117.3125, 95.875, 107.125],
+             7, &[94.875, 108.875, 100.0, 100.0, 126.0, 115.0, 121.0, 123.6875, 116.0, 132.3125, 90.0, 117.3125,
+                  94.875, 108.875]),
+            (17.0,
+             9, &[97.5625, 107.875, 97.625, 107.875, 100.0, 100.0, 119.125, 105.875, 116.8125, 113.5, 105.3125, 110.0,
+                  101.8125, 121.4375, 94.125, 119.125, 97.5625, 107.875],
+             7, &[97.0625, 109.5625, 100.0, 100.0, 128.6875, 108.75, 125.6875, 118.5625, 122.8125, 127.875, 94.125,
+                  119.125, 97.0625, 109.5625]),
+            (45.0,
+             7, &[100.0, 100.0, 114.125, 114.125, 108.5, 119.8125, 100.0, 111.3125, 91.5, 119.8125, 85.875, 114.125,
+                  100.0, 100.0],
+             7, &[100.0, 100.0, 121.1875, 121.1875, 114.125, 128.3125, 114.0625, 128.25, 107.0625, 135.375, 85.875,
+                  114.125, 100.0, 100.0]),
+            (72.0,
+             8, &[92.125, 102.5625, 100.0, 100.0, 106.1875, 119.0, 98.5625, 121.5, 94.875, 110.125, 83.4375, 113.8125,
+                  81.0, 106.1875, 92.125, 102.5625],
+             8, &[90.5, 103.0625, 100.0, 100.0, 109.25, 128.5625, 99.75, 131.625, 90.25, 134.6875, 81.0, 106.1875,
+                  90.5, 103.125, 90.5, 103.0625]),
+        ];
+        for (degrees, l_points, l_java, r_points, r_java) in cases {
+            let rot = |p: Polygon<f64>| rotated(&p, degrees, (100.0, 100.0));
+            // two rectangles with a small gap forming an L
+            let l = merged_exterior(&[rot(rect_xy(0.0, 0.0, 20.0, 8.0)), rot(rect_xy(0.0, 8.25, 8.0, 20.0))]);
+            assert_eq!(l_points, l.exterior().0.len(), "L rotated {degrees}: {l:?}");
+            assert_same_normalized_feature(&new_polygon(l_java).into(), &l.into());
+            // two rectangles with a small gap along a shared edge
+            let r = merged_exterior(&[rot(rect_xy(0.0, 0.0, 30.0, 10.0)), rot(rect_xy(0.0, 10.25, 30.0, 20.0))]);
+            assert_eq!(r_points, r.exterior().0.len(), "rectangles rotated {degrees}: {r:?}");
+            assert_same_normalized_feature(&new_polygon(r_java).into(), &r.into());
+        }
+    }
+
+    #[test]
+    fn remove_near_collinear_ring_keeps_corners_and_spikes() {
+        let ring = |c: &[f64]| LineString(c.chunks(2).map(|p| Coord { x: p[0], y: p[1] }).collect::<Vec<_>>());
+        // a point 1e-9 off the bottom edge, and one exactly on the closing edge (the ring's start)
+        let input = ring(&[5.0, 0.0, 10.0, 1e-9, 20.0, 0.0, 20.0, 10.0, 0.0, 10.0, 0.0, 0.0, 5.0, 0.0]);
+        let out = remove_near_collinear_ring(input, 1e-6).unwrap();
+        assert_eq!(ring(&[20.0, 0.0, 20.0, 10.0, 0.0, 10.0, 0.0, 0.0, 20.0, 0.0]), out);
+        // spikes double back so they are kept
+        let spike = ring(&[0.0, 0.0, 10.0, 0.0, 5.0, 0.0, 5.0, 5.0, 0.0, 0.0]);
+        assert_eq!(spike.clone(), remove_near_collinear_ring(spike, 1e-6).unwrap());
+        // a very shallow corner emitted as (offset end, mitre point, offset end) keeps exactly one vertex
+        let input = ring(&[0.0, 0.0, 49.999, 0.0, 50.0, 0.0, 50.001, 0.00001, 100.0, 0.5, 100.0, 50.0, 0.0, 50.0]);
+        let out = remove_near_collinear_ring(input, 1e-5).unwrap();
+        assert_eq!(6, out.0.len(), "{out:?}");
+        assert!(out.0.iter().any(|c| (c.x - 50.0).abs() < 0.002 && c.y.abs() < 0.001), "{out:?}");
+        // degenerate rings collapse
+        assert_eq!(None, remove_near_collinear_ring(ring(&[0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0]), 1e-6));
     }
 }
