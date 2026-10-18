@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn other_inputs_are_not_contexts() {
-        let tags = Tags::new();
+        let tags = Tags::default();
         assert!(ScriptContext::from_input(&tags).is_none());
     }
 }

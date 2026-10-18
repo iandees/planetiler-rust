@@ -465,7 +465,7 @@ mod tests {
         let feature = |id, xy: f64, attrs, group| vt_feature(LAYER_NAME, id, &new_point(xy, xy).into(), attrs, group);
         // Java sets dropped features to null, Rust gives them an empty geometry
         let dropped = |id, xy: f64, group| {
-            let mut f = feature(id, xy, Tags::new(), group);
+            let mut f = feature(id, xy, Tags::default(), group);
             f.geometry =
                 planetiler_core::vector_tile::VectorGeometry::new(Vec::<i32>::new(), f.geometry.geom_type(), 0);
             f
