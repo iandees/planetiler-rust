@@ -7,13 +7,14 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, bounded};
 use parking_lot::Mutex;
 
 use super::long_merger;
 use super::sortable_feature::SortableFeature;
+use crate::stats::stats::StatsRef;
+use crate::worker::worker::Worker;
 
 /// A boxed iterator over sorted features.
 ///
@@ -83,38 +84,39 @@ pub trait FeatureSort: Send + Sync {
         anyhow::bail!("Can't initialize chunk manifest: sorter is not ExternalMergeSort")
     }
 
-    /// Reads features using `threads` parallel threads (each reading one shard) and merges them into a sorted
-    /// iterator.
-    fn parallel_iterator(&self, threads: usize) -> anyhow::Result<ParallelIterator> {
+    /// Reads features using `threads` parallel threads (each reading one shard, in a [`Worker`] named `read`) and
+    /// merges them into a sorted iterator.
+    fn parallel_iterator(&self, stats: StatsRef, threads: usize) -> anyhow::Result<ParallelIterator> {
         let threads = threads.max(1);
-        let mut handles = Vec::with_capacity(threads);
+        let mut shards = Vec::with_capacity(threads);
         let mut receivers = Vec::with_capacity(threads);
         for shard in 0..threads {
             let iter = self.iterator(shard, threads)?;
             let (tx, rx) = bounded::<Batch>(16);
             receivers.push(rx);
-            let handle = std::thread::Builder::new().name(format!("read-{}", shard + 1)).spawn(move || {
-                crate::stats::process_info::register_current_thread();
-                let mut batch = Vec::with_capacity(BATCH_SIZE);
-                for item in iter {
-                    batch.push(item);
-                    if batch.len() >= BATCH_SIZE {
-                        let full = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE));
-                        if tx.send(Batch::Items(full)).is_err() {
-                            return; // consumer went away
-                        }
+            shards.push(Mutex::new(Some((iter, tx))));
+        }
+        let reader = Worker::new("read", stats, threads, move |shard| {
+            let Some((iter, tx)) = shards[shard].lock().take() else { return Ok(()) };
+            let mut batch = Vec::with_capacity(BATCH_SIZE);
+            for item in iter {
+                batch.push(item);
+                if batch.len() >= BATCH_SIZE {
+                    let full = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE));
+                    if tx.send(Batch::Items(full)).is_err() {
+                        return Ok(()); // consumer went away
                     }
                 }
-                if !batch.is_empty() {
-                    let _ = tx.send(Batch::Items(batch));
-                }
-                let _ = tx.send(Batch::Done);
-            })?;
-            handles.push(handle);
-        }
+            }
+            if !batch.is_empty() {
+                let _ = tx.send(Batch::Items(batch));
+            }
+            let _ = tx.send(Batch::Done);
+            Ok(())
+        });
         let iters: Vec<ChannelIter> = receivers.into_iter().map(ChannelIter::new).collect();
         let merged = long_merger::merge_iterators(iters, SortableFeature::compare_bytes);
-        Ok(ParallelIterator { reader_threads: handles, iterator: Box::new(merged) })
+        Ok(ParallelIterator { reader, iterator: Box::new(merged) })
     }
 }
 
@@ -159,24 +161,19 @@ impl Iterator for ChannelIter {
     }
 }
 
-/// Handle to the reader threads spawned by [`FeatureSort::parallel_iterator`] plus the merged iterator.
-///
-/// TODO(port): Java returns a `Worker` so pipeline stats can be logged; this exposes the raw thread handles.
+/// The reader threads spawned by [`FeatureSort::parallel_iterator`] (log them with
+/// [`ProgressLoggers::add_thread_pool_stats_for_worker`](crate::stats::progress_loggers::ProgressLoggers::add_thread_pool_stats_for_worker))
+/// plus the merged iterator.
 pub struct ParallelIterator {
-    pub reader_threads: Vec<JoinHandle<()>>,
+    pub reader: Worker,
     pub iterator: FeatureIter,
 }
 
 impl ParallelIterator {
-    /// Waits for all reader threads to finish, returning an error if any panicked.
+    /// Stops iterating and waits for all reader threads to finish, returning an error if any failed.
     pub fn join(self) -> anyhow::Result<()> {
         drop(self.iterator);
-        for handle in self.reader_threads {
-            if handle.join().is_err() {
-                anyhow::bail!("feature reader thread panicked");
-            }
-        }
-        Ok(())
+        self.reader.await_done()
     }
 }
 
@@ -281,7 +278,7 @@ mod tests {
         assert_eq!(3, sorter.num_features_written());
         assert_eq!(vec![entry(1), entry(3)], sorter.iterator(0, 2).unwrap().collect::<Vec<_>>());
         assert!(sorter.iterator(2, 2).is_err());
-        let par: Vec<_> = sorter.parallel_iterator(2).unwrap().collect();
+        let par: Vec<_> = sorter.parallel_iterator(crate::stats::stats::InMemoryStats::arc(), 2).unwrap().collect();
         assert_eq!(vec![entry(1), entry(2), entry(3)], par);
     }
 }

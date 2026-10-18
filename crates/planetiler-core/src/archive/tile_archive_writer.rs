@@ -165,8 +165,8 @@ pub fn write_output(
         .new_line()
         .add_process_stats()
         .new_line();
-    if read_threads > 1 {
-        loggers = loggers.add_thread_pool_stats("read", "read-");
+    if let Some(reader) = input_tiles.reader() {
+        loggers = loggers.add_thread_pool_stats_for_worker("read", reader);
     }
     loggers = loggers
         .add_thread_pool_stats(second_stage_name, &format!("archive_{second_stage_name}-"))

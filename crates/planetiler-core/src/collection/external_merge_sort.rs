@@ -15,7 +15,9 @@
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -35,8 +37,12 @@ use super::long_merger;
 use super::sortable_feature::SortableFeature;
 use crate::config::planetiler_config::PlanetilerConfig;
 use crate::stats::process_info;
+use crate::stats::progress_loggers::ProgressLoggers;
 use crate::stats::stats::StatsRef;
 use crate::util::async_file_writer::AsyncFileWriter;
+use crate::util::file_utils::DiskBacked;
+use crate::worker::work_queue::QueueHandle;
+use crate::worker::{Done, panic_to_error};
 
 const MAX_CHUNK_SIZE: u64 = 2_000_000_000; // 2GB
 const WRITE_BUFFER_BYTES: usize = 1 << 20;
@@ -318,6 +324,35 @@ impl ExternalMergeSort {
                 .collect();
             handles.into_iter().map(|h| h.join().expect("sort writer panicked")).collect()
         })
+    }
+}
+
+/// The groups of chunks waiting to be sorted, reported like a work queue in progress logs.
+struct GroupQueue {
+    groups: Mutex<std::vec::IntoIter<(usize, Vec<Chunk>)>>,
+    capacity: usize,
+}
+
+impl QueueHandle for GroupQueue {
+    fn get_pending(&self) -> usize {
+        self.groups.lock().len()
+    }
+
+    fn get_capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn close(&self) {}
+
+    fn abort(&self) {}
+}
+
+/// Size of the sort's temporary directory, for progress logs.
+struct DirSize(PathBuf);
+
+impl DiskBacked for DirSize {
+    fn disk_usage_bytes(&self) -> u64 {
+        crate::util::file_utils::size(&self.0).unwrap_or(0)
     }
 }
 
@@ -783,46 +818,68 @@ impl FeatureSort for ExternalMergeSort {
         let read_sem = Semaphore::new(self.reader_limit);
         let write_sem = Semaphore::new(self.writer_limit);
         let timing = Timing::default();
-        let done = AtomicUsize::new(0);
+        let done_counter = Arc::new(AtomicUsize::new(0));
         let num_groups = groups.len();
-        let queue: Mutex<std::vec::IntoIter<(usize, Vec<Chunk>)>> =
-            Mutex::new(groups.into_iter().enumerate().collect::<Vec<_>>().into_iter());
+        let queue = Arc::new(GroupQueue {
+            groups: Mutex::new(groups.into_iter().enumerate().collect::<Vec<_>>().into_iter()),
+            capacity: num_groups,
+        });
         let results: Mutex<Vec<Option<anyhow::Result<Vec<Chunk>>>>> =
             Mutex::new((0..num_groups).map(|_| None).collect());
         let failed = AtomicBool::new(false);
         let threads = self.workers.min(num_groups).max(1);
         let this = &*self;
 
-        std::thread::scope(|s| {
+        // Java runs this as a `sort` worker pipeline (`item_queue` -> `worker` threads); these are scoped threads
+        // named like that pipeline's threads so they can borrow the sorter, and they log the same way
+        let prefix = "sort_worker";
+        self.stats.gauge_value(&format!("{prefix}_threads"), threads as f64);
+        let loggers = {
+            let done_counter = done_counter.clone();
+            ProgressLoggers::create()
+                .add_percent_counter("chunks", num_groups as i64, move || done_counter.load(Ordering::Relaxed) as i64)
+                .add_file_size(Arc::new(DirSize(self.dir.clone())))
+                .new_line()
+                .add_process_stats()
+                .new_line()
+                .add_queue_stats(queue.clone())
+                .add_thread_pool_stats("worker", &format!("{prefix}-"))
+        };
+
+        let result = std::thread::scope(|s| {
+            let mut dones = Vec::with_capacity(threads);
             for i in 0..threads {
-                let (queue, results, read_sem, write_sem, timing, done, failed) =
-                    (&queue, &results, &read_sem, &write_sem, &timing, &done, &failed);
-                std::thread::Builder::new()
-                    .name(format!("sort-worker-{i}"))
-                    .spawn_scoped(s, move || {
+                let (queue, results, read_sem, write_sem, timing, done_counter, failed) =
+                    (&queue, &results, &read_sem, &write_sem, &timing, &done_counter, &failed);
+                let done = Done::new();
+                dones.push(done.clone());
+                let stats = &self.stats;
+                let spawned =
+                    std::thread::Builder::new().name(format!("{prefix}-{}", i + 1)).spawn_scoped(s, move || {
+                        process_info::register_current_thread();
+                        let start = std::time::Instant::now();
                         while !failed.load(Ordering::Relaxed) {
-                            let Some((idx, group)) = queue.lock().next() else { break };
-                            let result = this.sort_group(group, read_sem, write_sem, timing);
+                            let Some((idx, group)) = queue.groups.lock().next() else { break };
+                            let result =
+                                catch_unwind(AssertUnwindSafe(|| this.sort_group(group, read_sem, write_sem, timing)))
+                                    .unwrap_or_else(|payload| Err(panic_to_error(payload)));
                             if result.is_err() {
                                 failed.store(true, Ordering::Relaxed);
                             }
                             results.lock()[idx] = Some(result);
-                            done.fetch_add(1, Ordering::Relaxed);
+                            done_counter.fetch_add(1, Ordering::Relaxed);
                         }
-                    })
-                    .expect("spawn sort worker");
-            }
-            // TODO(port): Java logs progress with ProgressLoggers (percent of chunks done, file size, pipeline stats).
-            let start = std::time::Instant::now();
-            let mut last_log = start;
-            while done.load(Ordering::Relaxed) < num_groups && !failed.load(Ordering::Relaxed) {
-                std::thread::park_timeout(Duration::from_millis(50));
-                if last_log.elapsed() >= this.log_interval {
-                    last_log = std::time::Instant::now();
-                    info!("[sort] chunks: {} / {num_groups}", done.load(Ordering::Relaxed));
+                        stats.timers().finished_worker_thread(prefix, start.elapsed());
+                        done.complete(Ok(()));
+                    });
+                if let Err(e) = spawned {
+                    failed.store(true, Ordering::Relaxed);
+                    dones.last().unwrap().fail(anyhow::Error::new(e).context("Failed to spawn sort worker thread"));
                 }
             }
+            loggers.await_and_log(&Done::join_all(dones), this.log_interval)
         });
+        result?;
 
         let mut sorted_chunks = Vec::with_capacity(num_groups);
         let mut sorted_groups = 0;
@@ -1120,7 +1177,7 @@ mod tests {
             sorter.sort().unwrap();
             assert_eq!(sorted, sorter.to_list(), "gzip={gzip} mmap={mmap}");
             // parallel iterator gives the same result
-            let par = sorter.parallel_iterator(3).unwrap();
+            let par = sorter.parallel_iterator(InMemoryStats::arc(), 3).unwrap();
             assert_eq!(sorted, par.collect::<Vec<_>>(), "gzip={gzip} mmap={mmap}");
             // shards cover everything
             let mut all: Vec<_> = (0..3).flat_map(|s| sorter.iterator(s, 3).unwrap()).collect();
