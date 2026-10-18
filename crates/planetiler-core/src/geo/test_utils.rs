@@ -214,3 +214,58 @@ pub fn assert_lists_contain_same_elements<T: std::fmt::Debug>(expected: &[T], ac
     a.sort();
     assert_eq!(e, a);
 }
+
+/// Geometries rendered into each tile (Java's `Map<TileCoord, Collection<Geometry>>` in renderer tests).
+pub type TileGeometries = std::collections::BTreeMap<crate::geo::tile_coord::TileCoord, Vec<Geometry<f64>>>;
+
+/// Builds a [`TileGeometries`] map from `(tile, geometries)` entries.
+pub fn tile_geometries(
+    entries: impl IntoIterator<Item = (crate::geo::tile_coord::TileCoord, Vec<Geometry<f64>>)>,
+) -> TileGeometries {
+    entries.into_iter().collect()
+}
+
+/// Decodes a vector tile geometry to tile pixel coordinates, panicking on failure (Java `decodeSilently`).
+pub fn decode_silently(geom: &crate::vector_tile::VectorGeometry) -> Geometry<f64> {
+    geom.decode().unwrap_or_else(|e| panic!("failed to decode {geom:?}: {e:?}"))
+}
+
+fn sorted_by_debug(geoms: impl IntoIterator<Item = Geometry<f64>>) -> Vec<Geometry<f64>> {
+    let mut result: Vec<(String, Geometry<f64>)> = geoms.into_iter().map(|g| (format!("{g:?}"), g)).collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result.into_iter().map(|(_, g)| g).collect()
+}
+
+fn map_tile_features(input: &TileGeometries, f: impl Fn(&Geometry<f64>) -> Geometry<f64>) -> TileGeometries {
+    input.iter().map(|(tile, geoms)| (*tile, sorted_by_debug(geoms.iter().map(&f)))).collect()
+}
+
+/// Asserts that both maps contain exactly the same geometries in each tile, in any order (Java
+/// `assertExactSameFeatures`).
+#[track_caller]
+pub fn assert_exact_same_features(expected: &TileGeometries, actual: &TileGeometries) {
+    assert_eq!(map_tile_features(expected, Clone::clone), map_tile_features(actual, Clone::clone));
+}
+
+/// Asserts that both maps contain the same normalized geometries in each tile, in any order (Java
+/// `assertSameNormalizedFeatures`).
+#[track_caller]
+pub fn assert_same_normalized_features(expected: &TileGeometries, actual: &TileGeometries) {
+    assert_eq!(map_tile_features(expected, norm), map_tile_features(actual, norm));
+}
+
+/// Asserts that both maps contain topologically equivalent geometries in each tile (Java
+/// `assertTopologicallyEquivalentFeatures`).
+#[track_caller]
+pub fn assert_topologically_equivalent_features(expected: &TileGeometries, actual: &TileGeometries) {
+    let e = map_tile_features(expected, norm);
+    let a = map_tile_features(actual, norm);
+    assert_eq!(e.keys().collect::<Vec<_>>(), a.keys().collect::<Vec<_>>(), "tiles differ: {e:?} != {a:?}");
+    for (tile, eg) in &e {
+        let ag = &a[tile];
+        assert_eq!(eg.len(), ag.len(), "{tile:?}: {eg:?} != {ag:?}");
+        for (x, y) in eg.iter().zip(ag) {
+            assert!(x.relate(y).is_equal_topo(), "{tile:?}: not topologically equal:\n{x:?}\n{y:?}");
+        }
+    }
+}
