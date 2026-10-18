@@ -459,3 +459,8 @@ the geometry value with an internal `"\0name\0args"` key since overloads can't d
 `OsmReader.canBeLine`. Tests: `tests/{configured_feature_test, expression_tests, schema_tests}.rs` (the latter has a
 test-only port of `BaseSchemaValidator.validate` running the full shortbread spec, plus an ignored
 `bench_shortbread` throughput check: ~0.9M features/s/thread in release).
+- custommap: wire `post_process_layer_features` merging to `planetiler_core::feature_merge`; switch
+  `tests/schema_tests.rs` to `planetiler_core::validator`; port the SchemaValidator CLI/watch, ConfiguredMapTest and
+  the `ConfiguredMapMain` run call once the orchestrator lands.
+- custommap CEL gaps vs cel-java (no type checker, `1 == 1.0` is true, Rust regex syntax in `replaceRegex`): consider
+  closing these if real schemas hit them.
