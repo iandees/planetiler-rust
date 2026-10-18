@@ -1,4 +1,5 @@
 pub mod ansi_colors;
+pub mod async_file_writer;
 pub mod aws_osm;
 pub mod bin_pack;
 pub mod build_info;

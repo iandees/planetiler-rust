@@ -4,7 +4,9 @@
 //! Writers append features to a "chunk" file that can be sorted with a fixed amount of RAM, then start writing to a
 //! new chunk. [`FeatureSort::sort`] groups small chunks together, then sorts each group in memory in parallel
 //! (limiting the number of concurrent readers/writers) and writes it back out. Reads do a k-way merge of the sorted
-//! chunks using a min-heap of the next value from each.
+//! chunks using a min-heap of the next value from each. Writers record a record boundary every 32 MB, so an
+//! uncompressed, memory-mapped group is read back into memory by several threads (a single 880 MB chunk took 0.26s
+//! on one thread for Switzerland).
 //!
 //! Chunk file format (internal, native to this port): for each feature `key: i64 LE`, `len: u32 LE`, `len` bytes.
 //! With `compress` the whole file is gzip-compressed (Java uses snappy). With `mmap` chunks are read through a
@@ -34,6 +36,7 @@ use super::sortable_feature::SortableFeature;
 use crate::config::planetiler_config::PlanetilerConfig;
 use crate::stats::process_info;
 use crate::stats::stats::StatsRef;
+use crate::util::async_file_writer::AsyncFileWriter;
 
 const MAX_CHUNK_SIZE: u64 = 2_000_000_000; // 2GB
 const WRITE_BUFFER_BYTES: usize = 1 << 20;
@@ -75,7 +78,24 @@ struct Chunk {
     path: PathBuf,
     item_count: u64,
     bytes_in_memory: u64,
+    /// Record boundaries about every [`SPLIT_BYTES`] of the file (excluding the start), recorded while writing so
+    /// the chunk can be read back by several threads. Empty for chunks from a manifest or written by the sort.
+    splits: Vec<Split>,
 }
+
+/// A record boundary in a chunk file: its byte offset, the index of the record that starts there, and the total
+/// value bytes of the records before it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Split {
+    file_offset: u64,
+    item: u64,
+    data_offset: u64,
+}
+
+/// Bytes of a chunk file between recorded [`Split`]s.
+const SPLIT_BYTES: u64 = if cfg!(test) { 256 } else { 32 << 20 };
+/// Record header size in chunk files: key (8 bytes) and value length (4 bytes).
+const HEADER_BYTES: u64 = 12;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -200,7 +220,15 @@ impl ExternalMergeSort {
     fn new_chunk_writer(&self) -> anyhow::Result<ChunkWriter> {
         let num = self.chunk_num.fetch_add(1, Ordering::Relaxed) + 1;
         let path = self.dir.join(format!("chunk{num}"));
-        Ok(ChunkWriter { out: open_writer(&path, self.compress)?, path, item_count: 0, bytes_in_memory: 0 })
+        Ok(ChunkWriter {
+            out: open_writer(&path, self.compress)?,
+            path,
+            item_count: 0,
+            bytes_in_memory: 0,
+            file_bytes: 0,
+            data_bytes: 0,
+            splits: Vec::new(),
+        })
     }
 
     fn open_reader(&self, chunk: &Chunk) -> io::Result<ChunkReader> {
@@ -229,9 +257,14 @@ impl ExternalMergeSort {
                 data: Vec::with_capacity(data_bytes as usize),
                 entries: Vec::with_capacity(item_count as usize),
             };
-            for chunk in &group {
-                let mut reader = self.open_reader(chunk).with_context(|| format!("Unable to open {:?}", chunk.path))?;
-                reader.read_all_into(&mut sortable).with_context(|| format!("Error reading {:?}", chunk.path))?;
+            if self.mmap_io && !self.compress && group.iter().any(|c| !c.splits.is_empty()) {
+                read_group_parallel(&group, self.madvise, &mut sortable)?;
+            } else {
+                for chunk in &group {
+                    let mut reader =
+                        self.open_reader(chunk).with_context(|| format!("Unable to open {:?}", chunk.path))?;
+                    reader.read_all_into(&mut sortable).with_context(|| format!("Error reading {:?}", chunk.path))?;
+                }
             }
             for other in &group[1..] {
                 let _ = std::fs::remove_file(&other.path);
@@ -267,7 +300,7 @@ impl ExternalMergeSort {
             }
             finish_writer(out)?;
             timing.writing.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            Ok(Chunk { path, item_count: entries.len() as u64, bytes_in_memory: piece_bytes })
+            Ok(Chunk { path, item_count: entries.len() as u64, bytes_in_memory: piece_bytes, splits: Vec::new() })
         };
         if pieces.len() == 1 {
             let chunk = write_piece(0, &sortable.entries)?;
@@ -322,6 +355,129 @@ impl Drop for Permit<'_> {
     fn drop(&mut self) {
         let _ = self.0.tx.send(());
     }
+}
+
+/// Threads used to read one group of chunks.
+const READ_THREADS: usize = 8;
+
+/// Reads (uncompressed) `group` into `sortable` like reading each chunk in order with [`ChunkReader`], but with
+/// several threads, each parsing the records between two of the chunks' recorded [`Split`]s straight into its part
+/// of the (preallocated) value buffer and entry list.
+fn read_group_parallel(group: &[Chunk], madvise: bool, sortable: &mut SortableChunk) -> anyhow::Result<()> {
+    use std::mem::MaybeUninit;
+    struct Task<'a> {
+        bytes: &'a [u8],
+        items: u64,
+        data_base: u64,
+        data: &'a mut [MaybeUninit<u8>],
+        entries: &'a mut [MaybeUninit<Entry>],
+    }
+    let mut maps = Vec::with_capacity(group.len());
+    for chunk in group {
+        let file = File::open(&chunk.path).with_context(|| format!("Unable to open {:?}", chunk.path))?;
+        let len = file.metadata()?.len();
+        let map = if len == 0 {
+            None
+        } else {
+            // SAFETY: chunk files are private temp files that are not modified while being read.
+            let map = unsafe { Mmap::map(&file)? };
+            if madvise {
+                advise_sequential(&map);
+            }
+            Some(map)
+        };
+        let data_len = len
+            .checked_sub(chunk.item_count * HEADER_BYTES)
+            .with_context(|| format!("truncated chunk file {:?}", chunk.path))?;
+        maps.push((map, len, data_len));
+    }
+    let total_items: u64 = group.iter().map(|c| c.item_count).sum();
+    let total_data: u64 = maps.iter().map(|m| m.2).sum();
+    let (data_start, entries_start) = (sortable.data.len(), sortable.entries.len());
+    sortable.data.reserve(total_data as usize);
+    sortable.entries.reserve(total_items as usize);
+    let mut data_rest = &mut sortable.data.spare_capacity_mut()[..total_data as usize];
+    let mut entries_rest = &mut sortable.entries.spare_capacity_mut()[..total_items as usize];
+    let mut tasks = Vec::new();
+    let mut data_base = data_start as u64;
+    for (chunk, (map, len, data_len)) in group.iter().zip(&maps) {
+        let bytes: &[u8] = map.as_deref().unwrap_or(&[]);
+        let end = Split { file_offset: *len, item: chunk.item_count, data_offset: *data_len };
+        let mut start = Split::default();
+        for &split in chunk.splits.iter().chain(std::iter::once(&end)) {
+            anyhow::ensure!(
+                split.file_offset >= start.file_offset
+                    && split.item >= start.item
+                    && split.data_offset >= start.data_offset
+                    && split.file_offset <= *len
+                    && split.data_offset <= *data_len
+                    && split.item <= chunk.item_count,
+                "inconsistent splits for {:?}",
+                chunk.path
+            );
+            let items = split.item - start.item;
+            let data = split.data_offset - start.data_offset;
+            let (task_data, d) = std::mem::take(&mut data_rest).split_at_mut(data as usize);
+            let (task_entries, e) = std::mem::take(&mut entries_rest).split_at_mut(items as usize);
+            (data_rest, entries_rest) = (d, e);
+            tasks.push(Task {
+                bytes: &bytes[start.file_offset as usize..split.file_offset as usize],
+                items,
+                data_base: data_base + start.data_offset,
+                data: task_data,
+                entries: task_entries,
+            });
+            start = split;
+        }
+        data_base += data_len;
+    }
+    let parse = |task: Task| -> io::Result<()> {
+        let truncated = || io::Error::new(io::ErrorKind::UnexpectedEof, "truncated chunk file");
+        let (mut pos, mut out) = (0usize, 0usize);
+        for entry in task.entries.iter_mut() {
+            let header = task.bytes.get(pos..pos + HEADER_BYTES as usize).ok_or_else(truncated)?;
+            let key = i64::from_le_bytes(header[..8].try_into().unwrap());
+            let len = u32::from_le_bytes(header[8..].try_into().unwrap());
+            let start = pos + HEADER_BYTES as usize;
+            let value = task.bytes.get(start..start + len as usize).ok_or_else(truncated)?;
+            let dst = task.data.get_mut(out..out + value.len()).ok_or_else(truncated)?;
+            for (d, v) in dst.iter_mut().zip(value) {
+                d.write(*v);
+            }
+            entry.write(Entry { key: key as u64, offset: task.data_base + out as u64, len });
+            pos = start + value.len();
+            out += value.len();
+        }
+        if pos != task.bytes.len() || out != task.data.len() || task.entries.len() as u64 != task.items {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk split does not match its records"));
+        }
+        Ok(())
+    };
+    let queue = Mutex::new(tasks);
+    let threads = READ_THREADS.min(queue.lock().len());
+    let results: Vec<io::Result<()>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| -> io::Result<()> {
+                    loop {
+                        let Some(task) = queue.lock().pop() else { return Ok(()) };
+                        parse(task)?;
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("chunk reader panicked")).collect()
+    });
+    for result in results {
+        result.with_context(|| format!("Error reading {:?}", group[0].path))?;
+    }
+    // SAFETY: every task succeeded, which means it initialized all of its data bytes and entries, and the tasks
+    // cover the first `total_data` bytes and `total_items` entries of the spare capacity
+    unsafe {
+        sortable.data.set_len(data_start + total_data as usize);
+        sortable.entries.set_len(entries_start + total_items as usize);
+    }
+    Ok(())
 }
 
 /// Best-fit-decreasing bin packing of chunks by estimated memory size.
@@ -403,93 +559,12 @@ impl Write for ChunkOut {
     }
 }
 
-/// Buffers writes and hands each full buffer to a background thread that writes it to the file, so the writing
-/// thread does not stall in `write` syscalls (copying into the page cache, which can block when the system is
-/// writing back a lot of dirty data). In OSM pass 2 the single feature writer thread spent ~2/3 of its time there,
-/// and processing threads blocked on its full queue.
-struct AsyncFileWriter {
-    buf: Vec<u8>,
-    tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
-    recycle: crossbeam_channel::Receiver<Vec<u8>>,
-    handle: Option<std::thread::JoinHandle<io::Result<()>>>,
-}
-
-impl AsyncFileWriter {
-    /// Buffers kept in flight between the writer and its I/O thread.
-    const IN_FLIGHT: usize = 4;
-
-    fn new(mut file: File) -> io::Result<AsyncFileWriter> {
-        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(Self::IN_FLIGHT);
-        let (recycle_tx, recycle) = crossbeam_channel::bounded::<Vec<u8>>(Self::IN_FLIGHT + 1);
-        let handle = std::thread::Builder::new().name("chunk-io".to_string()).spawn(move || -> io::Result<()> {
-            for mut buf in rx {
-                file.write_all(&buf)?;
-                buf.clear();
-                let _ = recycle_tx.try_send(buf);
-            }
-            file.flush()
-        })?;
-        Ok(AsyncFileWriter { buf: Vec::with_capacity(WRITE_BUFFER_BYTES), tx: Some(tx), recycle, handle: Some(handle) })
-    }
-
-    fn send_buffer(&mut self) -> io::Result<()> {
-        let next = self.recycle.try_recv().unwrap_or_else(|_| Vec::with_capacity(WRITE_BUFFER_BYTES));
-        let full = std::mem::replace(&mut self.buf, next);
-        let sent = self.tx.as_ref().is_some_and(|tx| tx.send(full).is_ok());
-        if sent { Ok(()) } else { Err(self.join().err().unwrap_or_else(|| io::Error::other("chunk writer stopped"))) }
-    }
-
-    /// Stops the I/O thread and returns its result.
-    fn join(&mut self) -> io::Result<()> {
-        self.tx = None;
-        match self.handle.take() {
-            Some(handle) => handle.join().map_err(|_| io::Error::other("chunk writer panicked"))?,
-            None => Ok(()),
-        }
-    }
-
-    /// Writes the remaining buffered bytes and waits for everything to be written.
-    fn finish(mut self) -> io::Result<()> {
-        if !self.buf.is_empty() {
-            self.send_buffer()?;
-        }
-        self.join()
-    }
-}
-
-impl Write for AsyncFileWriter {
-    #[inline]
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.write_all(data)?;
-        Ok(data.len())
-    }
-
-    #[inline]
-    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        if self.buf.len() + data.len() > WRITE_BUFFER_BYTES && !self.buf.is_empty() {
-            self.send_buffer()?;
-        }
-        self.buf.extend_from_slice(data);
-        Ok(())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for AsyncFileWriter {
-    fn drop(&mut self) {
-        let _ = self.join();
-    }
-}
-
 fn open_writer(path: &Path, compress: bool) -> anyhow::Result<ChunkOut> {
     let file = File::create(path).with_context(|| format!("Unable to create {path:?}"))?;
     Ok(if compress {
         ChunkOut::Gzip(BufWriter::with_capacity(WRITE_BUFFER_BYTES, GzEncoder::new(file, Compression::fast())))
     } else {
-        ChunkOut::Plain(AsyncFileWriter::new(file)?)
+        ChunkOut::Plain(AsyncFileWriter::new(file, WRITE_BUFFER_BYTES, "chunk-io")?)
     })
 }
 
@@ -519,6 +594,9 @@ struct ChunkWriter {
     out: ChunkOut,
     item_count: u64,
     bytes_in_memory: u64,
+    file_bytes: u64,
+    data_bytes: u64,
+    splits: Vec<Split>,
 }
 
 /// Writer that a single thread can use to write features independent of writers used in other threads.
@@ -535,6 +613,7 @@ impl ThreadLocalWriter<'_> {
                 path: chunk.path,
                 item_count: chunk.item_count,
                 bytes_in_memory: chunk.bytes_in_memory,
+                splits: chunk.splits,
             });
         }
         Ok(())
@@ -548,7 +627,16 @@ impl FeatureSortWriter for ThreadLocalWriter<'_> {
             Some(c) => c,
             None => self.current.insert(self.sorter.new_chunk_writer()?),
         };
+        if chunk.file_bytes >= (chunk.splits.len() as u64 + 1) * SPLIT_BYTES {
+            chunk.splits.push(Split {
+                file_offset: chunk.file_bytes,
+                item: chunk.item_count,
+                data_offset: chunk.data_bytes,
+            });
+        }
         write_feature(&mut chunk.out, key, value).with_context(|| format!("Error writing to {:?}", chunk.path))?;
+        chunk.file_bytes += HEADER_BYTES + value.len() as u64;
+        chunk.data_bytes += value.len() as u64;
         chunk.item_count += 1;
         chunk.bytes_in_memory += bytes_in_memory(value.len());
         self.sorter.features.fetch_add(1, Ordering::Relaxed);
@@ -826,6 +914,7 @@ impl FeatureSort for ExternalMergeSort {
                 path: self.dir.join(c.filename),
                 item_count: c.item_count,
                 bytes_in_memory: c.bytes_in_memory,
+                splits: Vec::new(),
             })
             .collect();
         self.sorted = true;
@@ -911,6 +1000,41 @@ mod tests {
             }
         }
         sorter.sort().unwrap();
+    }
+
+    /// Chunks with recorded splits (every 256 bytes in tests) are read by several threads; the result is the same as
+    /// reading them sequentially.
+    #[test]
+    fn parallel_read_of_split_chunks() {
+        let mut rng = Rng::new(42);
+        let features: Vec<Vec<SortableFeature>> = (0..3)
+            .map(|_| {
+                (0..2000)
+                    .map(|_| {
+                        let len = (rng.next_u64() % 40) as usize;
+                        let value: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
+                        SortableFeature::new((rng.next_u64() % 500) as i64, value)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut expected: Vec<SortableFeature> = features.iter().flatten().cloned().collect();
+        expected.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+        for mmap in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sorter = new_sorter(dir.path(), 2, 1 << 30, false, mmap);
+            {
+                let mut ws: Vec<_> = features.iter().map(|_| sorter.writer_for_thread().unwrap()).collect();
+                for (w, items) in ws.iter_mut().zip(&features) {
+                    for f in items {
+                        w.accept(f.clone()).unwrap();
+                    }
+                }
+            }
+            assert!(sorter.chunks.lock().iter().all(|c| c.splits.len() > 10));
+            sorter.sort().unwrap();
+            assert_eq!(expected, sorter.to_list(), "mmap={mmap}");
+        }
     }
 
     #[test]
@@ -1034,7 +1158,7 @@ mod tests {
 
     #[test]
     fn bin_pack_groups() {
-        let chunk = |b| Chunk { path: PathBuf::new(), item_count: 1, bytes_in_memory: b };
+        let chunk = |b| Chunk { path: PathBuf::new(), item_count: 1, bytes_in_memory: b, splits: Vec::new() };
         let groups = bin_pack(vec![chunk(5), chunk(5), chunk(3), chunk(20)], 10);
         let sizes: Vec<u64> = groups.iter().map(|g| g.iter().map(|c| c.bytes_in_memory).sum()).collect();
         assert_eq!(vec![20, 10, 3], sizes);

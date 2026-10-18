@@ -538,7 +538,56 @@ pub fn positive_winding_region(curves: &[Vec<Coord<f64>>]) -> GeometryResult<Vec
     Ok(result)
 }
 
-type SegmentTree = rstar::RTree<rstar::primitives::GeomWithData<rstar::primitives::Rectangle<[f64; 2]>, (u32, u32)>>;
+/// [`positive_winding_region`] of a single closed `curve` that is known to be simple (no self-intersections or
+/// touches, no repeated consecutive vertices, e.g. checked by `buffer::noding::is_simple_closed_curve`), without
+/// running the overlay: the region is the curve's interior if it is counter-clockwise and empty if it is clockwise.
+///
+/// Returns `None` (use [`positive_winding_region`]) unless every vertex is exactly representable on the overlay's
+/// integer grid, so the result is exactly what the overlay would produce: the same ring, clockwise, with all
+/// vertices (collinear ones are preserved), rotated to JTS's start point by the same [`InputEdges`] matching.
+pub fn simple_curve_positive_winding_region(curve: &[Coord<f64>]) -> Option<Vec<Polygon<f64>>> {
+    let mut max = 0f64;
+    for c in curve {
+        max = max.max(c.x.abs()).max(c.y.abs());
+    }
+    let grid = exact_grid(max);
+    if max.is_nan() || max * grid.scale > I64_LIMIT {
+        return None;
+    }
+    let n = curve.len();
+    if n < 4 || curve[0] != curve[n - 1] {
+        return None;
+    }
+    let mut contour: Contour = Vec::with_capacity(n - 1);
+    for c in &curve[..n - 1] {
+        let p = grid.to_int(*c);
+        let back = grid.to_float(p.0, p.1);
+        // exact (also excludes -0.0, which the overlay would output as 0.0)
+        if back.x.to_bits() != c.x.to_bits() || back.y.to_bits() != c.y.to_bits() || contour.last() == Some(&p) {
+            return None;
+        }
+        contour.push(p);
+    }
+    if contour.len() < 3 || contour.first() == contour.last() {
+        return None;
+    }
+    let area = signed_area2(&contour);
+    if area < 0 {
+        return Some(vec![]);
+    } else if area == 0 {
+        return None;
+    }
+    let ring: Vec<Coord<f64>> = curve.iter().rev().copied().collect();
+    // closed: the first vertex is repeated at the end (`curve[0] == curve[n - 1]`)
+    debug_assert_eq!(ring[0], ring[n - 1]);
+    let reversed: Vec<Coord<f64>> = ring.clone();
+    let mut result = vec![Polygon::new(LineString(ring), vec![])];
+    InputEdges::new(std::iter::once(reversed.as_slice()), max).match_jts(&mut result);
+    Some(result)
+}
+
+type SegmentTree = crate::geo::segment_grid::SegmentGrid<(u32, u32)>;
+type RTreeIndex = rstar::RTree<rstar::primitives::GeomWithData<rstar::primitives::Rectangle<[f64; 2]>, (u32, u32)>>;
 
 /// Position of an output edge along the input rings: `(ring, segment, parameter along the segment)`.
 type EdgePosition = (u32, u32, f64);
@@ -581,7 +630,8 @@ struct InputEdges<'a> {
     vertices: hashbrown::HashMap<(u64, u64), u32>,
     /// (ring, index) of each vertex occurrence, and the index of the previous occurrence of the same vertex
     occurrences: Vec<((u32, u32), u32)>,
-    tree: std::cell::OnceCell<SegmentTree>,
+    grid: std::cell::OnceCell<SegmentTree>,
+    rtree: std::cell::OnceCell<RTreeIndex>,
     tolerance: f64,
 }
 
@@ -604,7 +654,8 @@ impl<'a> InputEdges<'a> {
             rings,
             vertices,
             occurrences,
-            tree: std::cell::OnceCell::new(),
+            grid: std::cell::OnceCell::new(),
+            rtree: std::cell::OnceCell::new(),
             tolerance: max_abs * 2f64.powi(-40),
         }
     }
@@ -623,9 +674,35 @@ impl<'a> InputEdges<'a> {
         }
     }
 
-    fn tree(&self) -> &SegmentTree {
+    fn grid(&self) -> &SegmentTree {
+        self.grid.get_or_init(|| {
+            let items = self.rings.iter().enumerate().flat_map(|(r, ring)| {
+                (0..ring.len()).filter_map(move |s| {
+                    let (a, b) = self.segment(r as u32, s as u32)?;
+                    (a != b).then(|| ([a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y)], (r as u32, s as u32)))
+                })
+            });
+            SegmentTree::new(items)
+        })
+    }
+
+    /// Input segments within the tolerance of `c`, in input order.
+    fn segments_near(&self, c: Coord<f64>, out: &mut Vec<(u32, u32)>) {
+        use crate::geo::cg_algorithms::point_to_segment;
+        let t = self.tolerance;
+        out.clear();
+        self.grid().query([c.x - t, c.y - t], [c.x + t, c.y + t], out);
+        out.retain(|&(r, s)| {
+            let (a, b) = self.segment(r, s).expect("indexed segment");
+            point_to_segment(c, a, b) <= t
+        });
+    }
+
+    /// [`Self::segments_near`] in the order of an `rstar` R-tree query.
+    fn segments_near_rtree_order(&self, c: Coord<f64>, out: &mut Vec<(u32, u32)>) {
+        use crate::geo::cg_algorithms::point_to_segment;
         use rstar::primitives::{GeomWithData, Rectangle};
-        self.tree.get_or_init(|| {
+        let tree = self.rtree.get_or_init(|| {
             let mut items = Vec::new();
             for (r, ring) in self.rings.iter().enumerate() {
                 for s in 0..ring.len() {
@@ -638,16 +715,11 @@ impl<'a> InputEdges<'a> {
                 }
             }
             rstar::RTree::bulk_load(items)
-        })
-    }
-
-    /// Input segments within the tolerance of `c`.
-    fn segments_near(&self, c: Coord<f64>, out: &mut Vec<(u32, u32)>) {
-        use crate::geo::cg_algorithms::point_to_segment;
+        });
         let t = self.tolerance;
         let envelope = rstar::AABB::from_corners([c.x - t, c.y - t], [c.x + t, c.y + t]);
         out.clear();
-        for item in self.tree().locate_in_envelope_intersecting(envelope) {
+        for item in tree.locate_in_envelope_intersecting(envelope) {
             let (r, s) = item.data;
             let (a, b) = self.segment(r, s).expect("indexed segment");
             if point_to_segment(c, a, b) <= t {
@@ -661,24 +733,79 @@ impl<'a> InputEdges<'a> {
     /// computes for the same pair of input segments (`RobustLineIntersector`, double-double arithmetic), so that
     /// results that land exactly on a rounding boundary later (e.g. half a tile pixel unit) round the same way as in
     /// Java.
+    ///
+    /// The closest intersection point of two input segments near the vertex wins (the first one in candidate order
+    /// on ties). Candidates come from the grid index; when the winner could depend on their order (another point at
+    /// the same distance, or a pair whose intersection depends on which segment is first) they are taken in the
+    /// order of an R-tree query instead, which is what this used before the grid index (so output is unchanged).
     fn refine_intersection_vertices(&self, polys: &mut [Polygon<f64>]) {
         use crate::geo::cg_algorithms::{LineIntersector, distance};
         let is_new = |c: &Coord<f64>| !self.vertices.contains_key(&coord_key(c));
+        let tolerance = self.tolerance;
         let mut li = LineIntersector::new();
         let mut candidates: Vec<(u32, u32)> = Vec::new();
+        let mut points: Vec<(f64, Coord<f64>)> = Vec::new();
         let mut refine = |c: &mut Coord<f64>| {
             self.segments_near(*c, &mut candidates);
-            let mut best: Option<(f64, Coord<f64>)> = None;
-            for (n, &i) in candidates.iter().enumerate() {
+            // every intersection point within the tolerance, or None if a pair's intersection depends on the order
+            // of the two segments
+            points.clear();
+            let mut order_independent = true;
+            'pairs: for (n, &i) in candidates.iter().enumerate() {
                 for &j in &candidates[n + 1..] {
                     let (p1, p2) = self.segment(i.0, i.1).expect("indexed segment");
                     let (q1, q2) = self.segment(j.0, j.1).expect("indexed segment");
+                    li.compute_intersection(q1, q2, p1, p2);
+                    let reverse = (li.intersection_num(), li.intersection(0), li.intersection(1));
                     li.compute_intersection(p1, p2, q1, q2);
-                    for k in 0..li.intersection_num() as usize {
+                    let num = li.intersection_num();
+                    let (a, b) = (li.intersection(0), li.intersection(1));
+                    let same = reverse.0 == num
+                        && match num {
+                            0 => true,
+                            1 => reverse.1 == a,
+                            _ => (reverse.1 == a && reverse.2 == b) || (reverse.1 == b && reverse.2 == a),
+                        };
+                    if !same {
+                        order_independent = false;
+                        break 'pairs;
+                    }
+                    for k in 0..num as usize {
                         let p = li.intersection(k);
                         let d = distance(p, *c);
-                        if d <= self.tolerance && best.is_none_or(|(bd, _)| d < bd) {
-                            best = Some((d, p));
+                        if d <= tolerance {
+                            points.push((d, p));
+                        }
+                    }
+                }
+            }
+            let mut best: Option<(f64, Coord<f64>)> = None;
+            if order_independent {
+                for &(d, p) in &points {
+                    if best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, p));
+                    }
+                }
+                if let Some((bd, bp)) = best
+                    && points.iter().any(|&(d, p)| d == bd && p != bp)
+                {
+                    order_independent = false;
+                }
+            }
+            if !order_independent {
+                self.segments_near_rtree_order(*c, &mut candidates);
+                best = None;
+                for (n, &i) in candidates.iter().enumerate() {
+                    for &j in &candidates[n + 1..] {
+                        let (p1, p2) = self.segment(i.0, i.1).expect("indexed segment");
+                        let (q1, q2) = self.segment(j.0, j.1).expect("indexed segment");
+                        li.compute_intersection(p1, p2, q1, q2);
+                        for k in 0..li.intersection_num() as usize {
+                            let p = li.intersection(k);
+                            let d = distance(p, *c);
+                            if d <= tolerance && best.is_none_or(|(bd, _)| d < bd) {
+                                best = Some((d, p));
+                            }
                         }
                     }
                 }

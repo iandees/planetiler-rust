@@ -1,0 +1,61 @@
+use crate::float::number::FloatNumber;
+
+pub trait FloatPointCompatible: Copy {
+    type Scalar: FloatNumber;
+    fn from_xy(x: Self::Scalar, y: Self::Scalar) -> Self;
+    fn x(&self) -> Self::Scalar;
+    fn y(&self) -> Self::Scalar;
+
+    #[inline(always)]
+    fn is_finite(&self) -> bool {
+        self.x().is_finite() && self.y().is_finite()
+    }
+
+    /// Whether both coordinates satisfy the inclusive [`crate::float`] input
+    /// limits. NaN and infinity are rejected.
+    #[inline(always)]
+    fn is_in_safe_range(&self) -> bool {
+        self.x().is_in_safe_range() && self.y().is_in_safe_range()
+    }
+}
+
+impl<T: FloatNumber> FloatPointCompatible for [T; 2] {
+    type Scalar = T;
+
+    #[inline(always)]
+    fn from_xy(x: T, y: T) -> Self {
+        [x, y]
+    }
+
+    #[inline(always)]
+    fn x(&self) -> T {
+        self[0]
+    }
+
+    #[inline(always)]
+    fn y(&self) -> T {
+        self[1]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::float::compatible::FloatPointCompatible;
+
+    #[test]
+    fn test_0() {
+        let a0 = [2.0, 5.0];
+        let x = a0.x();
+        let y = a0.y();
+        let a1 = <[f64; 2]>::from_xy(x, y);
+
+        assert_eq!(a0, a1);
+    }
+
+    #[test]
+    fn test_is_finite() {
+        assert!([2.0, 5.0].is_finite());
+        assert!(![f64::NAN, 5.0].is_finite());
+        assert!(![2.0, f64::INFINITY].is_finite());
+    }
+}

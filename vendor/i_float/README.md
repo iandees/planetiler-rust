@@ -1,0 +1,252 @@
+# iFloat
+
+`i_float` provides numeric primitives for deterministic 2D geometry:
+
+- generic integer points, vectors, and rectangles;
+- wide intermediate integer arithmetic;
+- conversion between floating-point and integer coordinate spaces;
+- fixed-scale unit ratios for interpolation;
+- basic triangle predicates;
+- optional `serde` and `glam` integration.
+
+The crate is `no_std` and supports `i16`, `i32`, and `i64` coordinate types.
+
+## Installation
+
+```toml
+[dependencies]
+i_float = "5.0"
+```
+
+The default `core` feature exposes the complete numeric and geometry API.
+
+## Integer geometry
+
+`IntPoint<T>` stores coordinates in `T`. Subtracting two points produces an
+`IntVector<T>` whose components use the associated wide integer type: `i32`
+coordinates produce an `i64` vector, while `i64` coordinates produce an
+`i128` vector.
+
+```rust
+use i_float::int::point::IntPoint;
+use i_float::triangle::Triangle;
+
+let a = IntPoint::new(0_i32, 0);
+let b = IntPoint::new(10, 0);
+let c = IntPoint::new(0, 10);
+
+let ab = b - a;
+assert_eq!(ab.x, 10_i64);
+assert_eq!(ab.y, 0_i64);
+
+assert_eq!(Triangle::area_two(a, b, c), 100_i64);
+assert!(!Triangle::is_clockwise(a, b, c));
+```
+
+### Coordinate range
+
+Integer geometry intentionally uses a coordinate range narrower than the full
+range of the underlying integer. Although point differences are widened, dot
+products, cross products, and squared lengths multiply wide values without
+widening them again.
+
+A conservative common bound for all point and vector operations is:
+
+```text
+-2^(I::BITS - 2) < coordinate < 2^(I::BITS - 2)
+```
+
+For example, `i32` coordinates should stay strictly between
+`-1_073_741_824` and `1_073_741_824`. This leaves enough headroom for the
+difference of two points and for the sum or difference of two products in
+`I::Wide`. Operations use normal integer arithmetic and do not perform runtime
+range checks.
+
+This bound is deliberately universal and conservative. An algorithm may use a
+wider range when it proves that its particular intermediate expressions still
+fit. Conversely, an `IntVector` constructed directly from arbitrary wide values
+is not covered by the point-coordinate bound.
+
+Floating-point input should normally be mapped with `FloatPointAdapter`. For an
+explicit general-purpose safety margin, use the conservative constructors. Their
+`CONSERVATIVE_COORDINATE_BITS = I::BITS - 3` budget reserves an extra bit for
+rounding within the arithmetic range; algorithms with stronger range analysis may select a larger bit
+budget.
+
+### Fast normalization
+
+`IntVector::fast_normalize()` returns an approximate `UnitIntVector<T>`, or
+`None` for a zero vector. It favors speed over precision: about 6, 14, or 30 bits
+of direction precision for `i16`, `i32`, or `i64`, respectively.
+The length is at most one. Normalization uses `sqr_length()` under the same
+arithmetic-range contract as other vector operations on point differences.
+It shifts the squared length to retain fractional precision in the reciprocal,
+then applies that reciprocal to the original components.
+
+```rust
+use i_float::int::vector::IntVector;
+
+let direction = IntVector::<i32>::new(3, 4).fast_normalize().unwrap();
+let offset = direction * 10;
+assert_eq!(offset, IntVector::<i32>::new(6, 8));
+assert!(IntVector::<i32>::new(0, 0).fast_normalize().is_none());
+```
+
+`UnitIntVector::x()` and `y()` return stored integers with scale `2^14`, `2^30`,
+or `2^62` for `i16`, `i32`, or `i64`, respectively. Multiplication by a scalar
+of type `T` (or `.scale(scalar)`) returns an `IntVector<T>`, rounding to the
+nearest integer with midpoint values away from zero. Approximation error in
+the direction grows with the magnitude of the scalar.
+
+## Floating-point coordinate range
+
+Floating-point geometry supports finite input coordinates and rectangle bounds
+within these inclusive limits:
+
+| Scalar | Maximum absolute coordinate |
+| --- | --- |
+| `f32` | `2^60` (approximately `1.15e18`) |
+| `f64` | `2^500` (approximately `3.27e150`) |
+
+These limits leave headroom for point differences, their dot and cross products,
+squared lengths, and midpoints without overflow. They do not guarantee exact
+arithmetic: ordinary floating-point rounding, cancellation, and underflow still
+apply. Arbitrary scaling and repeated operations require their own range analysis.
+
+`FloatPoint::normalize` and `FloatPointMath::normalize` additionally require a
+positive, finite, normal squared length: at least `f32::MIN_POSITIVE` or
+`f64::MIN_POSITIVE`. A nonzero vector alone is insufficient because squaring tiny
+components can underflow. Rescale such vectors before normalizing them.
+
+## Floating-point adapter
+
+`FloatPointAdapter` maps a bounded floating-point coordinate space onto an
+integer grid. The same adapter converts results back into the original space.
+Its input bounds must satisfy the floating-point coordinate range above and
+have `min <= max` on each axis. All adapter constructors validate bounds,
+including rectangles assembled through public fields. Fallible constructors
+return `FloatPointAdapterScaleError::InvalidRect`; infallible constructors panic.
+Checked point conversions validate membership in the original rectangle or
+the enclosing integer grid.
+
+```rust
+use i_float::adapter::FloatPointAdapter;
+use i_float::float::rect::FloatRect;
+use i_float::int::point::IntPoint;
+
+let bounds = FloatRect::new(-10.0_f64, 10.0, -5.0, 5.0).unwrap();
+let adapter = FloatPointAdapter::<[f64; 2], i32>::new(bounds);
+
+let source = [2.5, -1.25];
+let point: IntPoint<i32> = adapter.try_float_to_int(&source).unwrap();
+let restored = adapter.try_int_to_float(&point).unwrap();
+
+let tolerance = adapter.inv_scale();
+assert!((restored[0] - source[0]).abs() <= tolerance);
+assert!((restored[1] - source[1]).abs() <= tolerance);
+```
+
+Use `new_conservative(rect)` or `with_iter_conservative(iter)` for automatic
+scaling with the conservative coordinate range. Use
+`try_with_scale_conservative(rect, scale)` or
+`try_with_iter_and_scale_conservative(iter, scale)` to validate an explicit scale
+against the same budget. The associated `CONSERVATIVE_COORDINATE_BITS` constant
+is `I::BITS - 3`: converted coordinates stay within the inclusive range
+`[-2^(I::BITS - 3), 2^(I::BITS - 3)]`, leaving an extra bit for rounding inside
+the strict point arithmetic range.
+
+Use `with_coordinate_bits` when an algorithm has an explicit coordinate-bit
+budget. The value controls only the converted coordinate magnitude; it does not
+prove that every later arithmetic expression is safe. Use `try_with_scale` or
+`try_with_scale_and_coordinate_bits` when a caller supplies the scale and
+invalid or unsafe scales must be rejected.
+
+For input iterators, use `with_iter_and_coordinate_bits` or
+`try_with_iter_and_scale_and_coordinate_bits`. Both accept any `IntNumber`
+implementation, so downstream algorithms can share these constructors while
+choosing their own bit budget:
+
+```rust
+use i_float::adapter::FloatPointAdapter;
+
+let points = [[-3.0_f64, -1.0], [3.0, 1.0]];
+let adapter = FloatPointAdapter::<[f64; 2], i32>::with_iter_and_coordinate_bits(
+    points.iter(), i32::BITS - 3,
+);
+let fixed = FloatPointAdapter::<[f64; 2], i32>::try_with_iter_and_scale_and_coordinate_bits(
+    points.iter(), 100.0, i32::BITS - 3,
+)?;
+assert_eq!(fixed.dir_scale(), 100.0);
+# Ok::<(), i_float::adapter::FloatPointAdapterScaleError>(())
+```
+
+`new` and `with_iter` return the adapter directly and panic for invalid bounds
+or input points. An empty iterator uses zero bounds and scale one.
+
+Automatic scales are capped at the largest finite power of two of the scalar
+type (`2^127` for `f32`, `2^1023` for `f64`), trading precision for finite scales
+on very small bounds. Within the supported coordinate range, automatic scales
+have finite reciprocals. Checked constructors preserve explicit scales and return
+`ScaleTooSmall` if the reciprocal is non-finite. `with_scale` panics for invalid
+scales. `with_coordinate_bits` panics for invalid bounds or a bit budget greater
+than `I::BITS - 2`.
+
+The adapter retains the original floating-point bounds for input validation.
+Integer-to-float conversion checks an internal `IntRect` enclosing those bounds
+on the selected grid (minimum rounded down, maximum rounded up). Snapping a valid
+input can therefore return a grid point just outside the original float bounds.
+`rect()` continues to return the original bounds; `try_snap_to_grid` rejects
+inputs outside them.
+
+## Fixed-scale ratios
+
+`UnitRatio<I>` represents a value in the inclusive range `0..=1`. Its stored
+integer value uses `FixedScale<I>::DENOMINATOR` as one. Scaling rounds midpoint
+values away from zero.
+
+```rust
+use i_float::int::number::unit_ratio::UnitRatio;
+use i_float::int::point::IntPoint;
+
+let quarter = UnitRatio::<i32>::from_int(1, 4);
+let half = UnitRatio::<i32>::half();
+
+assert_eq!(quarter.scale(10), 3);
+assert_eq!(quarter.scale(-10), -3);
+assert_eq!(quarter.mid(half), UnitRatio::from_int(3, 8));
+
+let point = IntPoint::new(100, -40);
+assert_eq!(quarter.scale_point(point), IntPoint::new(25, -10));
+```
+
+Constructors currently expect valid input. In particular, `new` expects a
+stored value between zero and `DENOMINATOR`, `from_float` expects a finite value
+between zero and one, and `from_int` expects `0 <= numerator <= denominator`.
+These preconditions are checked by debug assertions.
+
+## Integer rotations
+
+`int::angle::{Angle, Rotation}` provides integer CORDIC angle measurement and
+reusable rotation matrices for `UnitIntVector`. Arc subdivision and storage stay
+in the consumer. See the [API, accuracy results, and reproducible arc benchmark](docs/cordic.md).
+`Rotation::<i32>::with_precision(angle, 4)` selects fewer iterations with an angle/16
+error budget (3 gives angle/8). `Rotation<I>` stores coefficients in `I`, sharing
+the vector scale (Q14/Q30/Q62); i64 retains Q30 kernel precision. `rotation.angle()`
+reports the achieved step for calculating counts and remainders.
+For runtime iteration/precision controls, run
+`cargo run --release --example cordic_precision -- --sweep`;
+or use `--relative 16 --step 20` to select rotation iterations from a relative
+angular tolerance. See the [precision experiment](docs/cordic-precision.md).
+
+## Features
+
+| Feature | Default | Description |
+| --- | --- | --- |
+| `core` | yes | Integer and floating-point primitives, adapters, and triangle predicates |
+| `serde` | no | Enables serialization for supported geometry types and also enables `core` |
+| `glam` | no | Adds conversions for `glam::Vec2`, `DVec2`, and `IVec2` and also enables `core` |
+
+
+## License
+
+Licensed under the MIT License. See the `LICENSE` file.

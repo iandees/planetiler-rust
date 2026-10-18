@@ -420,6 +420,24 @@ fn polygonal_error(polys: &[Polygon<f64>]) -> Option<ValidationError> {
             }
             let ring_b = &rings[b.ring as usize];
             let (b0, b1) = (ring_b.pts[b.idx as usize], ring_b.pts[b.idx as usize + 1]);
+            if a.ring == b.ring {
+                // consecutive segments of a ring (the rings have no repeated points) that are not collinear only
+                // touch at their shared vertex, which `intersect` reports as a touch at exactly that vertex
+                let n = ring_a.num_segments() as u32;
+                let (lo, hi) = if a.idx < b.idx { (a.idx, b.idx) } else { (b.idx, a.idx) };
+                let corner = if hi == lo + 1 {
+                    Some((lo as usize, hi as usize, (hi + 1) as usize))
+                } else if lo == 0 && hi == n - 1 {
+                    Some((hi as usize, 0, 1))
+                } else {
+                    None
+                };
+                if let Some((prev, at, next)) = corner
+                    && orient(ring_a.pts[prev], ring_a.pts[at], ring_a.pts[next]) != 0
+                {
+                    continue;
+                }
+            }
             match intersect(a0, a1, b0, b1) {
                 SegIntersection::None => {}
                 SegIntersection::Invalid => return Some(ValidationError::SelfIntersection),

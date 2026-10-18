@@ -1,11 +1,11 @@
 //! Port of `collection/AppendStoreMmap.java`: an append-only array of primitives backed by a memory-mapped file.
 //!
-//! Writes go through a buffered file writer. On the first read the writer is flushed and closed, and the whole file
+//! Writes are buffered and written by a background I/O thread. On the first read the writer is flushed and closed, and the whole file
 //! is memory-mapped read-only (optionally with `madvise(MADV_RANDOM)`). Java splits the mapping into 1GB segments
 //! because `ByteBuffer` is int-indexed; on 64-bit Rust a single mapping is used instead.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 
 use super::append_store::{AppendStore, Ints, Longs, check_index_in_bounds};
 use super::append_store_ram::Primitive;
+use crate::util::async_file_writer::AsyncFileWriter;
 
 /// Memory-maps `file` read-only, returning `None` for empty files. Applies `madvise(MADV_RANDOM)` when `madvise`
 /// is set, logging once if unsupported.
@@ -51,7 +52,7 @@ pub(crate) fn advise_random(map: &Mmap) {
 pub struct AppendStoreMmap<T: Primitive> {
     path: PathBuf,
     madvise: bool,
-    writer: Mutex<Option<BufWriter<File>>>,
+    writer: Mutex<Option<AsyncFileWriter>>,
     map: OnceLock<Option<Mmap>>,
     size: u64,
     _marker: std::marker::PhantomData<T>,
@@ -67,7 +68,7 @@ impl<T: Primitive> AppendStoreMmap<T> {
         Ok(AppendStoreMmap {
             path: path.to_path_buf(),
             madvise,
-            writer: Mutex::new(Some(BufWriter::with_capacity(1 << 16, file))),
+            writer: Mutex::new(Some(AsyncFileWriter::new(file, 1 << 18, "append-store-io")?)),
             map: OnceLock::new(),
             size: 0,
             _marker: std::marker::PhantomData,
@@ -92,7 +93,7 @@ impl<T: Primitive> AppendStoreMmap<T> {
             .get_or_init(|| {
                 let result: anyhow::Result<Option<Mmap>> = (|| {
                     if let Some(writer) = self.writer.lock().take() {
-                        writer.into_inner().map_err(|e| e.into_error())?;
+                        writer.finish()?;
                     }
                     let file = File::open(&self.path)?;
                     Ok(map_read_only(&file, self.madvise)?)

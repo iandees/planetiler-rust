@@ -1,0 +1,41 @@
+# Vendored copy of i_float 5.0.0 (https://github.com/iShape-Rust/iFloat, MIT) with one change: a fast
+# `CompositeUIntProduct::divide_with_rounding` for u64/u128 (`UIntNumber::div_rem_wide` in
+# src/int/number/uint.rs; the original divides bit by bit, 128 iterations for the i64 overlay engine). Used through
+# `[patch.crates-io]` in the workspace Cargo.toml.
+
+# not part of the planetiler workspace (`cargo test` here runs the crate's own unit tests)
+[workspace]
+
+[package]
+edition = "2024"
+rust-version = "1.85"
+name = "i_float"
+version = "5.0.0"
+authors = ["Nail Sharipov <nailxsharipov@gmail.com>"]
+description = "This fixed float math library provides an efficient and deterministic solution for arithmetic and geometric operations."
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/iShape-Rust/iFloat"
+
+[features]
+core = []
+default = ["core"]
+glam = ["dep:glam", "core"]
+serde = ["dep:serde", "core"]
+
+[lib]
+name = "i_float"
+path = "src/lib.rs"
+
+[dependencies.glam]
+version = ">=0.27"
+optional = true
+
+[dependencies.libm]
+version = "^0.2"
+
+[dependencies.serde]
+version = "^1.0"
+features = ["derive"]
+optional = true
+default-features = false

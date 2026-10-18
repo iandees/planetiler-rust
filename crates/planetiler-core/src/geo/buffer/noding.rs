@@ -69,6 +69,14 @@ fn for_each_candidate_pair_with(
 
 type Segment = (Coord<f64>, Coord<f64>);
 
+/// Whether consecutive segments `p00-p01` and `p10-p11` of a curve (`p01 == p10`) intersect only at their shared
+/// vertex, i.e. `LineIntersector` would find exactly that one point: true unless the three points are collinear
+/// (where the segments may overlap). Saves the full intersection test for most adjacent pairs.
+#[inline]
+fn adjacent_meet_at_vertex_only(p00: Coord<f64>, p01: Coord<f64>, p10: Coord<f64>, p11: Coord<f64>) -> bool {
+    p01 == p10 && crate::geo::cg_algorithms::orientation_index(p00, p01, p11) != 0
+}
+
 /// Segments of every curve, with the curve index and segment index of each.
 fn segments_of(curves: &[Vec<Coord<f64>>]) -> (Vec<Segment>, Vec<(usize, usize)>) {
     let mut segments = Vec::new();
@@ -101,6 +109,9 @@ fn noded_substrings(curves: &[Vec<Coord<f64>>]) -> Option<Vec<Vec<Coord<f64>>>> 
     for_each_candidate_pair(&segments, |i, j| {
         let ((c0, s0), (c1, s1)) = (ids[i], ids[j]);
         let ((p00, p01), (p10, p11)) = (segments[i], segments[j]);
+        if c0 == c1 && s1 == s0 + 1 && adjacent_meet_at_vertex_only(p00, p01, p10, p11) {
+            return;
+        }
         li.compute_intersection(p00, p01, p10, p11);
         if !li.has_intersection() {
             return;
@@ -202,6 +213,10 @@ fn is_noding_valid(strings: &[Vec<Coord<f64>>]) -> bool {
         let is_end01 = s0 + 2 == strings[e0].len();
         let is_end10 = s1 == 0;
         let is_end11 = s1 + 2 == strings[e1].len();
+        if e0 == e1 && s1 == s0 + 1 && adjacent_meet_at_vertex_only(p00, p01, p10, p11) {
+            // the only intersection is the shared endpoint, and adjacent segments skip the vertex checks
+            return;
+        }
         li.compute_intersection(p00, p01, p10, p11);
         if li.has_intersection() && li.is_interior_intersection() {
             valid = false;
@@ -228,6 +243,48 @@ pub fn floating_noding_is_valid(curves: &[Vec<Coord<f64>>]) -> bool {
     noded_substrings(curves).is_none_or(|strings| is_noding_valid(&strings))
 }
 
+/// Whether the closed `curve` is simple: no two of its segments intersect except consecutive segments (and the
+/// first and last one) at their shared vertex, and it has no repeated consecutive vertices. A simple curve is a
+/// single noded string for JTS's floating point noding, which is then trivially valid
+/// ([`floating_noding_is_valid`] is true).
+pub fn is_simple_closed_curve(curve: &[Coord<f64>]) -> bool {
+    let n = curve.len();
+    if n < 4 || curve[0] != curve[n - 1] || curve.windows(2).any(|w| w[0] == w[1]) {
+        return false;
+    }
+    let last = n - 2;
+    // (min x, max x, min y, max y, segment)
+    let mut boxes: Vec<(f64, f64, f64, f64, usize)> = curve
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| (w[0].x.min(w[1].x), w[0].x.max(w[1].x), w[0].y.min(w[1].y), w[0].y.max(w[1].y), i))
+        .collect();
+    boxes.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    let mut li = LineIntersector::new();
+    for (k, &(_, max_x, min_y, max_y, a)) in boxes.iter().enumerate() {
+        for &(other_min_x, _, other_min_y, other_max_y, b) in &boxes[k + 1..] {
+            if other_min_x > max_x {
+                break;
+            }
+            if other_min_y > max_y || other_max_y < min_y {
+                continue;
+            }
+            let (i, j) = if a < b { (a, b) } else { (b, a) };
+            let (p00, p01, p10, p11) = (curve[i], curve[i + 1], curve[j], curve[j + 1]);
+            if j == i + 1 && adjacent_meet_at_vertex_only(p00, p01, p10, p11) {
+                continue;
+            }
+            li.compute_intersection(p00, p01, p10, p11);
+            let num = li.intersection_num();
+            if num == 0 || (num == 1 && (j == i + 1 || (i == 0 && j == last && li.intersection(0) == curve[0]))) {
+                continue;
+            }
+            return false;
+        }
+    }
+    true
+}
+
 /// All pairwise intersection points between the segments of `curves` that are not the shared vertex of adjacent
 /// segments (used for the hot pixels of snap-rounding).
 pub fn intersection_points(curves: &[Vec<Coord<f64>>]) -> Vec<Coord<f64>> {
@@ -237,6 +294,9 @@ pub fn intersection_points(curves: &[Vec<Coord<f64>>]) -> Vec<Coord<f64>> {
     for_each_candidate_pair(&segments, |i, j| {
         let ((c0, s0), (c1, s1)) = (ids[i], ids[j]);
         let ((p00, p01), (p10, p11)) = (segments[i], segments[j]);
+        if c0 == c1 && s1 == s0 + 1 && adjacent_meet_at_vertex_only(p00, p01, p10, p11) {
+            return;
+        }
         li.compute_intersection(p00, p01, p10, p11);
         if !li.has_intersection() || (c0 == c1 && li.intersection_num() == 1 && s0.abs_diff(s1) == 1) {
             return;
