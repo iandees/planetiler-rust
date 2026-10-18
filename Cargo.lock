@@ -2130,13 +2130,17 @@ dependencies = [
 name = "planetiler-openmaptiles"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "geo",
  "geo-types",
+ "hashbrown 0.17.1",
  "indexmap",
  "once_cell",
+ "parking_lot",
  "planetiler-core",
  "regex",
+ "rstar 0.13.0",
  "serde",
  "serde_json",
  "serde_yaml",
