@@ -11,3 +11,6 @@ tracing.workspace = true
 indexmap.workspace = true
 geo.workspace = true
 geo-types.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
