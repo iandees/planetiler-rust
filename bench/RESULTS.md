@@ -18,6 +18,11 @@ Numbers are the best of the repeated runs each benchmark prints.
 | BenchmarkVectorTile (bench/java): encodeGeometry | 13.5M features/s | 11.6M features/s | **0.86x** |
 | BenchmarkVectorTile: full 3-layer tile encode | 1634 tiles/s | 1476 tiles/s | **0.90x** |
 | BenchmarkOsmRead pass1, Switzerland 549MB (15 threads) | ~1.2s wall, ~15s CPU | 1.0-1.3s wall, 13-16s CPU | ~1.0x |
+| BenchmarkLineSplitter ms/run (reused 3 sizes; !reused; cacheable) — lower is better | 36/12/6; 77/45/39; 40/12/6 | 39/10/3; 66/24/14; 43/11/4 | ~1-2.8x |
+| BenchmarkLineMerge loop(0) rates (/s, 4 workloads) | 11k/108k/282k/404k | 7.6k/72k/161k/224k | **0.55-0.7x** |
+| BenchmarkLineMerge JTS LineMerger (2 timings, lower is better) | 0.30s/0.34s | 0.18s/0.21s | 1.6x |
+| BenchmarkSimplify DP(1) (circles of 2/10/50/100/10k pts) | 39M/14M/4.5M/2.3M/25k | 39M/14M/3.4M/1.8M/21k | **0.75-1.0x** |
+| BenchmarkSimplify VW(0) (Planetiler's VW) | 13M/4.4M/1M/548k/3.2k | 9.8M/6.7M/2M/1.1M/5.8k | 0.75x small, ~2x large |
 
 Notes:
 - TileCoord: the first straight port ran at 604M/s (0.72x Java). Replacing the zoom-start lookup table + linear scan
@@ -27,6 +32,8 @@ Notes:
 - PMTiles: Java's numbers include JIT warmup + GC across 3 rounds; the per-round rate is the fairer comparison.
 - VectorTile is slower in Rust so far: candidate fixes are `Arc<Tags>` in `Feature` (avoid cloning tag maps),
   avoiding per-feature `Vec` allocations in the geometry encoder, and a faster hasher for key/value interning.
+- LoopLineMerger and Douglas-Peucker are slower than Java; candidates for a geometry perf pass (allocation in
+  inner loops, `Vec<Coord>` copies, hashing of node keys).
 - OsmRead is at parity: Rust decodes via prost-generated structs (allocates per block); a hand-written zero-copy
   PBF decoder is the next step.
 
