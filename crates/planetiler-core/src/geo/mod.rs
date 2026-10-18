@@ -24,6 +24,7 @@ pub mod polygonizer;
 pub mod precision_model;
 pub mod segment_grid;
 pub mod simplify_method;
+pub mod snap_rounding;
 pub mod test_utils;
 pub mod tile_coord;
 pub mod tile_extents;

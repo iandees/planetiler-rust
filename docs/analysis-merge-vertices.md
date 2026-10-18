@@ -68,17 +68,21 @@ Do not put it in `snap_and_fix` (Java keeps collinear points there).
    (output on a 1e-9 grid). `geo::buffer::noding` emulates JTS's `MCIndexNoder` + `IntersectionAdder` and
    `FastNodingValidator` to predict that (all 73 fallbacks on a Boston tile, 6 false positives in 2,211), and the
    port then snap-rounds the same way (hot pixels at curve vertices and intersections). This alone fixed ~70% of the
-   remaining differences.
+   remaining differences. Since the full `SnapRoundingNoder` port (`geo::snap_rounding`), the fallback is JTS's
+   `ScaledNoder(SnapRoundingNoder(PM(1)))` exactly (rounded to the scaled integer grid, intersections and
+   near-vertex nodes computed there, `SegmentNodeList` order), which brought Jakarta from 10 to 7 differing polygons
+   and the `buffer` tile tests' near-equal results from 3 / 15 to 1 / 2.
 
 Results:
 
 - `mergeNearbyPolygons` vs Java on the Boston/Jakarta test tiles (new `merge_*_matches_java` tests with Java's
   output stored in `tests/resources/buffer/`): polygon counts now exactly equal (1141, 947, 1073, 410); polygons
-  without an identical Java polygon: 11/1141, 5/947, 19/1073, 11/410 (before: 195, 105, 176, 97 with Fix A).
+  without an identical Java polygon: 11/1141, 5/947, 19/1073, 7/410 (before: 195, 105, 176, 97 with Fix A).
   Almost all remaining ones differ in one vertex by one 1/16 px unit or one extra/missing vertex.
 - Monaco OpenMapTiles: identical to Java (the 4 z13 `building` features now match).
 - Switzerland: building 578 differing features (was 2,387), landuse 35 (was 404), landcover 17 (was 21), same
-  feature count in every layer (`docs/switzerland-parity.md`).
+  feature count in every layer (`docs/switzerland-parity.md`); with the snap-rounding port: building 563, landuse 31,
+  landcover 0.
 
 Remaining causes: clusters of intersection points a few ulps apart that JTS's floating noding keeps and `i_overlay`
 merges (they round differently later); wrong fallback predictions; JTS's floating noding being invalid without

@@ -217,6 +217,52 @@ pub fn orientation_index(p1: Coord<f64>, p2: Coord<f64>, q: Coord<f64>) -> i32 {
     dx1.multiply(dy2).subtract(dy1.multiply(dx2)).signum()
 }
 
+/// Port of JTS `Orientation.isCCW(CoordinateSequence)` (returns false for flat or degenerate rings).
+pub fn is_ccw(ring: &[Coord<f64>]) -> bool {
+    if ring.is_empty() {
+        return false;
+    }
+    let n_pts = ring.len() - 1;
+    if n_pts < 3 {
+        return false;
+    }
+    let mut up_hi_pt = ring[0];
+    let mut prev_y = up_hi_pt.y;
+    let mut up_low_pt = ring[0];
+    let mut i_up_hi = 0;
+    for i in 1..=n_pts {
+        let py = ring[i].y;
+        if py > prev_y && py >= up_hi_pt.y {
+            up_hi_pt = ring[i];
+            i_up_hi = i;
+            up_low_pt = ring[i - 1];
+        }
+        prev_y = py;
+    }
+    if i_up_hi == 0 {
+        return false;
+    }
+    let mut i_down_low = i_up_hi;
+    loop {
+        i_down_low = (i_down_low + 1) % n_pts;
+        if i_down_low == i_up_hi || ring[i_down_low].y != up_hi_pt.y {
+            break;
+        }
+    }
+    let down_low_pt = ring[i_down_low];
+    let i_down_hi = if i_down_low > 0 { i_down_low - 1 } else { n_pts - 1 };
+    let down_hi_pt = ring[i_down_hi];
+    if up_hi_pt == down_hi_pt {
+        if up_low_pt == up_hi_pt || down_low_pt == up_hi_pt || up_low_pt == down_low_pt {
+            return false;
+        }
+        orientation_index(up_low_pt, up_hi_pt, down_low_pt) == 1
+    } else {
+        let del_x = down_hi_pt.x - up_hi_pt.x;
+        del_x < 0.0
+    }
+}
+
 /// JTS `CGAlgorithmsDD.intersection`: intersection of the lines through `p1-p2` and `q1-q2`, or `None` if they are
 /// parallel.
 pub fn intersection(p1: Coord<f64>, p2: Coord<f64>, q1: Coord<f64>, q2: Coord<f64>) -> Option<Coord<f64>> {

@@ -88,10 +88,31 @@ See the table at the bottom of this file; update it as modules are completed.
 
 - JTS `isValid` -> `geo::is_valid` (JTS semantics: no ring self-touch, holes may touch at single points as long as the
   interior stays connected). Prefer it over `geo::Validation`, which differs and is O(n^2).
-- `buffer(0)` -> `polygon_overlay::buffer_zero` (positive winding), `GeometryFixer.fix` -> `polygon_overlay::geometry_fixer`
-  (non-zero winding), `GeometryPrecisionReducer.reduce` -> `polygon_overlay::reduce_precision` (round to grid + re-node
-  with `i_overlay`'s integer engine; never fails, so the JTS fallback paths in `snap_and_fix_polygon` are rarely hit
-  and results can differ slightly from JTS snap-rounding). Overlay output: shells CW, holes CCW, OGC-valid.
+- `buffer(0)` -> `polygon_overlay::buffer_zero` (positive winding; input vertices that touch an output edge are
+  put back as collinear vertices, since JTS's noding makes them graph nodes), `GeometryFixer.fix` ->
+  `polygon_overlay::geometry_fixer` (non-zero winding), `GeometryPrecisionReducer.reduce` ->
+  `polygon_overlay::reduce_precision`. Overlay output: shells CW, holes CCW, OGC-valid.
+- `reduce_precision` follows JTS's `PrecisionReducerTransformer`: each polygon / multipolygon (also inside a
+  collection) is reduced like `OverlayNG(geom, pm)` with area results only, and lines and points are rounded pointwise
+  (JTS's `GeometryPrecisionReducer` does not node lines either), with JTS's result types (`LINESTRING EMPTY` for a
+  collapsed line, `POLYGON EMPTY` for a collapsed multipolygon, single-part multis become the part). The polygon
+  noding is `geo::snap_rounding::snap_round`, a port of JTS `SnapRoundingNoder`: `MCIndexNoder` monotone chains with
+  `SnapRoundingIntersectionAdder` (interior intersections and vertices within `gridSize / 100` of another chain's
+  segment become nodes and hot pixels), hot pixels at every vertex, then every noded segment snapped to every hot pixel
+  it passes through (`HotPixel.intersects`), ordered along the segment like `SegmentNodeList`
+  (`SegmentPointComparator`). JTS's hot pixel node flags only decide where noded strings are split, so they are not
+  modelled. Instead of OverlayNG's graph and labelling, the snapped rings are resolved by `i_overlay` (positive
+  winding, each ring oriented by JTS's depth delta: `Orientation.isCCW` of the input ring and whether it is a hole),
+  which gives the same polygons for valid input. Unlike JTS it never fails, so the fallback paths in
+  `snap_and_fix_polygon` are rarely hit. `polygon_overlay::tests::reduce_precision_matches_java_on_*` compare
+  `reduce_precision` and `snap_and_fix_polygon` with Java (`bench/java/SnapRoundCases.java`, cases in
+  `tests/resources/snapround`): all 4,000 synthetic cases (near-touching and self-touching polygons, slivers, spikes,
+  holes near the shell, invalid bow-ties, lines, collections) and all 1,456 tile polygons match exactly (normalized),
+  except `reduce_precision` of 14 invalid tile polygons, where what JTS keeps depends on how OverlayNG labels the
+  inconsistent sides of self-overlapping rings (Planetiler only reduces valid geometries: `snapAndFixPolygon` fixes
+  invalid input first). On all 109,910 polygons that took the snap-rounding path in an OpenMapTiles Switzerland run,
+  `snap_and_fix_polygon` matches Java exactly (20 differed before), and `reduce_precision` differs on 41 invalid
+  inputs (3,084 before).
 - Empty geometries: `GeometryCollection(vec![])` (Java `EMPTY_GEOMETRY`), `Polygon` with empty exterior, empty
   `LineString`; geo has no empty point so `EMPTY_POINT` is an empty `MultiPoint`.
 - CRS support (`geo::crs`): all EPSG codes GeoTools knows, WKT1/WKT2 and PROJ strings, see "Coordinate reference
@@ -102,7 +123,8 @@ See the table at the bottom of this file; update it as modules are completed.
   winding, `polygon_overlay::positive_winding_region`) instead of JTS's noding/graph. Intersection vertices are
   recomputed with JTS's `RobustLineIntersector` and rings rotated to JTS's start point; JTS's floating-noding failure
   (and fallback to snap-rounding at 12 digits) is predicted by emulating its noder and `FastNodingValidator`
-  (`geo::buffer::noding`). See the module docs for the remaining differences. A single raw curve that is simple
+  (`geo::buffer::noding`), and the fallback is `ScaledNoder(SnapRoundingNoder)` like JTS
+  (`polygon_overlay::positive_winding_region_scaled_snap_rounded`, on `geo::snap_rounding`). See the module docs for the remaining differences. A single raw curve that is simple
   (`noding::is_simple_closed_curve`) with every vertex exact on the overlay grid skips the overlay
   (`polygon_overlay::simple_curve_positive_winding_region`: the region is the curve itself); `buffer` tests compare
   it with the general path.
@@ -750,8 +772,7 @@ p.run()?;
   Not modelled: virtual-thread executor. (The write-phase disk estimate subtracts
   `free_<name>_after_read` inputs like Java, via `ResourceUsage::free_disk`.)
 - Behaviour fixes made while comparing against Java on Monaco/Switzerland: `polygon_overlay::reduce_precision` now
-  snaps each segment to every hot pixel it passes through (JTS `SnapRoundingNoder`, vertices only - intersection hot
-  pixels are still left to the integer overlay), so sub-pixel slivers collapse like JTS; `FeatureGroup` writes a tile
+  snap-rounds like JTS's `SnapRoundingNoder` (`geo::snap_rounding`), so sub-pixel slivers collapse like JTS; `FeatureGroup` writes a tile
   with an empty layer (like Java) when all of a layer's features are removed by `unscale/removePointsOutsideBuffer`;
   `test_utils::validate_geometry` uses JTS `isSimple` semantics like Java's `TestUtils`; custommap reads OSM tags via
   `WithTags::tags` (OSM features have empty `base().tags`); `extract_from_zip` handles relative tmp dirs.
@@ -782,8 +803,10 @@ came from equivalent Python scripts; current Switzerland numbers are in `docs/sw
   (a merged polygon of area 4.002 px² at the 4 px² merge threshold).
   After the JTS buffer port: same feature count in every layer; 578 z13 buildings, 35 landuse, 17 landcover and 10
   transportation features differ (`docs/switzerland-parity.md`); unchanged in the `627d901` benchmark pass, where
-  Monaco is identical to Java including feature IDs.
-- Fixes made while comparing: hot-pixel snap rounding in `reduce_precision`, Java multimap order for relation
+  Monaco is identical to Java including feature IDs. After the snap-rounding port (`geo::snap_rounding`, also used by
+  the buffer's fixed precision fallback) and the `buffer_zero` collinear-node fix: 563 buildings, 31 landuse,
+  0 landcover, 10 transportation; Monaco still identical.
+- Fixes made while comparing: JTS snap rounding in `reduce_precision`, Java multimap order for relation
   memberships (`route_N_*` attributes), Java `HashMap` iteration order for OMT housenumber grouping, custommap OSM
   tags, empty layers after point-buffer filtering (see above).
 

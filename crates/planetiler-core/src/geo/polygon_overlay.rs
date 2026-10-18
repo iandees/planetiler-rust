@@ -7,9 +7,10 @@
 //!   "bow-tie" keeps only the lobes that wind the same way as the overall ring.
 //! - [`geometry_fixer`]: JTS `GeometryFixer.fix`. Rings are resolved with a *non-zero* fill (both lobes of a bow-tie
 //!   are kept), holes are subtracted from their shell and the resulting polygons are unioned.
-//! - [`reduce_precision`]: JTS `GeometryPrecisionReducer.reduce`. Coordinates are rounded to the precision grid and
-//!   the result is re-noded on that grid (intersection points are rounded to the grid as well), equivalent to JTS's
-//!   snap-rounding overlay. The output is always valid, so unlike JTS this never fails.
+//! - [`reduce_precision`]: JTS `GeometryPrecisionReducer.reduce`. Polygon rings are snap-rounded to the precision
+//!   grid with a port of JTS's `SnapRoundingNoder` ([`crate::geo::snap_rounding`]) and the enclosed region is
+//!   rebuilt, like JTS's OverlayNG; lines and points are rounded pointwise. The output is always valid, so unlike JTS
+//!   this never fails.
 //! - [`union`], [`difference`], [`intersection`]: polygon boolean operations.
 //!
 //! Output polygons follow the JTS overlay convention: shells clockwise and holes counter-clockwise (in the usual
@@ -17,7 +18,9 @@
 //! not self-touching shells).
 
 use geo::Area;
-use geo_types::{Coord, Geometry, LineString, MultiPolygon, Point, Polygon};
+use geo_types::{
+    Coord, Geometry, GeometryCollection, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
+};
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::integer::OverlayInt;
 use i_overlay::core::overlay::{ContourDirection, IntOverlayOptions, Overlay, ShapeType};
@@ -29,6 +32,7 @@ use i_overlay::i_shape::int::shape::IntShapes;
 use crate::geo::geometry_exception::{GeometryException, GeometryResult};
 use crate::geo::geometry_transformer::build_geometry;
 use crate::geo::precision_model::{PrecisionModel, java_round};
+use crate::geo::snap_rounding;
 
 /// Maps between floating point coordinates and the integer grid used by the overlay engine.
 #[derive(Clone, Copy, Debug)]
@@ -300,202 +304,6 @@ fn positive_contours(polys: &[&Polygon<f64>], grid: Grid) -> Vec<Contour> {
     out
 }
 
-/// A JTS snap-rounding hot pixel: the unit square (in grid units) centered on a rounded vertex, with open top and
-/// right sides.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct HotPixel {
-    x: i64,
-    y: i64,
-}
-
-/// Hot pixels sorted by `(x, y)` and by `(y, x)`, queried by envelope. Each query scans whichever of the two sorted
-/// ranges (pixels with x in range, or with y in range) is shorter. Tile polygons have a few hundred vertices, where
-/// this is much cheaper than building an R-tree per call.
-struct HotPixelIndex {
-    by_x: Vec<HotPixel>,
-    by_y: Vec<HotPixel>,
-}
-
-impl HotPixelIndex {
-    /// `pixels` must be sorted by `(x, y)` and deduplicated.
-    fn new(pixels: &[(i64, i64)]) -> HotPixelIndex {
-        let by_x: Vec<HotPixel> = pixels.iter().map(|&(x, y)| HotPixel { x, y }).collect();
-        let mut by_y = by_x.clone();
-        by_y.sort_unstable_by_key(|p| (p.y, p.x));
-        HotPixelIndex { by_x, by_y }
-    }
-
-    /// Calls `f` for every pixel inside (or on the boundary of) the envelope `[min, max]`.
-    #[inline]
-    fn for_each_in(&self, min: (f64, f64), max: (f64, f64), mut f: impl FnMut(&HotPixel)) {
-        let x_start = self.by_x.partition_point(|p| (p.x as f64) < min.0);
-        let x_end = self.by_x.partition_point(|p| (p.x as f64) <= max.0);
-        let y_start = self.by_y.partition_point(|p| (p.y as f64) < min.1);
-        let y_end = self.by_y.partition_point(|p| (p.y as f64) <= max.1);
-        if x_end.saturating_sub(x_start) <= y_end.saturating_sub(y_start) {
-            for p in &self.by_x[x_start..x_end.max(x_start)] {
-                let y = p.y as f64;
-                if min.1 <= y && y <= max.1 {
-                    f(p);
-                }
-            }
-        } else {
-            for p in &self.by_y[y_start..y_end.max(y_start)] {
-                let x = p.x as f64;
-                if min.0 <= x && x <= max.0 {
-                    f(p);
-                }
-            }
-        }
-    }
-}
-
-/// JTS `CGAlgorithmsDD.orientationIndex` sign (1 = left/counter-clockwise, -1 = right, 0 = collinear) using robust
-/// predicates.
-fn orientation_index(p: (f64, f64), q: (f64, f64), r: (f64, f64)) -> i8 {
-    use geo::kernels::{Kernel, Orientation, RobustKernel};
-    match RobustKernel::orient2d(Coord { x: p.0, y: p.1 }, Coord { x: q.0, y: q.1 }, Coord { x: r.0, y: r.1 }) {
-        Orientation::CounterClockwise => 1,
-        Orientation::Clockwise => -1,
-        Orientation::Collinear => 0,
-    }
-}
-
-impl HotPixel {
-    const TOLERANCE: f64 = 0.5;
-
-    /// JTS `HotPixel.intersectsScaled`: whether the segment `p0`-`p1` (in scaled grid coordinates) intersects this
-    /// pixel.
-    fn intersects(&self, p0: (f64, f64), p1: (f64, f64)) -> bool {
-        // determine oriented segment pointing in positive X direction
-        let (p, q) = if p0.0 > p1.0 { (p1, p0) } else { (p0, p1) };
-        let (hx, hy) = (self.x as f64, self.y as f64);
-        let maxx = hx + Self::TOLERANCE;
-        if p.0.min(q.0) >= maxx {
-            return false;
-        }
-        let minx = hx - Self::TOLERANCE;
-        if p.0.max(q.0) < minx {
-            return false;
-        }
-        let maxy = hy + Self::TOLERANCE;
-        if p.1.min(q.1) >= maxy {
-            return false;
-        }
-        let miny = hy - Self::TOLERANCE;
-        if p.1.max(q.1) < miny {
-            return false;
-        }
-        // vertical or horizontal segments must now intersect the segment interior or Left or Bottom sides
-        if p.0 == q.0 || p.1 == q.1 {
-            return true;
-        }
-        let orient_ul = orientation_index(p, q, (minx, maxy));
-        if orient_ul == 0 {
-            // upward segment does not intersect pixel interior
-            return p.1 >= q.1;
-        }
-        let orient_ur = orientation_index(p, q, (maxx, maxy));
-        if orient_ur == 0 {
-            // downward segment does not intersect pixel interior
-            return p.1 <= q.1;
-        }
-        // check crossing Top side
-        if orient_ul != orient_ur {
-            return true;
-        }
-        let orient_ll = orientation_index(p, q, (minx, miny));
-        if orient_ll == 0 {
-            // segment crossed LL corner, which is the only one in pixel interior
-            return true;
-        }
-        // check crossing Left side
-        if orient_ll != orient_ul {
-            return true;
-        }
-        let orient_lr = orientation_index(p, q, (maxx, miny));
-        if orient_lr == 0 {
-            // upward segment does not intersect pixel interior
-            return p.1 >= q.1;
-        }
-        // check crossing Bottom side or Right side
-        orient_ll != orient_lr || orient_lr != orient_ur
-    }
-}
-
-/// Rounds polygon rings to `grid` like JTS's `SnapRoundingNoder`: every vertex becomes a hot pixel and each original
-/// segment is noded at every hot pixel it passes through (other than the pixels of its own endpoints). This lets
-/// slivers thinner than a grid cell collapse (and be removed by the overlay) the way they do in JTS instead of
-/// surviving as tiny triangles.
-///
-/// TODO(port): JTS also adds hot pixels for segment intersections (and vertices within a tiny tolerance of other
-/// segments); here those are only rounded by the integer overlay.
-fn snap_rounded_contours(polys: &[&Polygon<f64>], grid: Grid) -> Vec<Contour> {
-    let rings: Vec<(&[Coord<f64>], Option<bool>)> = polys
-        .iter()
-        .filter(|p| !p.exterior().0.is_empty())
-        .flat_map(|p| {
-            std::iter::once((p.exterior().0.as_slice(), Some(true)))
-                .chain(p.interiors().iter().map(|h| (h.0.as_slice(), Some(false))))
-        })
-        .collect();
-    snap_round_rings(&rings, &[], grid)
-}
-
-/// Snap-rounds `rings` to `grid` (see [`snap_rounded_contours`]) with `extra_pixels` (in grid units) as additional
-/// hot pixels. Each ring is oriented counter-clockwise (`Some(true)`), clockwise (`Some(false)`) or kept as is
-/// (`None`).
-fn snap_round_rings(rings: &[(&[Coord<f64>], Option<bool>)], extra_pixels: &[(i64, i64)], grid: Grid) -> Vec<Contour> {
-    let mut pixels: Vec<(i64, i64)> = rings.iter().flat_map(|(r, _)| r.iter().map(|c| grid.to_int(*c))).collect();
-    pixels.extend_from_slice(extra_pixels);
-    pixels.sort_unstable();
-    pixels.dedup();
-    let index = HotPixelIndex::new(&pixels);
-    let scaled = |c: &Coord<f64>| (c.x * grid.scale, c.y * grid.scale);
-    let mut out = Vec::with_capacity(rings.len());
-    let mut nodes: Vec<(f64, (i64, i64))> = Vec::new();
-    for &(ring, orientation) in rings {
-        let mut contour: Contour = Vec::with_capacity(ring.len());
-        for w in ring.windows(2) {
-            let (a, b) = (grid.to_int(w[0]), grid.to_int(w[1]));
-            if contour.last() != Some(&a) {
-                contour.push(a);
-            }
-            if a == b {
-                continue;
-            }
-            let (p0, p1) = (scaled(&w[0]), scaled(&w[1]));
-            let min = (p0.0.min(p1.0) - HotPixel::TOLERANCE, p0.1.min(p1.1) - HotPixel::TOLERANCE);
-            let max = (p0.0.max(p1.0) + HotPixel::TOLERANCE, p0.1.max(p1.1) + HotPixel::TOLERANCE);
-            nodes.clear();
-            let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
-            index.for_each_in(min, max, |hp| {
-                let key = (hp.x, hp.y);
-                if key != a && key != b && hp.intersects(p0, p1) {
-                    let t = (hp.x as f64 - p0.0) * dx + (hp.y as f64 - p0.1) * dy;
-                    nodes.push((t, key));
-                }
-            });
-            // ties (pixels at the same distance along the segment) are ordered by pixel so the result does not depend
-            // on the index's iteration order
-            nodes.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
-            for &(_, key) in &nodes {
-                if contour.last() != Some(&key) {
-                    contour.push(key);
-                }
-            }
-        }
-        if contour.len() > 1 && contour.first() == contour.last() {
-            contour.pop();
-        }
-        out.push(match orientation {
-            Some(ccw) => oriented(contour, ccw),
-            None => contour,
-        });
-    }
-    out
-}
-
 /// Equivalent of JTS `geom.buffer(0)` for polygonal geometries: resolves self-intersections and overlaps. Points and
 /// lines produce an empty polygon.
 pub fn buffer_zero(geom: &Geometry<f64>) -> GeometryResult<Geometry<f64>> {
@@ -503,7 +311,81 @@ pub fn buffer_zero(geom: &Geometry<f64>) -> GeometryResult<Geometry<f64>> {
     let grid = exact_grid(max_abs_coord(polys.iter().copied()));
     let contours = Contours { subject: positive_contours(&polys, grid), clip: vec![] };
     let max_int = max_abs_coord(polys.iter().copied()) * grid.scale;
-    Ok(to_polygonal(overlay(&contours, grid, max_int, OverlayRule::Subject, FillRule::Positive, true)?))
+    let mut result = overlay(&contours, grid, max_int, OverlayRule::Subject, FillRule::Positive, true)?;
+    restore_vertices_on_edges(&polys, &mut result);
+    Ok(to_polygonal(result))
+}
+
+/// Inserts every input vertex that lies exactly on the interior of an output edge into that edge.
+///
+/// JTS's noding splits an input segment at every input vertex that touches it (e.g. the tip of a spike folded back
+/// along another edge), so those vertices are nodes of its graph and stay in the output rings as collinear vertices,
+/// while `i_overlay` merges the collinear output segments around them.
+fn restore_vertices_on_edges(input: &[&Polygon<f64>], output: &mut [Polygon<f64>]) {
+    use crate::geo::cg_algorithms::orientation_index;
+    // only the input vertices that are not already output vertices can be missing
+    let mut present: hashbrown::HashSet<(u64, u64)> = hashbrown::HashSet::new();
+    for p in output.iter() {
+        for r in std::iter::once(p.exterior()).chain(p.interiors()) {
+            present.extend(r.0.iter().map(coord_key));
+        }
+    }
+    let mut by_x: Vec<Coord<f64>> = input
+        .iter()
+        .flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()))
+        .flat_map(|r| r.0.iter().copied())
+        .filter(|c| c.x.is_finite() && c.y.is_finite() && !present.contains(&coord_key(c)))
+        .collect();
+    if by_x.is_empty() {
+        return;
+    }
+    by_x.sort_unstable_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    by_x.dedup();
+    let mut by_y = by_x.clone();
+    by_y.sort_unstable_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+    let mut found: Vec<(f64, Coord<f64>)> = Vec::new();
+    let mut fix_ring = |ring: &mut LineString<f64>| {
+        let n = ring.0.len();
+        if n < 2 {
+            return;
+        }
+        let mut out: Option<Vec<Coord<f64>>> = None;
+        for i in 0..n - 1 {
+            let (a, b) = (ring.0[i], ring.0[i + 1]);
+            let (min_x, max_x, min_y, max_y) = (a.x.min(b.x), a.x.max(b.x), a.y.min(b.y), a.y.max(b.y));
+            let x_range = by_x.partition_point(|c| c.x < min_x)..by_x.partition_point(|c| c.x <= max_x);
+            let y_range = by_y.partition_point(|c| c.y < min_y)..by_y.partition_point(|c| c.y <= max_y);
+            let candidates = if x_range.len() <= y_range.len() { &by_x[x_range] } else { &by_y[y_range] };
+            found.clear();
+            for &v in candidates {
+                if v != a
+                    && v != b
+                    && min_x <= v.x
+                    && v.x <= max_x
+                    && min_y <= v.y
+                    && v.y <= max_y
+                    && orientation_index(a, b, v) == 0
+                {
+                    let (dx, dy) = (v.x - a.x, v.y - a.y);
+                    found.push((dx * dx + dy * dy, v));
+                }
+            }
+            if found.is_empty() && out.is_none() {
+                continue;
+            }
+            let out = out.get_or_insert_with(|| ring.0[..=i].to_vec());
+            found.sort_by(|x, y| x.0.total_cmp(&y.0));
+            out.extend(found.iter().map(|&(_, v)| v));
+            out.push(b);
+        }
+        if let Some(out) = out {
+            ring.0 = out;
+        }
+    };
+    for poly in output {
+        poly.exterior_mut(&mut fix_ring);
+        poly.interiors_mut(|rings| rings.iter_mut().for_each(&mut fix_ring));
+    }
 }
 
 /// Nodes a set of closed curves (which may self-intersect and overlap) and returns the region where their winding
@@ -602,24 +484,40 @@ fn coord_key(c: &Coord<f64>) -> (u64, u64) {
     (c.x.to_bits(), c.y.to_bits())
 }
 
-/// [`positive_winding_region`] with JTS's fixed precision noding (`ScaledNoder(SnapRoundingNoder)` at `scale`):
-/// every curve vertex and every intersection between curve segments is a hot pixel on the `1 / scale` grid, curve
-/// segments are noded at the hot pixels they pass through, and the output is on the grid. The curves' vertices
-/// should already be rounded to the grid.
-pub fn positive_winding_region_snap_rounded(
+/// [`positive_winding_region`] with JTS's fixed precision noding of buffer curves,
+/// `ScaledNoder(SnapRoundingNoder(PrecisionModel(1)), scale)`: the curves are scaled by `scale` and rounded to
+/// integers, snap-rounded on the unit grid with [`snap_rounding::snap_round`] and scaled back, so the output is on
+/// the `1 / scale` grid.
+pub fn positive_winding_region_scaled_snap_rounded(
     curves: &[Vec<Coord<f64>>],
-    intersections: &[Coord<f64>],
     scale: f64,
 ) -> GeometryResult<Vec<Polygon<f64>>> {
-    let grid = Grid { scale, round: true };
     let mut max = 0f64;
-    for c in curves.iter().flatten() {
-        max = max.max(c.x.abs()).max(c.y.abs());
+    let mut strings: Vec<Vec<Coord<f64>>> = Vec::with_capacity(curves.len());
+    for curve in curves {
+        // ScaledNoder.scale: round to the scaled grid and remove repeated points
+        let mut pts: Vec<Coord<f64>> = Vec::with_capacity(curve.len());
+        for c in curve {
+            let p = Coord { x: java_round(c.x * scale), y: java_round(c.y * scale) };
+            max = max.max(p.x.abs()).max(p.y.abs());
+            if pts.last() != Some(&p) {
+                pts.push(p);
+            }
+        }
+        if pts.len() >= 2 {
+            strings.push(pts);
+        }
     }
-    let extra: Vec<(i64, i64)> = intersections.iter().map(|c| grid.to_int(*c)).collect();
-    let rings: Vec<(&[Coord<f64>], Option<bool>)> = curves.iter().map(|c| (c.as_slice(), None)).collect();
-    let contours = Contours { subject: snap_round_rings(&rings, &extra, grid), clip: vec![] };
-    overlay(&contours, grid, max * scale + 1.0, OverlayRule::Subject, FillRule::Positive, true)
+    let refs: Vec<&[Coord<f64>]> = strings.iter().map(|s| s.as_slice()).collect();
+    let mut subject = Vec::with_capacity(strings.len());
+    for mut contour in snap_rounding::snap_round(&refs, 1.0).into_iter().flatten() {
+        if contour.len() > 1 && contour.first() == contour.last() {
+            contour.pop();
+        }
+        subject.push(contour);
+    }
+    let contours = Contours { subject, clip: vec![] };
+    overlay(&contours, Grid { scale, round: true }, max + 1.0, OverlayRule::Subject, FillRule::Positive, true)
 }
 
 /// The edges of the input rings of an overlay, used to make the output vertices and ring start points match what
@@ -910,38 +808,24 @@ impl<'a> InputEdges<'a> {
     }
 }
 
-/// Equivalent of JTS `GeometryPrecisionReducer.reduce(geom, precisionModel)`.
+/// Equivalent of JTS `GeometryPrecisionReducer.reduce(geom, precisionModel)` (`PrecisionReducerTransformer`, which
+/// removes collapsed components):
 ///
-/// Polygonal input (which should be valid) is rounded to the grid and re-noded so the result is valid; collapsed
-/// parts are removed. Points and lines are rounded pointwise (repeated points removed, collapsed lines dropped).
-// TODO(port): JTS snap-rounds lines too (noding intersections); lines are only rounded pointwise here.
+/// - Each polygon / multipolygon (also inside a geometry collection) is reduced like JTS's
+///   `OverlayNG(geom, precisionModel)` area-only union: its rings are snap-rounded to the grid with
+///   [`snap_rounding::snap_round`] (JTS `SnapRoundingNoder`: hot pixels at every vertex and every intersection or
+///   near-vertex, every segment snapped to the hot pixels it passes through) and the result is the region they enclose
+///   (each ring counted with the side JTS's depth delta gives it: shells enclose area, holes remove it, whatever their
+///   orientation). Collapsed parts are removed. The output is always valid, so unlike JTS this never fails.
+/// - Points, lines and multipoints are rounded pointwise like JTS: repeated points are removed from lines and lines
+///   that collapse to fewer than 2 points are removed (a single line becomes `LINESTRING EMPTY`), a multipoint or
+///   multilinestring with one remaining part becomes that part.
 pub fn reduce_precision(geom: &Geometry<f64>, pm: &PrecisionModel) -> GeometryResult<Geometry<f64>> {
     let scale = match pm {
         PrecisionModel::Floating => return Ok(geom.clone()),
         PrecisionModel::Fixed { scale } => *scale,
     };
-    let grid = Grid { scale, round: true };
-    let polys = polygons_of(geom);
-    let polygonal = matches!(geom, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
-    let reduced_polys = if polys.is_empty() {
-        vec![]
-    } else {
-        let contours = Contours { subject: snap_rounded_contours(&polys, grid), clip: vec![] };
-        let max_int = max_abs_coord(polys.iter().copied()) * scale + 1.0;
-        overlay(&contours, grid, max_int, OverlayRule::Subject, FillRule::Positive, true)?
-    };
-    if polygonal {
-        return Ok(to_polygonal(reduced_polys));
-    }
-    let mut others = Vec::new();
-    collect_non_polygonal_reduced(geom, pm, &mut others);
-    let mut all: Vec<Geometry<f64>> = reduced_polys.into_iter().map(Geometry::Polygon).collect();
-    all.extend(others);
-    Ok(build_geometry(all))
-}
-
-fn collect_non_polygonal_reduced(geom: &Geometry<f64>, pm: &PrecisionModel, out: &mut Vec<Geometry<f64>>) {
-    let reduce_line = |ls: &LineString<f64>| -> Option<LineString<f64>> {
+    let reduce_line = |ls: &LineString<f64>| -> LineString<f64> {
         let mut coords: Vec<Coord<f64>> = Vec::with_capacity(ls.0.len());
         for c in &ls.0 {
             let c = pm.make_precise_coord(*c);
@@ -949,19 +833,105 @@ fn collect_non_polygonal_reduced(geom: &Geometry<f64>, pm: &PrecisionModel, out:
                 coords.push(c);
             }
         }
-        (coords.len() >= 2).then_some(LineString(coords))
+        LineString(if coords.len() >= 2 { coords } else { vec![] })
     };
-    match geom {
-        Geometry::Point(p) => out.push(Geometry::Point(Point(pm.make_precise_coord(p.0)))),
+    Ok(match geom {
+        Geometry::Point(p) => Geometry::Point(Point(pm.make_precise_coord(p.0))),
         Geometry::MultiPoint(mp) => {
-            out.extend(mp.0.iter().map(|p| Geometry::Point(Point(pm.make_precise_coord(p.0)))));
+            let mut points: Vec<Point<f64>> = mp.0.iter().map(|p| Point(pm.make_precise_coord(p.0))).collect();
+            if points.len() == 1 {
+                Geometry::Point(points.pop().unwrap())
+            } else {
+                Geometry::MultiPoint(MultiPoint(points))
+            }
         }
-        Geometry::Line(l) => out.extend(reduce_line(&(*l).into()).map(Geometry::LineString)),
-        Geometry::LineString(ls) => out.extend(reduce_line(ls).map(Geometry::LineString)),
-        Geometry::MultiLineString(mls) => out.extend(mls.0.iter().filter_map(reduce_line).map(Geometry::LineString)),
-        Geometry::GeometryCollection(gc) => gc.0.iter().for_each(|g| collect_non_polygonal_reduced(g, pm, out)),
-        _ => {}
+        Geometry::Line(l) => Geometry::LineString(reduce_line(&(*l).into())),
+        Geometry::LineString(ls) => Geometry::LineString(reduce_line(ls)),
+        Geometry::MultiLineString(mls) => {
+            let mut lines: Vec<LineString<f64>> = mls.0.iter().map(reduce_line).filter(|l| !l.0.is_empty()).collect();
+            if lines.len() == 1 {
+                Geometry::LineString(lines.pop().unwrap())
+            } else {
+                Geometry::MultiLineString(MultiLineString(lines))
+            }
+        }
+        Geometry::Polygon(p) => to_polygonal(reduce_area(&[p], scale)?),
+        Geometry::MultiPolygon(mp) => {
+            let polys: Vec<&Polygon<f64>> = mp.0.iter().collect();
+            // an empty OverlayNG area result is an empty polygon
+            to_polygonal(reduce_area(&polys, scale)?)
+        }
+        Geometry::Rect(r) => to_polygonal(reduce_area(&[&r.to_polygon()], scale)?),
+        Geometry::Triangle(t) => to_polygonal(reduce_area(&[&t.to_polygon()], scale)?),
+        Geometry::GeometryCollection(gc) => {
+            let mut parts = Vec::with_capacity(gc.0.len());
+            for g in &gc.0 {
+                let reduced = reduce_precision(g, pm)?;
+                if !is_empty(&reduced) {
+                    parts.push(reduced);
+                }
+            }
+            Geometry::GeometryCollection(GeometryCollection(parts))
+        }
+    })
+}
+
+fn is_empty(geom: &Geometry<f64>) -> bool {
+    match geom {
+        Geometry::Point(_) | Geometry::Line(_) | Geometry::Rect(_) | Geometry::Triangle(_) => false,
+        Geometry::LineString(ls) => ls.0.is_empty(),
+        Geometry::Polygon(p) => p.exterior().0.is_empty(),
+        Geometry::MultiPoint(mp) => mp.0.is_empty(),
+        Geometry::MultiLineString(mls) => mls.0.iter().all(|l| l.0.is_empty()),
+        Geometry::MultiPolygon(mp) => mp.0.iter().all(|p| p.exterior().0.is_empty()),
+        Geometry::GeometryCollection(gc) => gc.0.iter().all(is_empty),
     }
+}
+
+/// JTS `OverlayNG(geom, pm)` with `setAreaResultOnly(true)` (`overlayng.PrecisionReducer.reducePrecision`) for the
+/// polygons of one polygonal geometry.
+fn reduce_area(polys: &[&Polygon<f64>], scale: f64) -> GeometryResult<Vec<Polygon<f64>>> {
+    // EdgeNodingBuilder.addPolygon: the shell then the holes, repeated points removed, collapsed rings dropped
+    let mut strings: Vec<Vec<Coord<f64>>> = Vec::new();
+    let mut reverse: Vec<bool> = Vec::new();
+    let mut max = 0f64;
+    for poly in polys {
+        for (i, ring) in std::iter::once(poly.exterior()).chain(poly.interiors()).enumerate() {
+            let mut pts: Vec<Coord<f64>> = Vec::with_capacity(ring.0.len());
+            for c in &ring.0 {
+                if pts.last() != Some(c) {
+                    pts.push(*c);
+                }
+                max = max.max(c.x.abs()).max(c.y.abs());
+            }
+            if pts.len() < 2 {
+                continue;
+            }
+            // EdgeNodingBuilder.computeDepthDelta: the interior is on the right of a clockwise shell or a
+            // counter-clockwise hole (orientation of the input ring); the positive fill rule wants it on the left
+            let ccw = crate::geo::cg_algorithms::is_ccw(&ring.0);
+            reverse.push(if i == 0 { !ccw } else { ccw });
+            strings.push(pts);
+        }
+    }
+    if strings.is_empty() {
+        return Ok(vec![]);
+    }
+    let refs: Vec<&[Coord<f64>]> = strings.iter().map(|s| s.as_slice()).collect();
+    let mut subject = Vec::with_capacity(strings.len());
+    for (snapped, reverse) in snap_rounding::snap_round(&refs, scale).into_iter().zip(reverse) {
+        let Some(mut contour) = snapped else { continue };
+        if contour.len() > 1 && contour.first() == contour.last() {
+            contour.pop();
+        }
+        if reverse {
+            contour.reverse();
+        }
+        subject.push(contour);
+    }
+    let grid = Grid { scale, round: true };
+    let contours = Contours { subject, clip: vec![] };
+    overlay(&contours, grid, max * scale + 1.0, OverlayRule::Subject, FillRule::Positive, true)
 }
 
 /// Equivalent of JTS `GeometryFixer.fix(geom)`: repairs invalid polygons keeping all area enclosed by each ring
@@ -1205,6 +1175,139 @@ mod tests {
         let result = buffer_zero(&p).unwrap();
         assert!(is_valid(&result), "{result:?}");
         assert!((result.unsigned_area() - 14.0).abs() < 1e-9);
+    }
+
+    /// A case generated by `bench/java/SnapRoundCases.java`: the input and Java's `GeoUtils.snapAndFixPolygon` and
+    /// `GeometryPrecisionReducer.reduce` outputs at tile precision (`None` where Java throws).
+    struct JavaCase {
+        kind: String,
+        input: Geometry<f64>,
+        snap: Option<Geometry<f64>>,
+        reduce: Option<Geometry<f64>>,
+    }
+
+    fn read_java_cases(name: &str) -> Vec<JavaCase> {
+        use crate::geo::geo_utils::read_wkb;
+        let path = if name.starts_with('/') {
+            std::path::PathBuf::from(name)
+        } else {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/resources/snapround").join(name)
+        };
+        let data = crate::util::gzip::gunzip(&std::fs::read(path).unwrap()).unwrap();
+        let text = String::from_utf8(data).unwrap();
+        let parse = |hex: &str| -> Option<Geometry<f64>> {
+            (hex != "ERROR").then(|| {
+                let bytes: Vec<u8> =
+                    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+                read_wkb(&bytes).unwrap()
+            })
+        };
+        let mut lines = text.lines();
+        let mut cases = Vec::new();
+        while let Some(line) = lines.next() {
+            let mut parts = line.split(' ');
+            assert_eq!(Some("CASE"), parts.next());
+            let kind = parts.next().unwrap().to_string();
+            let input = parse(parts.next().unwrap()).unwrap();
+            let snap = lines.next().unwrap().strip_prefix("SNAP ").unwrap();
+            let reduce = lines.next().unwrap().strip_prefix("REDUCE ").unwrap();
+            cases.push(JavaCase { kind, input, snap: parse(snap), reduce: parse(reduce) });
+        }
+        cases
+    }
+
+    /// Results of [`check_java_cases`]: descriptions of the outputs that differ from Java's (normalized).
+    #[derive(Default)]
+    struct JavaCaseFailures {
+        cases: usize,
+        /// `snap_and_fix_polygon` results, and `reduce_precision` results on valid inputs
+        failures: Vec<String>,
+        /// `reduce_precision` results on invalid inputs, which `GeometryPrecisionReducer` does not support (Java's
+        /// `snapAndFixPolygon` fixes invalid input before reducing it): what JTS keeps there depends on how its
+        /// overlay labels the inconsistent sides of self-overlapping rings
+        invalid_reduce_failures: Vec<String>,
+    }
+
+    /// Runs `reduce_precision` and `snap_and_fix_polygon` (tile precision) on every case of `name` (a file in
+    /// `tests/resources/snapround`, or an absolute path) and compares them with Java's results.
+    fn check_java_cases(name: &str) -> JavaCaseFailures {
+        use crate::geo::geo_utils::{TILE_PRECISION, snap_and_fix_polygon};
+        use crate::geo::normalize::norm;
+        use crate::stats::stats::InMemoryStats;
+        let cases = read_java_cases(name);
+        let mut result = JavaCaseFailures { cases: cases.len(), ..Default::default() };
+        let mut counts: std::collections::BTreeMap<(String, &str), usize> = Default::default();
+        for (i, case) in cases.iter().enumerate() {
+            if let Some(expected) = &case.reduce {
+                let actual = reduce_precision(&case.input, &TILE_PRECISION).unwrap();
+                if norm(expected) != norm(&actual) {
+                    let valid = is_valid(&case.input);
+                    *counts.entry((case.kind.clone(), if valid { "reduce" } else { "reduce invalid" })).or_default() +=
+                        1;
+                    let text = format!(
+                        "case {i} ({}) reduce of {:?}:\n  expected {:?}\n  actual   {:?}",
+                        case.kind,
+                        case.input,
+                        norm(expected),
+                        norm(&actual)
+                    );
+                    if valid { result.failures.push(text) } else { result.invalid_reduce_failures.push(text) }
+                }
+            }
+            if let Some(expected) = &case.snap {
+                let actual = snap_and_fix_polygon(&case.input, &InMemoryStats::new(), "test").unwrap();
+                if norm(expected) != norm(&actual) {
+                    *counts.entry((case.kind.clone(), "snap")).or_default() += 1;
+                    result.failures.push(format!(
+                        "case {i} ({}) snapAndFixPolygon of {:?}:\n  expected {:?}\n  actual   {:?}",
+                        case.kind,
+                        case.input,
+                        norm(expected),
+                        norm(&actual)
+                    ));
+                }
+            }
+        }
+        eprintln!("{name}: {} cases, differences by kind: {counts:?}", cases.len());
+        result
+    }
+
+    fn assert_no_failures(failures: &[String]) {
+        assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures[..failures.len().min(5)].join("\n"));
+    }
+
+    /// Synthetic near-touching / self-touching / sliver / spike polygons, invalid bow-ties, lines and collections.
+    #[test]
+    fn reduce_precision_matches_java_on_synthetic_cases() {
+        let result = check_java_cases("synthetic.txt.gz");
+        assert!(result.cases > 1000);
+        assert_no_failures(&result.failures);
+        assert_no_failures(&result.invalid_reduce_failures);
+    }
+
+    /// Polygons passed to `snap_and_fix_polygon` whose pointwise rounding is invalid, from OpenMapTiles Switzerland
+    /// (most of them invalid themselves) and Monaco.
+    #[test]
+    fn reduce_precision_matches_java_on_tile_polygons() {
+        let result = check_java_cases("tiles.txt.gz");
+        assert!(result.cases > 1000);
+        assert_no_failures(&result.failures);
+        // 41 of the 3,084 (of 109,910) Switzerland polygons where JTS reduces an invalid input differently
+        assert!(result.invalid_reduce_failures.len() <= 14, "{}", result.invalid_reduce_failures.len());
+    }
+
+    /// `SNAPROUND_CASES=/path/to/cases.txt.gz cargo test --release -- --ignored snapround_cases_from_env`: checks a
+    /// case file generated outside the repo (e.g. from a whole-country dump of tile polygons) and writes the
+    /// differences to `SNAPROUND_FAILURES` if set.
+    #[test]
+    #[ignore = "needs SNAPROUND_CASES"]
+    fn snapround_cases_from_env() {
+        let result = check_java_cases(&std::env::var("SNAPROUND_CASES").unwrap());
+        if let Ok(out) = std::env::var("SNAPROUND_FAILURES") {
+            std::fs::write(out, [result.failures.join("\n"), result.invalid_reduce_failures.join("\n")].join("\n"))
+                .unwrap();
+        }
+        assert_no_failures(&result.failures);
     }
 
     #[test]
