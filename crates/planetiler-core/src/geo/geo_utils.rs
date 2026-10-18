@@ -602,6 +602,79 @@ pub fn read_wkb(bytes: &[u8]) -> GeometryResult<Geometry<f64>> {
     Ok(wkb.try_to_geometry().unwrap_or_else(empty_geometry))
 }
 
+/// Returns the envelope of every coordinate in a WKB-encoded geometry without building the geometry, or `None` if
+/// it cannot be parsed, has no coordinates or has non-finite ones.
+///
+/// It contains the envelope of [`read_wkb`]'s result (holes count too), so a geometry whose `wkb_envelope` does not
+/// intersect an area cannot intersect it once parsed either: readers use it to skip rows outside the bounds cheaply.
+pub fn wkb_envelope(bytes: &[u8]) -> Option<Envelope> {
+    use geo_traits::{
+        CoordTrait, GeometryCollectionTrait, GeometryTrait, GeometryType as G, LineStringTrait, MultiLineStringTrait,
+        MultiPointTrait, MultiPolygonTrait, PointTrait, PolygonTrait,
+    };
+
+    /// Envelope so far, `None` once a non-finite coordinate is seen.
+    type Acc = Option<Envelope>;
+    fn coord(c: &impl CoordTrait<T = f64>, env: &mut Acc) {
+        let (x, y) = (c.x(), c.y());
+        match env {
+            Some(e) if x.is_finite() && y.is_finite() => e.expand_to_include(x, y),
+            _ => *env = None,
+        }
+    }
+    fn line(l: &impl LineStringTrait<T = f64>, env: &mut Acc) {
+        for c in l.coords() {
+            coord(&c, env);
+        }
+    }
+    fn polygon(p: &impl PolygonTrait<T = f64>, env: &mut Acc) {
+        if let Some(e) = p.exterior() {
+            line(&e, env);
+        }
+        for i in p.interiors() {
+            line(&i, env);
+        }
+    }
+    fn geometry(g: &impl GeometryTrait<T = f64>, env: &mut Acc) {
+        match g.as_type() {
+            G::Point(p) => {
+                if let Some(c) = p.coord() {
+                    coord(&c, env);
+                }
+            }
+            G::LineString(l) => line(l, env),
+            G::Polygon(p) => polygon(p, env),
+            G::MultiPoint(mp) => {
+                for p in mp.points() {
+                    if let Some(c) = p.coord() {
+                        coord(&c, env);
+                    }
+                }
+            }
+            G::MultiLineString(ml) => {
+                for l in ml.line_strings() {
+                    line(&l, env);
+                }
+            }
+            G::MultiPolygon(mp) => {
+                for p in mp.polygons() {
+                    polygon(&p, env);
+                }
+            }
+            G::GeometryCollection(gc) => {
+                for g in gc.geometries() {
+                    geometry(&g, env);
+                }
+            }
+            G::Rect(_) | G::Triangle(_) | G::Line(_) => *env = None,
+        }
+    }
+    let wkb = wkb::reader::read_wkb(bytes).ok()?;
+    let mut env = Some(Envelope::null());
+    geometry(&wkb, &mut env);
+    env.filter(|e| !e.is_null())
+}
+
 /// Encode a geometry as little-endian WKB.
 pub fn write_wkb(geom: &Geometry<f64>) -> GeometryResult<Vec<u8>> {
     let mut out = Vec::new();
@@ -709,6 +782,39 @@ mod tests {
     use crate::stats::stats::InMemoryStats;
     use approx::assert_relative_eq;
     use geo::{AffineOps, AffineTransform, Contains};
+
+    #[test]
+    fn wkb_envelope_contains_parsed_envelope() {
+        let geoms: Vec<Geometry<f64>> = vec![
+            Point::new(1.0, 2.0).into(),
+            LineString::from(vec![(0.0, 0.0), (3.0, -1.0)]).into(),
+            Polygon::new(
+                LineString::from(vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 0.0)]),
+                // a hole outside the shell still counts
+                vec![LineString::from(vec![(20.0, 20.0), (21.0, 20.0), (21.0, 21.0), (20.0, 20.0)])],
+            )
+            .into(),
+            MultiPoint::from(vec![(5.0, 5.0), (-5.0, 7.0)]).into(),
+            Geometry::GeometryCollection(GeometryCollection(vec![
+                Point::new(1.0, 1.0).into(),
+                Point::new(-1.0, 4.0).into(),
+            ])),
+        ];
+        for g in geoms {
+            let wkb = write_wkb(&g).unwrap();
+            let env = wkb_envelope(&wkb).unwrap();
+            let parsed = Envelope::of_geometry(&read_wkb(&wkb).unwrap());
+            assert!(env.contains(&parsed), "{g:?}: {env:?} vs {parsed:?}");
+            let mut all = Envelope::null();
+            for c in geo::CoordsIter::coords_iter(&g) {
+                all.expand_to_include(c.x, c.y);
+            }
+            assert_eq!(all, env, "{g:?}");
+        }
+        assert_eq!(None, wkb_envelope(&write_wkb(&Point::new(f64::NAN, 1.0).into()).unwrap()));
+        assert_eq!(None, wkb_envelope(&write_wkb(&Geometry::GeometryCollection(GeometryCollection(vec![]))).unwrap()));
+        assert_eq!(None, wkb_envelope(&[1, 2, 3]));
+    }
 
     #[test]
     fn projections() {

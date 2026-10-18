@@ -75,6 +75,19 @@ pub trait SimpleReader: Send + Sync {
     /// Reads all features in this data provider, submitting each to `next` for further processing.
     fn read_features(&self, next: &mut FeatureSink<'_>) -> anyhow::Result<()>;
 
+    /// Like [`SimpleReader::read_features`], but the reader may skip features whose lat/lon envelope certainly does
+    /// not intersect `bounds` without decoding them, reporting how many it skipped to `skipped` (possibly from other
+    /// threads). Callers still filter the features they receive. The default reads everything.
+    fn read_features_within(
+        &self,
+        bounds: &Envelope,
+        skipped: &(dyn Fn(u64) + Sync),
+        next: &mut FeatureSink<'_>,
+    ) -> anyhow::Result<()> {
+        let _ = (bounds, skipped);
+        self.read_features(next)
+    }
+
     /// Reads all features into a vector (convenience for tests and small inputs).
     fn read_all(&self) -> anyhow::Result<Vec<ReaderFeature>> {
         let mut result = Vec::new();
