@@ -816,6 +816,9 @@ fn extract_adjacency_list(geometries: &[Geometry<f64>], min_dist: f64) -> Vec<Ve
         })
         .collect();
     let index = RTree::bulk_load(items);
+    // Every candidate pair is usually visited from both sides; remember the (symmetric) distance test result of pairs
+    // whose other side has not been queried yet so it is computed once.
+    let mut pending: hashbrown::HashMap<(usize, usize), bool, foldhash::fast::FixedState> = Default::default();
     for (i, a) in geometries.iter().enumerate() {
         let env_a = &envelopes[i];
         if env_a.is_null() {
@@ -824,7 +827,22 @@ fn extract_adjacency_list(geometries: &[Geometry<f64>], min_dist: f64) -> Vec<Ve
         let query = AABB::from_corners([env_a.min_x, env_a.min_y], [env_a.max_x, env_a.max_y]);
         for item in index.locate_in_envelope_intersecting(query) {
             let j = item.data;
-            if is_within_distance(a, env_a, &geometries[j], &envelopes[j], min_dist) {
+            let within = if i == j && min_dist >= 0.0 {
+                // a non-empty geometry is at distance 0 from itself
+                true
+            } else if j < i {
+                match pending.remove(&(j, i)) {
+                    Some(within) => within,
+                    None => is_within_distance(a, env_a, &geometries[j], &envelopes[j], min_dist),
+                }
+            } else {
+                let within = is_within_distance(a, env_a, &geometries[j], &envelopes[j], min_dist);
+                if j > i {
+                    pending.insert((i, j), within);
+                }
+                within
+            };
+            if within {
                 result[i].push(j);
                 result[j].push(i);
             }
