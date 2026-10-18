@@ -554,6 +554,9 @@ point/order; scripts in the orchestrator port's final report):
   nulls every feature; since fixed: dropped peaks now get an empty geometry so the empty layer is kept), and lower
   `osm_boundary_missing_way`/`osm_multipolygon_missing_way`/`merge_snap_fix_input` data error counts (Java recomputes
   and re-logs failed geometries per layer).
+  Re-run 2026-10-18 (`docs/switzerland-parity.md`): tile sets identical (the 28 empty tiles are fixed); 2387 z13
+  buildings, 404 landuse, 21 landcover, 10 transportation, 1730 housenumber ID diffs; one extra z13 building in Rust
+  (a merged polygon of area 4.002 px² at the 4 px² merge threshold).
 - Fixes made while comparing: hot-pixel snap rounding in `reduce_precision`, Java multimap order for relation
   memberships (`route_N_*` attributes), Java `HashMap` iteration order for OMT housenumber grouping, custommap OSM
   tags, empty layers after point-buffer filtering (see above).
@@ -570,12 +573,9 @@ point/order; scripts in the orchestrator port's final report):
 - Re-enable the four `#[cfg(any())]` merge tests in `crates/planetiler-core/tests/` once FeatureMerge merges.
 - `feature_merge::buffer_geometry`: near-collinear mitre vertices are now removed (Monaco z13 buildings within ~1.5%
   of Java's vertex count); exact parity would need a port of the JTS offset-curve builder.
-- Re-run the Switzerland Java-vs-Rust comparison to confirm the `mountain_peak` empty-tile fix and the buffer-merge
-  vertex change on `landuse`/`landcover`.
 - Port custommap `SchemaValidator` CLI, `TopOsmTiles.main` (xz), `OpenMapTilesMapping` benchmark; in-memory stream
   archive readers for the csv/tsv/json/proto `testPlanetilerRunner` variants.
 - MLT tile format (MapLibre Tile) encoder.
-- Full benchmark re-run on a quiet machine (see `bench/RESULTS.md`).
 ### custommap notes (`crates/planetiler-custommap`)
 
 **Loading.** `SchemaConfig::load(path)` / `load_str(yaml)` go through `util::yaml` (anchors, aliases, `<<` merge keys)
