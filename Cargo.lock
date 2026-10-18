@@ -1051,8 +1051,6 @@ dependencies = [
 [[package]]
 name = "i_float"
 version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ecaff1ce29bcacd72cdf581ba6fce636ef4c4e0b2da7e7846dd0137d98141e2"
 dependencies = [
  "libm",
 ]

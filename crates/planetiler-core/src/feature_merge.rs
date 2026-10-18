@@ -704,7 +704,10 @@ fn extract_adjacency_list(geometries: &[Geometry<f64>], min_dist: f64) -> Vec<Ve
                 return true;
             }
         }
-        Euclidean.distance(a, b) <= min_dist
+        match polygons_within_distance(a, b, min_dist) {
+            Some(within) => within,
+            None => Euclidean.distance(a, b) <= min_dist,
+        }
     };
     for (i, env_a) in envelopes.iter().enumerate() {
         if env_a.is_null() {
@@ -735,6 +738,121 @@ fn extract_adjacency_list(geometries: &[Geometry<f64>], min_dist: f64) -> Vec<Ve
         }
     }
     result
+}
+
+/// The polygons of a `Polygon` / `MultiPolygon`, or `None` for other geometries or if one has an empty shell.
+fn polygon_parts(geom: &Geometry<f64>) -> Option<&[Polygon<f64>]> {
+    let parts = match geom {
+        Geometry::Polygon(p) => std::slice::from_ref(p),
+        Geometry::MultiPolygon(mp) => &mp.0[..],
+        _ => return None,
+    };
+    parts.iter().all(|p| p.exterior().0.len() >= 2).then_some(parts)
+}
+
+/// A segment envelope `[min_x, min_y, max_x, max_y]` and its endpoints.
+type RingSegment = ([f64; 4], Coord<f64>, Coord<f64>);
+
+/// Segment envelopes and endpoints of every ring of `polys`.
+fn ring_segments(polys: &[Polygon<f64>], out: &mut Vec<RingSegment>) {
+    for p in polys {
+        for ring in std::iter::once(p.exterior()).chain(p.interiors()) {
+            for w in ring.0.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                out.push(([a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y)], a, b));
+            }
+        }
+    }
+}
+
+/// Decides `Euclidean.distance(a, b) <= min_dist` for two small polygonal geometries without `geo`'s per-call
+/// R-trees, or returns `None` when it can't decide exactly the same way (other geometry types, large inputs, or a
+/// boundary distance within rounding error of `min_dist`, where the caller falls back to `geo`).
+///
+/// `geo`'s polygon distance is 0 if the polygons intersect, otherwise the minimum vertex-to-segment distance between
+/// their boundaries. Here: if any two boundary segments intersect (robust predicates, like `geo`'s `intersects`)
+/// the distance is 0. Otherwise the minimum vertex-to-segment distance over segment pairs whose envelopes are within
+/// `min_dist` decides, unless it is within a small margin of `min_dist`. If the boundaries are far apart, the
+/// polygons still intersect when one contains the other, which (since no boundaries cross) the first vertex of one
+/// being in the other tells.
+fn polygons_within_distance(a: &Geometry<f64>, b: &Geometry<f64>, min_dist: f64) -> Option<bool> {
+    use geo::Intersects;
+    use geo::kernels::{Kernel, Orientation, RobustKernel};
+    const MAX_PAIRS: usize = 1 << 14;
+    if min_dist.is_nan() || min_dist < 0.0 {
+        return None;
+    }
+    let (pa, pb) = (polygon_parts(a)?, polygon_parts(b)?);
+    thread_local! {
+        static SEGMENTS: std::cell::RefCell<(Vec<RingSegment>, Vec<RingSegment>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+    SEGMENTS.with_borrow_mut(|(sa, sb)| {
+        sa.clear();
+        sb.clear();
+        ring_segments(pa, sa);
+        ring_segments(pb, sb);
+        if sa.len().saturating_mul(sb.len()) > MAX_PAIRS {
+            return None;
+        }
+        let mut max_abs = min_dist;
+        for (env, _, _) in sa.iter().chain(sb.iter()) {
+            max_abs = max_abs.max(env[0].abs()).max(env[1].abs()).max(env[2].abs()).max(env[3].abs());
+        }
+        if !max_abs.is_finite() {
+            return None;
+        }
+        // far above the rounding error of a vertex-to-segment distance at this coordinate magnitude
+        let margin = max_abs * 1e-9;
+        let reach = min_dist + margin;
+        let orient = |p: Coord<f64>, q: Coord<f64>, r: Coord<f64>| match RobustKernel::orient2d(p, q, r) {
+            Orientation::CounterClockwise => 1i8,
+            Orientation::Clockwise => -1,
+            Orientation::Collinear => 0,
+        };
+        let mut min_d = f64::INFINITY;
+        for &(ea, a1, a2) in sa.iter() {
+            for &(eb, b1, b2) in sb.iter() {
+                if eb[0] - ea[2] > reach || ea[0] - eb[2] > reach || eb[1] - ea[3] > reach || ea[1] - eb[3] > reach {
+                    continue;
+                }
+                if eb[0] <= ea[2] && ea[0] <= eb[2] && eb[1] <= ea[3] && ea[1] <= eb[3] {
+                    let (o1, o2) = (orient(a1, a2, b1), orient(a1, a2, b2));
+                    let (o3, o4) = (orient(b1, b2, a1), orient(b1, b2, a2));
+                    if o1 * o2 <= 0 && o3 * o4 <= 0 && (o1 != 0 || o2 != 0 || o3 != 0 || o4 != 0) {
+                        return Some(true);
+                    }
+                    if o1 == 0 && o2 == 0 && o3 == 0 && o4 == 0 {
+                        // collinear segments with overlapping envelopes overlap
+                        return Some(true);
+                    }
+                }
+                let la = geo_types::Line::new(a1, a2);
+                let lb = geo_types::Line::new(b1, b2);
+                let d = Euclidean
+                    .distance(b1, &la)
+                    .min(Euclidean.distance(b2, &la))
+                    .min(Euclidean.distance(a1, &lb))
+                    .min(Euclidean.distance(a2, &lb));
+                min_d = min_d.min(d);
+            }
+        }
+        if min_d <= min_dist - margin {
+            return Some(true);
+        }
+        if min_d <= min_dist + margin {
+            return None;
+        }
+        // boundaries are more than min_dist apart and do not cross: within distance only if one contains the other
+        for p in pa {
+            for q in pb {
+                if p.intersects(&q.exterior().0[0]) || q.intersects(&p.exterior().0[0]) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    })
 }
 
 /// Sorted, deduplicated bit patterns of every vertex of `geom` (with `-0.0` as `0.0`, so equal keys mean equal
@@ -1550,6 +1668,45 @@ mod tests {
             (1.0, 1.0, 0.5, 0.0625),
             3,
         );
+    }
+
+    /// The buffer fast path for a single simple curve (no overlay) gives exactly the same merged polygons as the
+    /// general path, on real building tiles.
+    #[test]
+    #[ignore = "slow in debug builds; run with --release -- --ignored"]
+    fn simple_curve_buffer_fast_path_is_exact() {
+        let tiles = [
+            (("bostonbuildings.mbtiles", 2477, 3028, 13), (4.0, 0.0, 0.5, 0.5)),
+            (("bostonbuildings.mbtiles", 2481, 3026, 13), (4.0, 0.0, 0.5, 0.5)),
+            (("bostonbuildings.mbtiles", 2479, 3028, 13), (4.0, 0.0, 0.5, 0.5)),
+            (("jakartabuildings.mbtiles", 6527, 4240, 13), (4.0, 0.0, 0.5, 0.5)),
+            (("protomaps538lakemerge.mbtiles", 35, 46, 7), (1.0, 1.0, 0.5, 0.0625)),
+        ];
+        for (tile, args) in tiles {
+            let features = read_tile(tile.0, tile.1, tile.2, tile.3);
+            let run = |fast: bool| {
+                crate::geo::buffer::SIMPLE_CURVE_FAST_PATH.with(|f| f.set(fast));
+                let stats = InMemoryStats::new();
+                let merged =
+                    merge_nearby_polygons_with(features.clone(), args.0, args.1, args.2, args.3, &stats, None).unwrap();
+                crate::geo::buffer::SIMPLE_CURVE_FAST_PATH.with(|f| f.set(true));
+                merged
+            };
+            assert_eq!(run(false), run(true), "{tile:?}");
+            // and on each polygon's buffer / unbuffer by itself
+            for feature in &features {
+                let Ok(geom) = feature.geometry.decode() else { continue };
+                for distance in [0.5, -0.5, 0.0625, 2.0] {
+                    let with = |fast: bool| {
+                        crate::geo::buffer::SIMPLE_CURVE_FAST_PATH.with(|f| f.set(fast));
+                        let result = buffer_geometry(distance, &geom).ok();
+                        crate::geo::buffer::SIMPLE_CURVE_FAST_PATH.with(|f| f.set(true));
+                        result
+                    };
+                    assert_eq!(with(false), with(true), "{tile:?} {distance} {geom:?}");
+                }
+            }
+        }
     }
 
     /// The buffer/union/unbuffer implementation before the JTS buffer port (`geo::Buffer` with the near-collinear

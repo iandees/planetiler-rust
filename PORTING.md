@@ -40,6 +40,10 @@ were not given Rust files; use the Rust idiom instead.
   in the same Rust file (or `tests/` for integration tests). Test resources are in `planetiler-core/src/test/resources`.
 - **Formatting**: `cargo fmt` (see `rustfmt.toml`); `cargo clippy` should be clean.
 - Mark intentionally-deferred work with `// TODO(port): ...`.
+- **Vendored crates**: `vendor/i_float` is `i_float` 5.0.0 with a fast exact two-word division
+  (`UIntNumber::div_rem_wide`; upstream divides bit by bit, which was ~12% of building merge time in the i64
+  overlay engine's segment intersections), used via `[patch.crates-io]`. Results are identical; drop the patch if
+  upstream speeds this up.
 
 ## Status
 
@@ -94,7 +98,15 @@ See the table at the bottom of this file; update it as modules are completed.
   winding, `polygon_overlay::positive_winding_region`) instead of JTS's noding/graph. Intersection vertices are
   recomputed with JTS's `RobustLineIntersector` and rings rotated to JTS's start point; JTS's floating-noding failure
   (and fallback to snap-rounding at 12 digits) is predicted by emulating its noder and `FastNodingValidator`
-  (`geo::buffer::noding`). See the module docs for the remaining differences.
+  (`geo::buffer::noding`). See the module docs for the remaining differences. A single raw curve that is simple
+  (`noding::is_simple_closed_curve`) with every vertex exact on the overlay grid skips the overlay
+  (`polygon_overlay::simple_curve_positive_winding_region`: the region is the curve itself); `buffer` tests compare
+  it with the general path.
+- `InputEdges` (overlay output vertex refinement / ring start matching) finds input segments near a vertex with
+  `geo::segment_grid::SegmentGrid` (a lazily built uniform grid; the first queries scan linearly) instead of an
+  `rstar` tree. Candidates come back in input order, and when the refined vertex could depend on the candidate
+  order (a tie between different intersection points, or a pair whose intersection depends on segment order) it
+  falls back to the R-tree order the port used before, so results are unchanged.
 - JTS `geometryCollection.union()` for polygons -> `geo::cascaded_polygon_union::union` (port of
   `CascadedPolygonUnion` with the `STRtree` item order; pairwise `polygon_overlay::union_pair`). Use it where Java
   calls `union()` and exact vertices matter; `polygon_overlay::union_all` is a faster single-pass union.
@@ -126,7 +138,12 @@ See the table at the bottom of this file; update it as modules are completed.
   `geo::cascaded_polygon_union` (docs/analysis-merge-vertices.md "Fix B"). `merge_*_matches_java` compare
   `merge_nearby_polygons` with Java's output on the Boston/Jakarta/protomaps538 tiles (stored in
   `tests/resources/buffer/`; ~1% of polygons differ, mostly by one vertex), and `bench_merge_building_tiles`
-  benchmarks against the previous `geo::Buffer` implementation (`tests::legacy`).
+  benchmarks against the previous `geo::Buffer` implementation (`tests::legacy`). `benchmark_feature_merge`
+  (planetiler-benchmarks) reports single-thread CPU time per merged building tile for A/B comparisons.
+- The proximity grouping decides `distance <= min_dist` for small polygon pairs with a brute-force segment scan
+  (robust crossing test + vertex-to-segment distances, `polygons_within_distance`) and only calls `geo`'s
+  R-tree-based `Euclidean` distance when the boundary distance is within 1e-9 (relative) of `min_dist`, so the
+  decisions are the same.
 - `buffer_union_unbuffer` succeeds on 3 of the protomaps538 inputs where JTS's floating unbuffer silently returns an
   empty result (locationtech/jts#1183) and Java falls back to a plain union; the Rust result fills sub-pixel gaps
   (area up to ~3% larger than the input), so that test allows a 3% area increase instead of 1%. The `@Slow`
@@ -245,6 +262,8 @@ helpers `*_fn`).
 Option<Group> }`; filled tiles of one polygon/zoom share one `Arc` so the encoder only encodes it once.
 `TiledGeometry` (`slice_into_tiles`, `slice_points_into_tiles`, `get_covered_tiles`, `CoveredTiles`) and
 `geometry_coordinate_sequences` (`Groups = Vec<Vec<Vec<Coord>>>`) are public for other users (e.g. `Bounds` shapes).
+A line or polygon whose coordinates (plus the neighbor buffer) all fall in one tile skips the striped clipping
+(`slice_single_tile_group`, same output; a test compares both on random inputs).
 JTS `LinearRing` semantics: when simplification collapses a polygon's shell, JTS's `GeometryTransformer` returns the
 surviving rings as `LinearRing`s, and Java's renderer then treats them as non-polygonal (line slicing, unsquared min
 size) but `extractGroups` turns each `LinearRing` into a polygon filtered by area. geo has no `LinearRing`, so
@@ -385,7 +404,9 @@ reader.close();                            // drops node locations / relation in
   processes its own blocks. With a sequential map (`sparsearray`, `sortedtable`; the default) `threads-2` parse
   threads decode blocks, **call `preprocess_osm_node` and encode node locations in parallel** (Java does both on the
   single writer thread; ordering vs. ways is preserved because the writer consumes blocks in order) and hand
-  `(id, location)` pairs plus the remaining elements over a per-block channel to the single writer thread.
+  `(id, location)` pairs plus the remaining elements over a per-block channel to the single writer thread. Up to
+  `8 * parse threads` parsed blocks can wait for the writer (a slow block at the head no longer stalls the reader),
+  and mmap append stores write through a background I/O thread (`util::async_file_writer`).
   Profile panics in `preprocess_*`/`process_feature`/`finish` are caught and logged like Java exceptions.
 - Relation info (`HashMap<i64, Arc<dyn OsmRelationInfo>>`, last info per relation wins like Java), way->relation and
   relation->parent memberships (sorted `Vec<(i64, i64)>`, role id in the top 16 bits) and the roaring set of

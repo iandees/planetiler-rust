@@ -711,6 +711,9 @@ impl OsmReader {
             // when they are ready
             let parse_threads = 1.max(if threads < 8 { threads } else { threads - 2 });
             let pending_blocks = parse_threads * 2;
+            // parsed blocks waiting for the (in order) writer: a deeper window than the parse queue so a slow block
+            // at the head does not stall the reader and starve the other parse threads
+            let parsed_window = parse_threads * 8;
             type Pending = crossbeam_channel::Receiver<anyhow::Result<ParsedBlock>>;
             type ToParse = (
                 crate::reader::osm::osm_block_source::Block,
@@ -718,7 +721,7 @@ impl OsmReader {
                 u64,
             );
             inner.pass1_phaser.register_workers(1);
-            let parsed_batches: WorkQueue<Pending> = WorkQueue::new("elements", pending_blocks, 1, stats);
+            let parsed_batches: WorkQueue<Pending> = WorkQueue::new("elements", parsed_window, 1, stats);
             let source = inner.block_source.clone();
             let parse_inner = inner.clone();
             let batches = parsed_batches.clone();

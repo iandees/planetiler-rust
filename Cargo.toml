@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -78,6 +79,11 @@ any_ascii = "0.3"
 proptest = "1"
 criterion = "0.8"
 approx = "0.5"
+
+# i_float with a fast two-word division in the i64 overlay engine's segment intersection (identical results; see
+# vendor/i_float/Cargo.toml)
+[patch.crates-io]
+i_float = { path = "vendor/i_float" }
 
 [profile.release]
 debug = 1

@@ -22,6 +22,7 @@ pub mod polygon_index;
 pub mod polygon_overlay;
 pub mod polygonizer;
 pub mod precision_model;
+pub mod segment_grid;
 pub mod simplify_method;
 pub mod test_utils;
 pub mod tile_coord;

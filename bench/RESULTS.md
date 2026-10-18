@@ -332,3 +332,33 @@ The cleanup pass (`da514d1`) switched PMTiles directory varints to `util::var_in
 and index-based decoding, and `put_var_long` uses a `while v >= 0x80` loop. Spot check on a quiet machine (load ~1.6,
 Rust only, not a full pass): BenchmarkPmtiles 95-109M entries/s, BenchmarkVarInt 362-450M/s (was 244M/s). Re-measure
 against Java in the next full pass.
+
+### History: building merge, tiling, validity, pass 1 and sort pass (after 0cd140c)
+
+Rust only, interleaved A/B of `0cd140c` vs this pass on a shared machine (load 7 -> 14 during the runs, other
+builds running), 5 runs each, Switzerland, medians [min-max], stage wall from log timestamps, CPU = user+sys of the
+process. Output byte-identical (`cmp` of the Switzerland and Monaco mbtiles; `planetiler compare`: 0 tile diffs).
+
+- Switzerland: 10.84s [10.10-11.52] / 131s CPU -> 9.94s [9.51-10.66] / 120s CPU (each pair 0.6-1.0s faster, 5-11s
+  less CPU), peak RSS 4.0 GB both. archive 3.65s -> 3.14s (z13 28-33s -> 23-27s CPU), sort 0.55s -> 0.39s,
+  osm_pass1 0.85s -> 0.79s (nodes sub-phase avg 8.6 -> 9.9 cores), osm_pass2 4.28s -> 4.03s (ways 38-40s -> 35-38s
+  CPU). An earlier 4+4 run at load 14-16 gave 11.95s / 141s -> 11.0s / 133s.
+- `benchmark_feature_merge` (new; single-thread CPU per z13 building tile, the `merge_*_matches_java` inputs):
+  Boston 213 / 171 / 172 ms -> 159 / 129 / 129 ms, Jakarta 652 -> 484 ms (sum 1205 -> 900 ms, -25%).
+- Building `merge_nearby_polygons` hotspots (`sample` of z13 and of the benchmark): `i_float`'s 256-by-128-bit
+  division in `i_overlay`'s i64 segment intersection was a 128-iteration bit loop (~12% of merge time) -> vendored
+  `i_float` with an exact two-digit (Knuth D) division (`vendor/i_float`); the overlay vertex refinement built an
+  `rstar` tree per overlay (~7%) -> a lazily built uniform grid with an exact fallback to the R-tree order on ties;
+  JTS noding emulation ran the full intersection test on every pair of consecutive curve segments -> one
+  orientation test unless collinear; the proximity grouping's `geo` distance built two R-trees per polygon pair ->
+  a brute-force segment scan for small pairs (falls back to `geo` near the threshold); a single simple buffer curve
+  (most building buffers) skips the overlay. What remains is ~40% `i_overlay` itself, ~17% noding emulation and
+  ~13% JTS vertex matching.
+- Pass 2: the striped clipping now handles a line or polygon that lies in one tile directly (slicing 15% -> 9% of
+  pass 2 process time), and `is_valid` skips consecutive non-collinear ring segments.
+- Pass 1: the single node-location writer was the limit (busy ~78%, ~15% of it in `write` syscalls, and the
+  reader stalled once 26 parsed blocks were waiting for it) -> mmap append stores write through a background I/O
+  thread and up to `8 * parse threads` parsed blocks can wait.
+- Sort: the critical path was reading one 880 MB chunk on one thread (0.26s) -> writers record a record boundary
+  every 32 MB and the group is read by 8 threads (0.09s); then the in-memory sort (0.13s) and the 6 parallel piece
+  writers (0.15-0.18s).

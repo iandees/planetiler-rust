@@ -43,6 +43,23 @@ fn unkey(k: u64) -> (u32, u32) {
     ((k >> 32) as u32, k as u32)
 }
 
+#[cfg(not(test))]
+#[inline]
+fn single_tile_fast_path_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests turn the single tile fast path off to compare it with the striped clipping.
+    static SINGLE_TILE_FAST_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+fn single_tile_fast_path_enabled() -> bool {
+    SINGLE_TILE_FAST_PATH.with(|f| f.get())
+}
+
 #[inline]
 fn floor_i32(v: f64) -> i32 {
     v.floor() as i32
@@ -371,6 +388,9 @@ impl TiledGeometry {
         let mut overflow = Overflow::default();
         let mut in_progress: FastIndexMap<u64, Vec<CoordSeq>> = FastIndexMap::default();
         for group in groups {
+            if x_offset == 0 && single_tile_fast_path_enabled() && self.slice_single_tile_group(group) {
+                continue;
+            }
             in_progress.clear();
             for (i, segment) in group.iter().enumerate() {
                 let is_outer_ring = i == 0;
@@ -407,6 +427,79 @@ impl TiledGeometry {
             self.add_shape_to_results(&mut in_progress);
         }
         Ok(overflow)
+    }
+
+    /// Fast path of [`Self::slice_world_copy`] for a group (a line, or the rings of one polygon) whose coordinates,
+    /// expanded by the neighbor buffer, all fall in one tile: no clipping happens, so every ring becomes the same
+    /// sequence of points (consecutive duplicates removed, polygon rings closed) translated and scaled to that tile,
+    /// exactly what the striped clipping produces. Returns false (doing nothing) if the group does not qualify.
+    fn slice_single_tile_group(&mut self, group: &[CoordSeq]) -> bool {
+        let nb = self.neighbor_buffer;
+        let (mut min_x, mut min_y, mut max_x, mut max_y) =
+            (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        if group.is_empty() {
+            return false;
+        }
+        for ring in group {
+            if ring.len() < 2 {
+                return false;
+            }
+            for c in ring {
+                if !(c.x.is_finite() && c.y.is_finite()) {
+                    return false;
+                }
+                min_x = min_x.min(c.x);
+                max_x = max_x.max(c.x);
+                min_y = min_y.min(c.y);
+                max_y = max_y.max(c.y);
+            }
+        }
+        let x = floor_i32(min_x - nb);
+        let y = floor_i32(min_y - nb);
+        if floor_i32(max_x + nb) != x
+            || floor_i32(max_y + nb) != y
+            || x < 0
+            || x >= self.max_tiles_at_this_zoom
+            || !self.extents.test_x(x as u32)
+            || y < self.extents.min_y as i32
+            || y >= self.extents.max_y as i32
+        {
+            return false;
+        }
+        let area = self.area;
+        let (fx, fy) = (x as f64, y as f64);
+        let mut seqs: Vec<CoordSeq> = Vec::with_capacity(group.len());
+        for ring in group {
+            // the x stripe (tile-relative x, world y), then the row (tile pixels), as in slice_x / slice_y
+            let mut stripe: CoordSeq = Vec::with_capacity(ring.len() + 1);
+            for c in ring {
+                add_point(&mut stripe, c.x - fx, c.y);
+            }
+            if area {
+                close_ring(&mut stripe);
+            }
+            let mut out: CoordSeq = Vec::with_capacity(stripe.len() + 1);
+            for c in &stripe {
+                add_point(&mut out, 256.0 * c.x, 256.0 * (c.y - fy));
+            }
+            if area {
+                close_ring(&mut out);
+            }
+            seqs.push(out);
+        }
+        // add_shape_to_results
+        let min_points = if area { 4 } else { 2 };
+        if area && seqs[0].len() < 4 {
+            return true;
+        }
+        if !self.extents.test(x as u32, y as u32) {
+            return true;
+        }
+        seqs.retain(|seq| seq.len() >= min_points);
+        if !seqs.is_empty() {
+            self.tile_contents.entry(key(x as u32, y as u32)).or_default().push(seqs);
+        }
+        true
     }
 
     fn add_shape_to_results(&mut self, in_progress: &mut FastIndexMap<u64, Vec<CoordSeq>>) {
@@ -908,6 +1001,70 @@ mod tests {
 
     fn gc(geoms: Vec<Geometry<f64>>) -> Geometry<f64> {
         Geometry::GeometryCollection(new_geometry_collection(geoms))
+    }
+
+    /// The single tile fast path gives exactly the striped clipping's result (tile order, sequences, filled tiles).
+    #[test]
+    fn single_tile_fast_path_matches_striped_clipping() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let z = 3;
+        let extents = for_zoom(z, 1, 0, 8, 7);
+        let mut single_tile = 0;
+        for case in 0..20_000 {
+            let area = case % 2 == 0;
+            let buffer = [0.0, 4.0 / 256.0, 0.125][case % 3];
+            // groups of small rings, sometimes near tile edges or outside the extents
+            let mut groups: Groups = Vec::new();
+            for _ in 0..(1 + case % 3) {
+                let (cx, cy) = (rand() * 9.0 - 0.5, rand() * 9.0 - 0.5);
+                let size = [0.001, 0.05, 0.3][case % 5 % 3];
+                let mut group = Vec::new();
+                for r in 0..(1 + case % 2) {
+                    let s = size / (1 + r) as f64;
+                    let n = 2 + (rand() * 6.0) as usize;
+                    let mut ring: CoordSeq = (0..n)
+                        .map(|i| {
+                            let a = i as f64 / n as f64 * std::f64::consts::TAU;
+                            Coord { x: cx + s * a.cos() * rand(), y: cy + s * a.sin() * rand() }
+                        })
+                        .collect();
+                    if case % 7 == 0 {
+                        ring.push(ring[ring.len() - 1]);
+                    }
+                    if area {
+                        ring.push(ring[0]);
+                    }
+                    group.push(ring);
+                }
+                groups.push(group);
+            }
+            let run = |fast: bool| {
+                SINGLE_TILE_FAST_PATH.with(|f| f.set(fast));
+                let result = TiledGeometry::slice_into_tiles(&groups, buffer, area, z, &extents);
+                SINGLE_TILE_FAST_PATH.with(|f| f.set(true));
+                result.map(|t| {
+                    let filled: Vec<_> = t.filled_tiles().collect();
+                    let data: Vec<_> = t.tile_data().map(|(c, g)| (c, g.clone())).collect();
+                    (filled, data)
+                })
+            };
+            let (general, fast) = (run(false), run(true));
+            match (general, fast) {
+                (Ok(general), Ok(fast)) => {
+                    single_tile += (general.1.len() == 1) as usize;
+                    assert_eq!(general, fast, "case {case}: {groups:?}");
+                }
+                (Err(_), Err(_)) => {}
+                (general, fast) => panic!("case {case}: {general:?} vs {fast:?}"),
+            }
+        }
+        assert!(single_tile > 2000, "{single_tile}");
     }
 
     fn covered(g: impl Into<Geometry<f64>>, z: u32) -> CoveredTiles {

@@ -50,7 +50,16 @@ pub fn buffer(geom: &Geometry<f64>, distance: f64, params: &BufferParameters) ->
     if curves.is_empty() {
         return Ok(polygon_overlay::to_polygonal(vec![]));
     }
-    let mut result = if noding::floating_noding_is_valid(&curves) {
+    // fast path for the common case of a single simple curve (the region is the curve itself)
+    let simple = match curves.as_slice() {
+        [curve] if simple_curve_fast_path_enabled() && noding::is_simple_closed_curve(curve) => {
+            polygon_overlay::simple_curve_positive_winding_region(curve)
+        }
+        _ => None,
+    };
+    let mut result = if let Some(simple) = simple {
+        simple
+    } else if noding::floating_noding_is_valid(&curves) {
         polygon_overlay::positive_winding_region(&curves)?
     } else {
         // JTS's floating point buffer would fail, and BufferOp.bufferReducedPrecision retries with snap-rounding
@@ -71,6 +80,23 @@ pub fn buffer(geom: &Geometry<f64>, distance: f64, params: &BufferParameters) ->
         result = vec![keep_largest_area(result)];
     }
     Ok(polygon_overlay::to_polygonal(result))
+}
+
+#[cfg(not(test))]
+#[inline]
+fn simple_curve_fast_path_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests turn the single simple curve fast path off to compare it with the general path.
+    pub(crate) static SIMPLE_CURVE_FAST_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+fn simple_curve_fast_path_enabled() -> bool {
+    SIMPLE_CURVE_FAST_PATH.with(|f| f.get())
 }
 
 /// JTS `BufferOp.MAX_PRECISION_DIGITS`.

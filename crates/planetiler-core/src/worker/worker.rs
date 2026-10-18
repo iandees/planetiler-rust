@@ -51,6 +51,9 @@ impl Worker {
                     Ok(r) => r,
                     Err(payload) => Err(panic_to_error(payload)),
                 };
+                // release the task (and everything it captured) before signalling completion, so that once all
+                // threads are done nothing they shared is still referenced from a worker thread
+                drop(task);
                 match result {
                     Ok(()) => {
                         stats.timers().finished_worker_thread(&prefix_owned, start.elapsed());
