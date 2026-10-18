@@ -3,6 +3,9 @@
 Machine: Apple Silicon, 15 cores, 48 GB RAM. Java: OpenJDK 25.0.4.1. Rust: 1.99 `--release`.
 Numbers are the best of the repeated runs each benchmark prints.
 
+**Provisional:** everything below was measured while other agents were compiling (load avg 5-50). It will be re-measured
+sequentially on a quiet machine by a dedicated benchmark pass; treat ratios as rough until then.
+
 ## Component benchmarks
 
 | Benchmark | Java | Rust | Rust/Java |
