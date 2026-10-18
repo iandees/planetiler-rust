@@ -542,6 +542,15 @@ impl VectorTile {
     }
 
     /// Adds features in a layer to this tile.
+    /// Adds `layer_name` with no features if it does not exist yet (Java `addLayerFeatures` with a list that only
+    /// contains `null`s).
+    pub fn add_empty_layer(&mut self, layer_name: &str) -> &mut Self {
+        if !self.layers.contains_key(layer_name) {
+            self.layers.insert(layer_name.to_string(), Layer::default());
+        }
+        self
+    }
+
     pub fn add_layer_features(&mut self, layer_name: &str, features: &[Feature]) -> &mut Self {
         if features.is_empty() {
             return self;

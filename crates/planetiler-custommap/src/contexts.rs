@@ -453,7 +453,7 @@ static EMPTY_TAGS: LazyLock<Tags> = LazyLock::new(Tags::new);
 impl<'a> FeatureRef<'a> {
     pub fn tags(&self) -> &'a Tags {
         match self {
-            FeatureRef::Source(s) => &s.base().tags,
+            FeatureRef::Source(s) => planetiler_core::reader::with_tags::WithTags::tags(*s),
             FeatureRef::SplitTest(w) => &w.tags,
         }
     }

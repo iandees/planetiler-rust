@@ -836,7 +836,13 @@ impl TileFeatures {
             // intersections between endpoints to confuse line merging, so we have to reduce the precision here, now
             // that line merging is done. Also remove points more than --max-point-buffer pixels outside the tile if
             // the user has requested a narrower buffer than the profile provides by default.
+            let had_features = !features.is_empty();
             unscale_and_remove_points_outside_buffer(&mut features, self.shared.config.max_point_buffer);
+            if had_features && features.is_empty() {
+                // Java nulls out the removed features but still adds the (now featureless) layer, so the tile is
+                // written (empty) instead of being skipped
+                tile.add_empty_layer(&layer);
+            }
             tile.add_layer_features(&layer, &features);
         }
         tile

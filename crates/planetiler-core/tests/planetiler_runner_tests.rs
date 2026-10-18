@@ -41,11 +41,13 @@ fn split_args(args: &str) -> Vec<String> {
     args.split_whitespace().map(str::to_string).collect()
 }
 
+type TileMap = BTreeMap<TileCoord, Vec<ComparableFeature>>;
+
 fn read_tiles(
     format: &str,
     output: &Path,
     compression: TileCompression,
-) -> (BTreeMap<TileCoord, Vec<ComparableFeature>>, Option<indexmap::IndexMap<String, String>>) {
+) -> (TileMap, Option<indexmap::IndexMap<String, String>>) {
     let archive: Box<dyn ReadableTileArchive> = match format {
         "mbtiles" => Box::new(Mbtiles::new_read_only_database(output).unwrap()),
         "pmtiles" => Box::new(ReadablePmtiles::new_read_from_file(output).unwrap()),
