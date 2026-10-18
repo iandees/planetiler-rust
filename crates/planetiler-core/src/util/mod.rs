@@ -35,4 +35,5 @@ pub mod translations;
 pub mod var_int;
 pub mod wikidata;
 pub mod yaml;
+pub mod zip_entry_reader;
 pub mod zoom_function;

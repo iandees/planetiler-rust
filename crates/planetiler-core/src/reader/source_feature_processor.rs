@@ -190,22 +190,32 @@ where
 
     /// Returns the total number of features in all `source_paths`.
     pub fn get_feature_count(&self, source_paths: &[PathBuf]) -> anyhow::Result<u64> {
-        let mut count = 0;
-        for path in source_paths {
-            count += (self.reader_factory)(path)?.feature_count()?;
-        }
-        Ok(count)
+        Ok(self.open_readers(source_paths)?.1)
     }
 
-    /// Starts a pipeline that reads every feature from `source_paths` on `feature_read_threads` threads into a
+    /// Opens a reader for every path and returns them with the total number of features.
+    ///
+    /// Java opens one reader per path to count features and another one to read them. Here the readers used to count
+    /// are kept and handed to the read pipeline, so expensive setup (extracting a zipped sqlite file, inflating a
+    /// zipped shapefile to filter its records by bounds) happens once per run instead of twice.
+    fn open_readers(&self, source_paths: &[PathBuf]) -> anyhow::Result<(Vec<R>, u64)> {
+        let mut count = 0;
+        let mut readers = Vec::with_capacity(source_paths.len());
+        for path in source_paths {
+            let reader = (self.reader_factory)(path)?;
+            count += reader.feature_count()?;
+            readers.push(reader);
+        }
+        Ok((readers, count))
+    }
+
+    /// Starts a pipeline that reads every feature from `readers` on `feature_read_threads` threads into a
     /// `process_queue`.
-    fn read_pipeline(&self, source_paths: Vec<PathBuf>, config: &PlanetilerConfig) -> Builder<ReaderFeature> {
-        let factory = self.reader_factory.clone();
+    fn read_pipeline(&self, readers: Vec<R>, config: &PlanetilerConfig) -> Builder<ReaderFeature> {
         WorkerPipeline::start(&self.source_name, self.stats.clone())
-            .read_from_tiny("source_paths", source_paths)
-            .add_worker("read", config.feature_read_threads.max(1), move |paths, next| {
-                for path in paths {
-                    let reader = factory(&path)?;
+            .read_from_tiny("source_paths", readers)
+            .add_worker("read", config.feature_read_threads.max(1), move |readers, next| {
+                for reader in readers {
                     reader.read_features(&mut |feature| {
                         next.accept(feature);
                         Ok(())
@@ -235,12 +245,12 @@ where
             return Ok(());
         }
         let timer = self.stats.start_stage(&self.source_name);
-        let feature_count = self.get_feature_count(&source_paths)?;
+        let (readers, feature_count) = self.open_readers(&source_paths)?;
         let lat_lon_bounds: Envelope = config.bounds.lat_lon();
         let features_read = Counter::new_multi_thread_counter();
 
         let (counter, source) = (features_read.clone(), self.source_name.clone());
-        let builder = self.read_pipeline(source_paths, config);
+        let builder = self.read_pipeline(readers, config);
         let pipeline =
             process_and_write_with_profile(builder, writer, config, profile, &self.stats, move |prev, process| {
                 let counter = counter.counter_for_thread();
@@ -286,13 +296,13 @@ where
         P: Fn() -> ProcessFn + Send + Sync + 'static,
     {
         let timer = self.stats.start_stage(&self.source_name);
-        let feature_count = self.get_feature_count(&source_paths)?;
+        let (readers, feature_count) = self.open_readers(&source_paths)?;
         let process_threads = config.feature_process_threads.max(1);
         let lat_lon_bounds: Envelope = config.bounds.lat_lon();
         let features_read = Counter::new_multi_thread_counter();
 
         let counter = features_read.clone();
-        let pipeline = self.read_pipeline(source_paths, config).sink_to("process", process_threads, move |prev| {
+        let pipeline = self.read_pipeline(readers, config).sink_to("process", process_threads, move |prev| {
             let counter = counter.counter_for_thread();
             let mut process = processor_factory();
             for feature in prev {

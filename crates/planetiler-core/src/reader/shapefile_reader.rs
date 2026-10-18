@@ -26,6 +26,8 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use parking_lot::Mutex;
+
 use anyhow::{Context, Result, anyhow, bail};
 use geo_types::{Coord, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use tracing::warn;
@@ -37,6 +39,7 @@ use crate::reader::simple_reader::{
     FeatureSink, ReaderFeature, SimpleReader, default_decode_threads, inverse_transform_envelope,
 };
 use crate::util::file_utils;
+use crate::util::zip_entry_reader::{self, ZipEntryReader};
 use crate::value::{Tags, Value};
 
 /// Where the shapefile components live.
@@ -98,7 +101,13 @@ pub struct ShapefileReader {
     charset: Charset,
     dbf: DbfHeader,
     decode_threads: usize,
+    /// Records that passed `source_filter`, kept by [`SimpleReader::feature_count`] so that
+    /// [`SimpleReader::read_features`] does not have to read (and inflate) the whole file again.
+    filtered: Mutex<Option<Vec<RawBatch>>>,
 }
+
+/// Keep at most this many bytes of filtered records between counting and reading.
+const MAX_CACHED_BYTES: usize = 512 << 20;
 
 impl ShapefileReader {
     /// Opens the shapefile at `input`, reading all features. `source_projection` overrides the CRS from the `.prj`
@@ -163,6 +172,7 @@ impl ShapefileReader {
             charset,
             dbf,
             decode_threads: default_decode_threads(),
+            filtered: Mutex::new(None),
         })
     }
 
@@ -192,12 +202,11 @@ impl ShapefileReader {
                 }
             }
             Input::Zip { zip, shp, dbf } => {
-                let mut shp_zip = open_zip(zip)?;
-                let mut shp = BufReader::with_capacity(BUF, shp_zip.by_name(shp)?);
+                // the .shp entry is usually the large one: inflate it on a background thread
+                let mut shp = zip_entry_reader::open_with_read_ahead(zip, shp)?;
                 match dbf {
                     Some(dbf) => {
-                        let mut dbf_zip = open_zip(zip)?;
-                        let mut dbf = BufReader::with_capacity(BUF, dbf_zip.by_name(dbf)?);
+                        let mut dbf = BufReader::with_capacity(BUF, ZipEntryReader::open(zip, dbf)?);
                         f(&mut shp, Some(&mut dbf))
                     }
                     None => f(&mut shp, None),
@@ -208,7 +217,7 @@ impl ShapefileReader {
 
     /// Reads raw records sequentially, sending batches of records that pass the filters to `emit`. Returns `false` from
     /// `emit` to stop reading.
-    fn scan(&self, mut emit: impl FnMut(RawBatch) -> bool) -> Result<()> {
+    fn scan(&self, emit: &mut dyn FnMut(RawBatch) -> bool) -> Result<()> {
         const BATCH_BYTES: usize = 4 << 20;
         const BATCH_RECORDS: usize = 4096;
         let record_length = self.dbf.record_length;
@@ -330,18 +339,43 @@ impl SimpleReader for ShapefileReader {
             }
         }
         let mut count = 0;
-        self.scan(|batch| {
+        let mut bytes = 0;
+        let mut batches = Some(vec![]);
+        self.scan(&mut |batch| {
             count += batch.records.len() as u64;
+            bytes += batch.shp.len() + batch.dbf.len();
+            if bytes > MAX_CACHED_BYTES {
+                batches = None;
+            }
+            if let Some(batches) = &mut batches {
+                batches.push(batch);
+            }
             true
         })?;
+        *self.filtered.lock() = batches;
         Ok(count)
     }
 
     fn read_features(&self, next: &mut FeatureSink<'_>) -> Result<()> {
         let threads = self.decode_threads;
+        // records kept by feature_count, or else read them from the file
+        let cached = self.filtered.lock().take();
+        let produce = |emit: &mut dyn FnMut(RawBatch) -> bool| -> Result<()> {
+            match cached {
+                Some(batches) => {
+                    for batch in batches {
+                        if !emit(batch) {
+                            break;
+                        }
+                    }
+                    Ok(())
+                }
+                None => self.scan(emit),
+            }
+        };
         if threads <= 1 {
             let mut error = None;
-            self.scan(|batch| match self.decode_batch(&batch) {
+            produce(&mut |batch| match self.decode_batch(&batch) {
                 Ok(features) => {
                     for feature in features {
                         if let Err(e) = next(feature) {
@@ -363,7 +397,7 @@ impl SimpleReader for ShapefileReader {
             let (raw_tx, raw_rx) = crossbeam_channel::bounded::<RawBatch>(threads * 2);
             let (decoded_tx, decoded_rx) =
                 crossbeam_channel::bounded::<(usize, Result<Vec<ReaderFeature>>)>(threads * 2);
-            let reader = scope.spawn(move || self.scan(|batch| raw_tx.send(batch).is_ok()));
+            let reader = scope.spawn(move || produce(&mut |batch| raw_tx.send(batch).is_ok()));
             for _ in 0..threads {
                 let raw_rx = raw_rx.clone();
                 let decoded_tx = decoded_tx.clone();
@@ -922,6 +956,14 @@ mod tests {
             assert!((c.x - -77.0934256).abs() < 1e-5, "iter {i}");
             assert!((c.y - 38.8509022).abs() < 1e-5, "iter {i}");
         }
+        // records cached by feature_count are consumed by the first read; later reads scan the file again
+        assert_eq!(NUM_IN_ENV, reader.read_all().unwrap().len());
+        let zipped = ShapefileReader::with_bounds(None, "test", &resource("shapefile.zip"), &Bounds::new(Some(env())))
+            .unwrap()
+            .with_decode_threads(1);
+        assert_eq!(NUM_IN_ENV as u64, zipped.feature_count().unwrap());
+        assert_eq!(NUM_IN_ENV, zipped.read_all().unwrap().len());
+        assert_eq!(NUM_IN_ENV, zipped.read_all().unwrap().len());
     }
 
     #[test]

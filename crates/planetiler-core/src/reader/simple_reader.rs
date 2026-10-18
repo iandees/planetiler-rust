@@ -227,10 +227,10 @@ pub(crate) fn extract_from_zip(
     }
     if !keep_unzipped || file_utils::is_newer(&zip_path, &extracted) {
         tracing::info!("unzipping {} to {}", zip_path.display(), extracted.display());
-        let file = std::fs::File::open(&zip_path).with_context(|| format!("opening {}", zip_path.display()))?;
-        let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))?;
-        let entry = zip.by_name(entry.trim_start_matches('/'))?;
-        file_utils::safe_copy(std::io::BufReader::with_capacity(1 << 20, entry), &extracted)?;
+        // inflate on a background thread while this one writes
+        let entry = crate::util::zip_entry_reader::open_with_read_ahead(&zip_path, &entry)
+            .with_context(|| format!("opening {entry} in {}", zip_path.display()))?;
+        file_utils::safe_copy(entry, &extracted)?;
     }
     Ok(Some(extracted))
 }
