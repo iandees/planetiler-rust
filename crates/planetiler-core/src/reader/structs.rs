@@ -13,9 +13,11 @@
 //! columns are converted to their Java `toString()` strings (see `parquet_primitive_converter`), which is what ends up
 //! in tiles, and [`Struct::as_timestamp`] parses them back.
 //!
-//! TODO(port): Java caches the parsed JSON of string values; here it is re-parsed on each access.
+//! Like Java, a string struct caches its parsed JSON the first time it is traversed (with [`Struct::get`],
+//! [`Struct::get_index`] or [`Struct::as_map`]), so later accesses to the same struct don't parse it again.
 
 use std::fmt;
+use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
@@ -63,34 +65,59 @@ impl From<usize> for StructKey<'_> {
 }
 
 /// Wrapper for a value that could either be a primitive, list, or map of nested primitives.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Struct(Value);
+///
+/// The second field caches the parsed JSON of a string value.
+#[derive(Clone, Default)]
+pub struct Struct(Value, OnceLock<Value>);
+
+impl PartialEq for Struct {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl fmt::Debug for Struct {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Struct").field(&self.0).finish()
+    }
+}
 
 impl From<Value> for Struct {
     fn from(value: Value) -> Self {
-        Struct(value)
+        Struct::wrap(value)
     }
 }
 
 impl From<&Value> for Struct {
     fn from(value: &Value) -> Self {
-        Struct(value.clone())
+        Struct::wrap(value.clone())
     }
 }
 
 impl From<Option<&Value>> for Struct {
     fn from(value: Option<&Value>) -> Self {
-        Struct(value.cloned().unwrap_or_default())
+        Struct::wrap(value.cloned().unwrap_or_default())
     }
 }
 
 impl Struct {
     /// A missing or empty value.
-    pub const NULL: Struct = Struct(Value::Null);
+    // each use of `NULL` is a fresh value, and a null value never fills the JSON cache
+    #[allow(clippy::declare_interior_mutable_const)]
+    pub const NULL: Struct = Struct::wrap(Value::Null);
+
+    const fn wrap(value: Value) -> Struct {
+        Struct(value, OnceLock::new())
+    }
+
+    /// The parsed JSON of `s` (this struct's string value), cached after the first call.
+    fn parsed_json(&self, s: &str) -> Struct {
+        Struct::wrap(self.1.get_or_init(|| json_conversion::read_value_dynamic(s).unwrap_or_default()).clone())
+    }
 
     /// Returns a new struct that wraps a primitive value, or nested list or map of values.
     pub fn of(value: impl Into<Value>) -> Struct {
-        Struct(value.into())
+        Struct::wrap(value.into())
     }
 
     /// Returns the nested field of a map struct, elements of a list (flat-mapped), or [`Struct::NULL`] when called on a
@@ -101,7 +128,7 @@ impl Struct {
                 if let Some(v) = map.get(key)
                     && !v.is_null()
                 {
-                    return Struct(v.clone());
+                    return Struct::wrap(v.clone());
                 }
                 if let Some((first, rest)) = key.split_once('.') {
                     return match first.strip_suffix("[]") {
@@ -118,7 +145,7 @@ impl Struct {
                 let stripped = key.strip_prefix("[]").map(|k| k.strip_prefix('.').unwrap_or(k)).unwrap_or(key);
                 self.flat_map(|v| v.get(stripped))
             }
-            Value::String(s) => parse_json(s).get(key),
+            Value::String(s) => self.parsed_json(s).get(key),
             _ => Struct::NULL,
         }
     }
@@ -128,12 +155,12 @@ impl Struct {
         match &self.0 {
             Value::List(list) => {
                 if index >= 0 && (index as usize) < list.len() {
-                    Struct(list[index as usize].clone())
+                    Struct::wrap(list[index as usize].clone())
                 } else {
                     Struct::NULL
                 }
             }
-            Value::String(s) => parse_json(s).get_index(index),
+            Value::String(s) => self.parsed_json(s).get_index(index),
             _ => Struct::NULL,
         }
     }
@@ -162,9 +189,9 @@ impl Struct {
     pub fn as_map(&self) -> IndexMap<String, Struct> {
         match &self.0 {
             Value::Map(map) => {
-                map.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.clone(), Struct(v.clone()))).collect()
+                map.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.clone(), Struct::wrap(v.clone()))).collect()
             }
-            Value::String(s) => parse_json(s).as_map(),
+            Value::String(s) => self.parsed_json(s).as_map(),
             _ => IndexMap::new(),
         }
     }
@@ -179,7 +206,7 @@ impl Struct {
     pub fn as_list(&self) -> Vec<Struct> {
         match &self.0 {
             Value::Null => vec![],
-            Value::List(list) => list.iter().map(|v| Struct(v.clone())).collect(),
+            Value::List(list) => list.iter().map(|v| Struct::wrap(v.clone())).collect(),
             _ => vec![self.clone()],
         }
     }
@@ -308,7 +335,7 @@ impl Struct {
                 other => result.push(other),
             }
         }
-        if result.is_empty() { Struct::NULL } else { Struct(Value::list(result)) }
+        if result.is_empty() { Struct::NULL } else { Struct::wrap(Value::list(result)) }
     }
 }
 
@@ -319,10 +346,6 @@ impl fmt::Display for Struct {
             None => f.write_str("null"),
         }
     }
-}
-
-fn parse_json(s: &str) -> Struct {
-    Struct(json_conversion::read_value_dynamic(s).unwrap_or_default())
 }
 
 /// Formats a float the way Java's `Float.toString` does for typical values.
@@ -542,6 +565,24 @@ mod tests {
         let s = Struct::of("{\"a\":[{\"b\":1}]}\n");
         assert_eq!(Some(1), s.get_path(&["a".into(), 0.into(), "b".into()]).as_int());
         assert_eq!(Some(Outer { a: vec![Inner { b: 1 }] }), s.as_type::<Outer>());
+    }
+
+    #[test]
+    fn test_json_string_parsed_once() {
+        let s = Struct::of(r#"{"a":{"b":1},"c":[2]}"#);
+        assert!(s.1.get().is_none());
+        assert_eq!(Some(1), s.get("a.b").as_int());
+        let cached = s.1.get().unwrap() as *const Value;
+        assert_eq!(Some(2), s.get("c").get_index(0).as_int());
+        assert_eq!(1, s.as_map().get("a").unwrap().get("b").as_int().unwrap());
+        assert_eq!(cached, s.1.get().unwrap() as *const Value);
+        // the cache doesn't affect equality, and clones keep it
+        assert_eq!(Struct::of(r#"{"a":{"b":1},"c":[2]}"#), s);
+        assert!(s.clone().1.get().is_some());
+        // invalid JSON is cached as null
+        let invalid = Struct::of("not json");
+        assert!(invalid.get("a").is_null());
+        assert_eq!(Some(&Value::Null), invalid.1.get());
     }
 
     #[test]
