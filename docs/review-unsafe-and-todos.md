@@ -1,6 +1,6 @@
 # `unsafe` audit and remaining `TODO(port)`s
 
-Current as of `main` @ `8ccc4e4` (2026-10-18). The original read-only review was done at `c116961`; this document
+Current as of `main` @ `97111e5` (2026-10-18). The original read-only review was done at `c116961`; this document
 keeps only what is still relevant. Fix history is in git (`git log -- docs/review-unsafe-and-todos.md` and the commits
 it references).
 
@@ -41,22 +41,13 @@ Outside the library crates: `planetiler-benchmarks/src/bin/benchmark_line_merge.
 (single-threaded, so fine, but an `AtomicUsize` would avoid the edition-2024 `static mut` lint).
 `benchmark_simple_readers.rs` calls `getrusage` with a zeroed out-param (OK).
 
-## Remaining `TODO(port)` markers (11)
+## Remaining `TODO(port)` markers
 
-Down from 53 at the time of the audit. Everything else was ported, swapped for the shared helper it was waiting on,
-or relabeled as a documented difference from Java.
+None. All 53 markers present at the time of the audit have been resolved: ported, switched to the shared helper they
+were waiting on, or relabeled as a documented difference from Java. The last ones were the JTS snap-rounding noder
+(`geo/snap_rounding.rs`), general CRS support (`geo/crs/`), Parquet load balancing, `top-osm-tiles`,
+`benchmark-mapping`, `[stage]` log prefixes, sort progress logging, the `Struct` JSON cache and the stream-archive
+runner tests.
 
-| Location | What's missing | Size | Impact |
-|---|---|---|---|
-| `geo/polygon_overlay.rs:431` | JTS snap rounding also adds hot pixels at segment intersections (and near-vertex tolerance); only vertices are hot pixels here | M | Medium: rare geometry/validity differences from Java in `reduce_precision` output |
-| `geo/polygon_overlay.rs:917` | Snap rounding for lines (noding at intersections); lines are only rounded point by point | M | Low-medium: vertex-count and byte differences for merged/simplified lines |
-| `collection/external_merge_sort.rs:815` | `ProgressLoggers` during the sort (percent of chunks, file size, pipeline stats) | S | Log cosmetics |
-| `collection/feature_sort.rs:164` | Return a `Worker` instead of raw thread handles so pipeline stats can be logged | S | Log cosmetics |
-| `stats/stats.rs:65` | `LogUtil.setStage` `[stage]` log-line prefix | S | Log cosmetics; makes Java/Rust log diffs noisier |
-| `reader/structs.rs:16` | Cache parsed JSON for string-encoded struct values | S | Performance, only for JSON-in-string fields |
-| `util/top_osm_tiles.rs:50`, `:116`; `planetiler/src/main.rs:108` | `top-osm-tiles` CLI: xz decompression of tile logs and `TileWeights::write_to_file` wiring | S | Low |
-| `planetiler/src/main.rs:77` | `benchmark-mapping` (`OpenMapTilesMapping` benchmark) | S | Low |
-| `tests/planetiler_runner_tests.rs:66` | In-memory stream archive readers for the csv/tsv/json/proto variants of `testPlanetilerRunner` | S-M | Test coverage only (writers are ported) |
-
-Highest value next: snap rounding at intersections (parity). Parquet load balancing and general CRS support are done
-(see PORTING.md "Simple readers" and "Coordinate reference systems").
+Plain `TODO` comments that remain are copied from upstream Java (Planetiler, planetiler-openmaptiles and the MLT
+library). Known behaviour differences and follow-ups are listed in [PORTING.md](../PORTING.md#follow-ups).

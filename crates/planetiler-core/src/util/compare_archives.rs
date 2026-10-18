@@ -212,14 +212,15 @@ pub fn log_result(result: &CompareResult, strict: bool) -> i32 {
 
 /// `CompareArchives.main`: `compare [options] {path/to/archive1} {path/to/archive2}`. Returns the process exit code.
 pub fn main<S: AsRef<str>>(args: &[S]) -> anyhow::Result<i32> {
-    if args.len() < 2 {
+    // the two archive paths are the arguments that aren't `--options`; options can come before or after them
+    let (paths, options): (Vec<&str>, Vec<&str>) = args.iter().map(AsRef::as_ref).partition(|a| !a.starts_with('-'));
+    if paths.len() != 2 {
         eprintln!("Usage: compare [options] {{path/to/archive1}} {{path/to/archive2}}");
         return Ok(1);
     }
-    // last 2 args are paths to the archives
-    let input1 = TileArchiveConfig::from(args[args.len() - 2].as_ref())?;
-    let input2 = TileArchiveConfig::from(args[args.len() - 1].as_ref())?;
-    let arguments = crate::config::arguments::Arguments::from_args_or_config_file(&args[..args.len() - 2])?;
+    let input1 = TileArchiveConfig::from(paths[0])?;
+    let input2 = TileArchiveConfig::from(paths[1])?;
+    let arguments = crate::config::arguments::Arguments::from_args_or_config_file(&options)?;
     let options = CompareOptions {
         verbose: arguments.get_boolean("verbose", "log each tile diff and differing feature", false),
         ignore_ids: arguments.get_boolean("ignore_ids", "don't compare feature IDs", false),

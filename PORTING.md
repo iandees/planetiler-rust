@@ -4,6 +4,36 @@ This repo is a port of [onthegomap/planetiler](https://github.com/onthegomap/pla
 The upstream reference checkout lives at `../planetiler-ref/planetiler` (commit `d88cf89`, OpenMapTiles submodule
 `373030b`).
 
+## Port status
+
+The port is feature-complete: every `TODO(port)` marker has been resolved. That covers the core library, all
+readers and archive formats, MVT and MLT output, the OpenMapTiles profile, custom YAML maps, the examples and the CLI.
+
+**Parity with Java.** Monaco OpenMapTiles output is identical to Java's after decoding. On Switzerland both produce the
+same 23,922 tiles and the same per-layer feature counts in all 16 layers; the remaining differences are listed under
+[Follow-ups](#follow-ups). MLT encoding is byte-identical to Java for the same input tiles (11 option combinations on
+Monaco and Switzerland). Check two archives with `planetiler compare a.mbtiles b.mbtiles --strict=false`.
+
+**Performance.** OpenMapTiles for Switzerland on a 15-core Apple M5 Pro (last quiet pass, `627d901`): Java 37.4 s /
+313 s CPU / 9.6 GB peak RSS, Rust 10.7 s / 121 s / 4.0 GB (3.5x faster, 61% less CPU, 58% less memory). Rust is faster
+in every stage. Details, methodology and component benchmarks: [bench/RESULTS.md](bench/RESULTS.md).
+
+**Intentional differences from Java:**
+
+- Profiles are Rust code implementing `planetiler_core::profile::Profile`; there's no JVM plugin loading. YAML
+  schemas work the same way.
+- JVM options don't apply (no `-Xmx`). Memory checks use physical memory; `--nodemap-storage`/`--nodemap-type` and
+  `--storage` choose between RAM and memory-mapped temp storage as before.
+- Rust has no `Error`/`Exception` split, so every panic in a profile is caught and logged as a data error.
+- Custom map expressions use the [`cel`](https://crates.io/crates/cel) crate (see Follow-ups for the gaps).
+- Parquet temporal and UUID columns become their Java `toString()` strings.
+- `planetiler compare` decodes tiles and reports only real content differences (layers paired by name, tags compared
+  as maps, geometries normalized); it also reads MLT archives.
+- Each simple source file is opened once (Java opens it twice: once to count features, once to read), and large zip
+  entries are inflated in parallel.
+- Gzip-compressed tiles use libdeflate, so compressed bytes differ from Java's (decoded tiles are the same).
+- `mimalloc` is the default global allocator (`--no-default-features` for the system allocator).
+
 ## Layout
 
 | Java module               | Rust crate                         |
@@ -48,9 +78,9 @@ were not given Rust files; use the Rust idiom instead.
   overlay engine's segment intersections), used via `[patch.crates-io]`. Results are identical; drop the patch if
   upstream speeds this up.
 
-## Status
+## Module status and notes
 
-See the table at the bottom of this file; update it as modules are completed.
+One row per area. The notes after the table describe each area's Rust API and its differences from Java.
 
 | Area | Status |
 |------|--------|
@@ -74,7 +104,6 @@ See the table at the bottom of this file; update it as modules are completed.
 | `reader::osm::{osm_reader, osm_phaser}` (+ `OsmReaderTest`, `OsmPhaserTest`, monaco end-to-end test matching Java feature counts / data errors), `benchmark_osm_reader` bin + `bench/java/BenchmarkOsmReader.java` | done (see notes below) |
 | `util::{translations, language_utils, thread_local_transliterator, wikidata}` | done (`wikidata::fetch` takes a `Fn(&OsmElement) -> bool` filter; `fetch_for_profile` / `profile_filter` adapt a `Profile`) |
 | Feature pipeline spine: `profile` (`Profile`, `NullProfile`), `feature_processor`, `forwarding_profile`, `feature_collector`, `reader::{source_feature, simple_feature}`, `reader::osm::osm_relation_info` (+ `RelationMember`), `render::{feature_renderer, tiled_geometry, geometry_coordinate_sequences, rendered_feature}`, `collection::feature_group` | done (see notes below) |
-| `reader::{simple_reader, source_feature_processor, shapefile_reader, geo_package_reader, natural_earth_reader}`, `reader::geojson::*`, `reader::parquet::*` + benchmark `benchmark_simple_readers` | done as *decoders* emitting `ReaderFeature`; wiring into `SimpleFeature`/`Profile`/`FeatureGroup` is `TODO(port)` (see notes) |
 | `archive::tile_archive_writer` (`TileArchiveWriter.writeOutput`), `validator::{schema_specification, base_schema_validator, java_profile_validator}`, `testing` harness + `tests/planetiler_tests*.rs` (the `runWithReaderFeatures` subset of `PlanetilerTests`), benchmark `benchmark_tile_archive_writer` | done |
 | `planetiler` (`Planetiler.java` orchestrator) + `tests/planetiler_runner_tests.rs` (testPlanetilerRunner*, MemoryCheck*, ReuseFeatureDb) + `tests/planetiler_osm_tests.rs` (all OSM `PlanetilerTests`) + `testing::run_with_osm_elements`, `TileSizeStats.main` (`tile_size_stats::main`), `CompareArchives.main` (`compare_archives::main`) | done (see "Planetiler orchestrator notes"; the csv/tsv/json/proto/pbf variants of testPlanetilerRunner read outputs with `testing::in_memory_stream_archive`; testExceptionWhileProcessingOsm is `#[ignore]`d) |
 | `planetiler` CLI crate (`planetiler-dist` `Main.java` task dispatch) | done (`verify`/`verify-schema` run the custommap `SchemaValidator`; `top-osm-tiles` decompresses the `.xz` tile logs with `lzma-rust2`; `benchmark-mapping` is `crates/planetiler/src/benchmark_mapping.rs` (optional `--osm_path`/`--iterations`); `benchmark-longlongmap` errors and points at the benchmarks crate) |
@@ -493,7 +522,7 @@ tiles.join()?;
   straight from arrow arrays (`geo_arrow::GeoArrowColumn`); WKB/WKT lazily (`ParquetFeature::lat_lon_geometry`).
   parquet-mr `FilterPredicate` -> `geo_parquet_metadata::FilterPredicate` (numeric compare/and/or/not) used for row
   group pruning via statistics (`can_drop`) and row filtering (`evaluate`); IDs use the same fnv1a hashes as Java.
-  `ParquetFeature` implements `WithTags` and has `into_reader_feature()`; TODO(port): `impl SourceFeature`.
+  `ParquetFeature` implements `WithTags` and `SourceFeature` and has `into_reader_feature()`.
 ### OSM reader notes (`reader::osm::osm_reader`, `osm_phaser`)
 
 How the `Planetiler` orchestrator drives it (Java `Planetiler.addOsmSource`):
@@ -810,22 +839,6 @@ came from equivalent Python scripts; current Switzerland numbers are in `docs/sw
   memberships (`route_N_*` attributes), Java `HashMap` iteration order for OMT housenumber grouping, custommap OSM
   tags, empty layers after point-buffer filtering (see above).
 
-## Follow-ups (tracked by the coordinator)
-
-- Replace `planetiler-openmaptiles/src/feature_merge_shim.rs` with `planetiler_core::feature_merge` once FeatureMerge
-  merges; drop the crate's `rstar`/`hashbrown`/`ahash` deps.
-- Move `Verify.checkMinFeatureCount`/`getNumFeatures` from `planetiler-openmaptiles/src/util/verify_monaco.rs` to
-  `planetiler_core::mbtiles::verify`.
-- Unify the two `VectorLayer` types (`archive::tile_archive_metadata` and `util::layer_attr_stats`).
-- Re-enable the four `#[cfg(any())]` merge tests in `crates/planetiler-core/tests/` once FeatureMerge merges.
-- Port JTS `Polygonizer` into core and use it for OpenMapTiles boundary country polygons (currently a line-merge +
-  union stand-in that drops rings closing only through a node shared by 3+ ways).
-- Re-enable the four `#[cfg(any())]` merge tests in `crates/planetiler-core/tests/` once FeatureMerge merges.
-- `feature_merge::buffer_geometry`: near-collinear mitre vertices are now removed (Monaco z13 buildings within ~1.5%
-  of Java's vertex count); exact parity would need a port of the JTS offset-curve builder.
-- MLT encoding speed: done (bench/RESULTS.md "MLT encoding": 6x Java on the benchmark tile, advanced archive
-  stage 28.5s -> 5.1s). Remaining MLT cost is mostly the geometry dictionary candidates (curve codes, radix sort)
-  and FSST table building; any further change must stay byte-identical (`mlt_reference` on Switzerland, 11 variants).
 ### custommap notes (`crates/planetiler-custommap`)
 
 **Loading.** `SchemaConfig::load(path)` / `load_str(yaml)` go through `util::yaml` (anchors, aliases, `<<` merge keys)
@@ -878,6 +891,19 @@ core's `BaseSchemaValidator` (`planetiler verify schema.yml [--watch]`). Tests:
 `tests/{configured_feature_test, expression_tests, schema_tests}.rs` (the latter runs the full shortbread spec through
 the core validator, `SchemaValidatorTest` including the CLI output, plus an ignored `bench_shortbread` throughput
 check: ~0.9M features/s/thread in release).
-- custommap CEL gaps vs cel-java (no type checker, `1 == 1.0` is true, Rust regex syntax in `replaceRegex`): consider
-  closing these if real schemas hit them.
-  `ParquetFeature` implements `SourceFeature` and has `into_reader_feature()`.
+
+## Follow-ups
+
+- **Remaining output differences from Java** (Switzerland, see [docs/switzerland-parity.md](docs/switzerland-parity.md)):
+  563 merged z13 buildings and 31 landuse features from the FeatureMerge buffer/unbuffer path (noding runs on an
+  integer overlay instead of OverlayNG's graph), 10 merged transportation lines (a different continuation at a
+  junction), and 1,730 housenumber feature IDs (multi-threaded input order).
+- **`reduce_precision` on invalid polygons** can differ from JTS (OverlayNG side labelling of self-overlapping rings).
+  Planetiler never calls it that way (`snap_and_fix_polygon` fixes first), so tile output is unaffected.
+- **CRS:** grid-based datum shifts (NTv2/NADCON) and EPSG:31300 (Lambert Conic Conformal 2SP Belgium) are unsupported.
+- **custommap CEL gaps** vs cel-java: no type checker, `1 == 1.0` is true, Rust `regex` syntax in `replaceRegex`.
+- **MLT encoding** is ~6x Java; the remaining cost is mostly geometry dictionary candidates and FSST table building.
+  Any change must stay byte-identical (`mlt_reference` on Switzerland, 11 variants).
+- **Benchmarks:** the last full quiet pass is at `627d901`. Later work (perf pass 3, MLT speed-up, Parquet load
+  balancing, CRS, snap rounding) was measured with A/B runs under load only; re-run `bench/run_all.sh`.
+- Plain `TODO`s left in the code are copied from upstream Java (Planetiler, planetiler-openmaptiles, the MLT library).

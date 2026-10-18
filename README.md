@@ -1,164 +1,234 @@
-# Planetiler (Rust port)
+# planetiler-rust
 
-A Rust port of [Planetiler](https://github.com/onthegomap/planetiler), the tool that generates
-[vector tiles](https://github.com/mapbox/vector-tile-spec) from geographic data sources like
-[OpenStreetMap](https://www.openstreetmap.org/). It covers the same pieces as the Java project:
+Generate [vector tiles](https://github.com/mapbox/vector-tile-spec) from
+[OpenStreetMap](https://www.openstreetmap.org/) and other geographic data, from a city up to the whole planet, on a
+single machine. Output is an MBTiles or PMTiles file (or a directory of tiles) that you can serve or open directly in
+[MapLibre](https://maplibre.org/).
 
-- the **OpenMapTiles** profile (all 16 layers, generated from the vendored OpenMapTiles schema),
-- **custom maps** defined in YAML (the `planetiler-custommap` schema, including the bundled `shortbread.yml` and other
-  samples) and the schema validator,
-- the **example profiles** (toilets, bike routes, OSM QA tiles, Overture, ...),
-- the core library: OSM `.osm.pbf`, shapefile, GeoPackage, Natural Earth, GeoJSON and (Geo)Parquet readers, the
-  feature pipeline, external merge sort, and MBTiles / PMTiles / files / CSV / TSV / JSON / protobuf output archives,
-- Mapbox Vector Tile (MVT) and [MapLibre Tile](https://github.com/maplibre/maplibre-tile-spec) (MLT,
-  `--tile-format=mlt` with all the `--mlt-*` options) output; the MLT encoder is a port of the Java MLT library and
-  writes byte-identical tiles,
-- the `planetiler` CLI with the same task names and `--key=value` arguments as `planetiler.jar`.
+This is a Rust port of [Planetiler](https://github.com/onthegomap/planetiler). It takes the same commands and options
+and writes the same tiles, and runs about 3.5x faster with 58% less memory
+([benchmarks](bench/RESULTS.md)). Details of the port are in [PORTING.md](PORTING.md).
 
-The code mirrors the Java layout file by file (see [PORTING.md](PORTING.md)), so the upstream docs apply.
+## Quick start
 
-## Status
-
-The port is feature-complete for OSM-based OpenMapTiles, custom YAML maps and the examples. Its output matches Java
-closely: Monaco output is identical, and on Switzerland both produce the same 23,922 tiles with the same per-layer
-feature counts in all 16 layers. The remaining differences are sub-pixel vertex differences in a few hundred merged
-polygons and 10 merged lines (see [docs/switzerland-parity.md](docs/switzerland-parity.md)).
-
-Performance, OpenMapTiles for Switzerland (549 MB `.osm.pbf`) on a 15-core Apple M5 Pro, from
-[bench/RESULTS.md](bench/RESULTS.md):
-
-| | Java | Rust | |
-|---|---|---|---|
-| Wall time | 37.4s | 10.7s | **3.5x faster** |
-| CPU time | 313s | 121s | **2.6x less CPU** (61% less) |
-| Peak RSS | 9.6 GB | 4.0 GB | **58% less RAM** |
-
-Rust is faster in every stage of the pipeline (OSM pass 1 and 2, sort, archive, simple sources). On Monaco it takes
-1.6s vs 14.1s wall, 11.0s vs 20.2s CPU and 0.83 vs 1.02 GB peak RSS. See [bench/RESULTS.md](bench/RESULTS.md) for
-the methodology and the component benchmarks.
-
-## Building
-
-You need a recent stable Rust toolchain (edition 2024; CI uses the latest stable).
+You need a recent stable Rust toolchain.
 
 ```sh
 cargo build --release
-# the binary is target/release/planetiler
+
+# download OpenStreetMap data for Monaco plus the ocean, lake and Natural Earth sources,
+# then build an OpenMapTiles basemap
+target/release/planetiler --download --area=monaco --output=data/monaco.pmtiles
 ```
 
-`mimalloc` is the default global allocator (`--no-default-features` turns it off). With the macOS system allocator,
-OSM decoding was up to 2.5x slower in some runs because of false sharing; see bench/RESULTS.md.
+Drag `data/monaco.pmtiles` onto [pmtiles.io](https://pmtiles.io) to look at it. For a styled map, point a MapLibre
+style that uses the [OpenMapTiles schema](https://openmaptiles.org/schema/) (for example
+[OSM Bright](https://github.com/openmaptiles/osm-bright-gl-style)) at the archive. MBTiles output can be served
+with [tileserver-gl](https://github.com/maptiler/tileserver-gl) or [martin](https://github.com/maplibre/martin).
 
-Run the tests with `cargo test --workspace`.
+The first run downloads about 1.3 GB of global sources (oceans, Natural Earth, lake centerlines) into
+`data/sources/`. Later runs reuse them.
 
-## Running
+## Building a basemap
 
-Arguments use the same names as the Java version (`--key=value`, `--key value`, `key=value`, `PLANETILER_KEY=value`
-environment variables, or a `--config=file.properties` file). `-` and `_` are interchangeable.
-
-### OpenMapTiles (the default task)
+The default task builds an [OpenMapTiles](https://openmaptiles.org/) basemap.
 
 ```sh
-# download Monaco and the other sources into data/sources, then write data/output.mbtiles
-target/release/planetiler --download --area=monaco
+# any Geofabrik extract by name ("switzerland", "new-york", "planet", ...)
+target/release/planetiler --download --area=switzerland --output=data/switzerland.mbtiles
 
-# a local extract, PMTiles output
-target/release/planetiler --osm-path=data/sources/switzerland.osm.pbf --output=data/switzerland.pmtiles --download
+# a .osm.pbf you already have
+target/release/planetiler --download --osm-path=path/to/region.osm.pbf --output=data/region.pmtiles
+
+# only part of the extract, a smaller zoom range, a few languages
+target/release/planetiler --download --area=germany --bounds=13.0,52.3,13.8,52.7 \
+  --maxzoom=12 --languages=en,de --output=data/berlin.pmtiles
 ```
 
-`--area` takes a Geofabrik extract name (or `planet`). The common options all work: `--output`, `--bounds`,
-`--minzoom`/`--maxzoom`, `--threads`, `--force`, `--nodemap-type`/`--nodemap-storage`, `--languages`, and so on.
+Layer options: `--only-layers=water,landcover,...` and `--exclude-layers=...` choose layers, and
+`--transportation-z13-paths`, `--building-merge-z13`, `--boundary-country-names` and other layer switches tune the
+output (see `--help`).
 
-### Custom YAML maps
+Maps built with OpenMapTiles must credit "© OpenMapTiles © OpenStreetMap contributors".
+
+## Making your own map
+
+Describe the layers you want in a YAML schema. This one makes a layer of manhole covers from OpenStreetMap:
+
+```yaml
+schema_name: Manhole covers
+attribution: <a href="https://www.openstreetmap.org/copyright">&copy; OpenStreetMap contributors</a>
+sources:
+  osm:
+    type: osm
+    url: geofabrik:rhode-island
+layers:
+- id: manhole
+  features:
+  - source: osm
+    geometry: point
+    min_zoom: 14
+    include_when:
+      man_made: manhole
+    attributes:
+    - key: manhole
+    - key: operator
+```
 
 ```sh
-target/release/planetiler custom --schema=path/to/schema.yml --download
-target/release/planetiler path/to/schema.yml --download         # shortcut for the above
-target/release/planetiler shortbread --area=monaco --download   # bundled shortbread.yml
-target/release/planetiler custom --schema=owg_simple.yml          # bundled samples work by name
+target/release/planetiler manholes.yml --download        # same as: custom --schema=manholes.yml
+target/release/planetiler shortbread --download --area=monaco
 ```
 
-Check a schema against its examples (embedded under `examples:` or in a separate spec file):
+Schemas can filter and transform features with [CEL](https://cel.dev) expressions, read shapefiles, GeoPackages
+and GeoJSON as well as OSM, and merge lines and polygons after tiling. The full reference is upstream
+Planetiler's [custommap docs](https://github.com/onthegomap/planetiler/tree/main/planetiler-custommap). Bundled
+samples work by name: `shortbread.yml`, `owg_simple.yml`, `power.yml`, `railways.yml`, `highway_areas.yml`,
+`manholes.yml`, `natural_earth.yml`.
+
+Put example inputs and expected outputs in the schema (or a separate spec file) and check them while you edit:
 
 ```sh
-target/release/planetiler verify path/to/schema.yml          # add --watch to re-run on every change
+target/release/planetiler verify manholes.yml --watch
 ```
 
-### Examples
+## Writing a profile in Rust
 
-```sh
-target/release/planetiler example-toilets --download             # data/toilets.mbtiles
-target/release/planetiler example-bikeroutes --download
-target/release/planetiler example-toilets-lowlevel --download
-target/release/planetiler example-qa --download                  # OSM QA tiles
-target/release/planetiler example-overture --base=data/overture  # Overture Maps buildings (GeoParquet)
+For full control, implement the `Profile` trait and run it with the `Planetiler` builder:
+
+```rust
+use planetiler_core::config::arguments::Arguments;
+use planetiler_core::feature_collector::FeatureCollector;
+use planetiler_core::planetiler::Planetiler;
+use planetiler_core::profile::Profile;
+use planetiler_core::reader::source_feature::SourceFeature;
+
+struct Toilets;
+
+impl Profile for Toilets {
+    fn process_feature(&self, feature: &dyn SourceFeature, features: &mut FeatureCollector<'_>) {
+        if feature.is_point() && feature.has_tag_str("amenity", "toilets") {
+            features.point("toilets").set_zoom_range(0, 14);
+        }
+    }
+
+    fn name(&self) -> String {
+        "Toilets".into()
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    Planetiler::create(Arguments::from_env_or_args(&args))?
+        .set_profile(Toilets)
+        .add_osm_source_with_url("osm", "data/sources/monaco.osm.pbf", Some("geofabrik:monaco"))?
+        .overwrite_output("data/toilets.mbtiles")?
+        .run()
+}
 ```
 
-The example profiles live in `crates/planetiler-examples/src` and show how to write a profile in Rust by implementing
-the `Profile` trait and running it with `planetiler_core::planetiler::Planetiler`.
+This compiles as `cargo run --release -p planetiler-examples --example readme_profile -- --download`.
+`crates/planetiler-examples` has complete examples (toilets, bike routes, parks, OSM QA tiles, Overture buildings)
+that you can also run from the CLI, e.g. `planetiler example-toilets --download`.
 
-### CLI tasks
+## Inputs
 
-| Task | What it does |
+| Source | How to use it |
 |---|---|
-| `openmaptiles` / `generate-openmaptiles` (default) | Build an OpenMapTiles basemap |
-| `custom` / `generate-custom`, `<schema>.yml` | Build a map from a YAML schema |
-| `shortbread` / `generate-shortbread` | Build a map with the bundled Shortbread schema |
-| `verify` / `verify-custom` / `verify-schema` | Check a YAML schema against its examples (`--watch`) |
-| `example-toilets`, `example-toilets-lowlevel`, `example-bikeroutes`, `example-qa` / `osm-qa`, `example-overture` / `overture` | Example profiles |
-| `verify-mbtiles <file>` | Basic checks on an MBTiles file (metadata, tiles decode, polygons are valid) |
-| `verify-monaco <file>` | `verify-mbtiles` plus feature counts expected in an OpenMapTiles Monaco build |
-| `stats --input=<archive>` | Per-tile/per-layer size statistics (`TileSizeStats`) |
-| `compare [--verbose] <archive1> <archive2>` | Compare two archives tile by tile |
+| OpenStreetMap `.osm.pbf` | `--area=<geofabrik name>` / `--osm-url=...` with `--download`, or `--osm-path=file.osm.pbf` |
+| Shapefile (plain or zipped) | `type: shapefile` in YAML, `add_shapefile_source` in Rust |
+| GeoPackage | `type: geopackage` / `add_geopackage_source` |
+| GeoJSON (also newline-delimited) | `type: geojson` / `add_geojson_source` |
+| GeoParquet, including [Overture Maps](https://overturemaps.org/) | `add_parquet_source` in Rust; `planetiler overture --base=<dir>` for Overture buildings |
+| Natural Earth (SQLite) | `add_natural_earth_source` in Rust |
 
-Logging uses `RUST_LOG` (for example `RUST_LOG=debug`).
+Shapefiles and GeoPackages can be in any projection: EPSG codes, `.prj` files (ESRI and OGC WKT), WKT2 and PROJ
+strings are supported. Grid-based datum shifts (NTv2, NADCON) are not.
 
-`compare` decodes tiles (MVT or MLT) whose bytes differ and reports a diff only when the decoded contents differ:
-layers are paired by name, feature tags are compared as decoded key/value pairs, and geometries are compared by their
-decoded value. Tiles that differ only in encoding (key/value table order, layer order) are counted separately as
-"equivalent". This makes it useful for comparing Java and Rust output.
+## Output
 
-Benchmarks are separate binaries in `crates/planetiler-benchmarks` (`cargo run --release -p planetiler-benchmarks
---bin <name>`); `bench/run_all.sh` runs the Java-vs-Rust suite.
+The output format comes from the `--output` file name:
 
-## Differences from Java
+| Output | Example |
+|---|---|
+| MBTiles (SQLite) | `--output=out.mbtiles` |
+| PMTiles (single file, serve from static hosting) | `--output=out.pmtiles` |
+| Directory of `{z}/{x}/{y}.pbf` files | `--output=out/` or `--output=files:///path?format=...` |
+| CSV / TSV / JSON / protobuf streams | `--output=out.csv`, `.tsv`, `.json`, `.proto` |
 
-- **Profiles are Rust code.** Write a profile by implementing `planetiler_core::profile::Profile`; there's no JVM
-  plugin loading. YAML schemas work the same way as in Java.
-- **JVM options don't apply.** There's no `-Xmx`. Memory checks use the machine's physical memory, and the same
-  `--nodemap-storage`/`--nodemap-type` options choose between RAM and memory-mapped storage.
-- **Profile errors.** Rust has no `Error`/`Exception` split, so every panic in a profile is caught and logged as a
-  data error (Java lets `Error`s abort the run).
-- **Custom map expressions** use the [`cel`](https://crates.io/crates/cel) crate. Unlike cel-java there is no type
-  checker (type errors show up at runtime), `1 == 1.0` is true, and `replaceRegex` uses Rust `regex` syntax (no
-  look-around or backreferences).
-- **Parquet/struct values.** Temporal and UUID columns become their Java `toString()` strings.
-- **`compare`** only reports real content differences (see above), and can also compare MLT archives. Java also
-  counts tiles whose bytes differ.
-- **Logging.** There's no `[stage]` prefix on log lines, and data-error debug logs print WKB as hex rather than base64.
+Tiles are [Mapbox Vector Tiles](https://github.com/mapbox/vector-tile-spec) by default. Add `--tile-format=mlt` for
+[MapLibre Tiles](https://github.com/maplibre/maplibre-tile-spec), and `--mlt-advanced=true` for FSST and FastPFOR
+compression (smaller tiles, needs an MLT-capable client).
 
-## Known gaps
+## Common options
 
-From [PORTING.md](PORTING.md) and the remaining `TODO(port)` list in
-[docs/review-unsafe-and-todos.md](docs/review-unsafe-and-todos.md):
+Options are `--key=value` (or `--key value`). `-` and `_` are interchangeable, and every option can also be set with a
+`PLANETILER_KEY=value` environment variable or in a `--config=file.properties` file. `planetiler --help` lists them
+all with their defaults.
 
-- **Snap rounding.** `reduce_precision` adds hot pixels for vertices but not for segment intersections, and lines are
-  rounded point by point, so a small number of output geometries differ from JTS.
-- **Merged polygons.** FeatureMerge uses a port of JTS's buffer and cascaded union, but noding still runs on an
-  integer overlay, so a small number of merged buildings/landuse/landcover features differ from Java by single
-  1/16-pixel vertices (Switzerland: 578 of ~39.6k buildings, 35 landuse, 17 landcover; see
-  [docs/switzerland-parity.md](docs/switzerland-parity.md)).
-- **Coordinate reference systems.** EPSG codes, WKT (`.prj` files, GeoPackage SRS definitions) and PROJ strings
-  are supported like GeoTools, but grid-based datum shifts (NTv2/NADCON) are not (Java doesn't ship the grids), and
-  one EPSG projection method GeoTools supports isn't: Lambert Conic Conformal (2SP Belgium), used only by the
-  obsolete EPSG:31300. See [PORTING.md](PORTING.md#coordinate-reference-systems).
-- **CLI tasks not ported:** `top-osm-tiles` (needs xz decompression) and `benchmark-mapping`.
-  `benchmark-longlongmap` points you at the benchmarks crate instead.
+| Option | Default | |
+|---|---|---|
+| `--download` | `false` | Download missing sources |
+| `--area` | `monaco` | Geofabrik extract to download (`planet` for the whole world) |
+| `--osm-path` | `data/sources/<area>.osm.pbf` | Local OSM input |
+| `--output` | `data/output.mbtiles` | Output archive |
+| `--force` | `false` | Overwrite the output and ignore disk/memory warnings |
+| `--bounds` | whole input | `minlon,minlat,maxlon,maxlat` or `world` |
+| `--polygon` | | `.poly` file to limit output to |
+| `--minzoom` / `--maxzoom` | `0` / `14` | Zoom range (max 16) |
+| `--threads` | all cores | Worker threads |
+| `--tmpdir` | `data/tmp` | Temporary files; put it on a fast SSD with free space |
+| `--storage` | `mmap` | Temp storage: `mmap` (on disk, memory-mapped) or `ram` |
+| `--nodemap-type` | `sparsearray` | Node location map: `sparsearray`, `array` (best for the planet), `sortedtable` |
+| `--languages` | profile default | Name languages to include, e.g. `en,de,fr` |
+| `--tile-format` | `mvt` | `mvt` or `mlt` |
+| `--tile-compression` | `gzip` | `gzip` or `none` |
+| `--skip-filled-tiles` | `false` | Leave out tiles that are only ocean or land fill |
+| `--free-osm-after-read` | `false` | Delete inputs after reading to save disk (also `--free-<source>-after-read`) |
+| `--fetch-wikidata` | `false` | Fetch Wikidata name translations for more languages |
+
+Set `RUST_LOG=debug` for more logging.
+
+## How big a machine?
+
+Measured with OpenMapTiles on a 15-core Apple M5 Pro with 48 GB of RAM:
+
+| Input | `.osm.pbf` size | Time | Peak memory | Output |
+|---|---|---|---|---|
+| Monaco | 0.4 MB | 1.6 s | 0.8 GB | 0.3 MB |
+| Switzerland | 549 MB | 11 s | 4.0 GB | 362 MB |
+
+Run time and temporary disk space grow roughly with the size of the input. For large extracts or the planet, leave
+`--storage=mmap` (the default) so node locations and temporary features live in memory-mapped files on disk, and give
+`--tmpdir` a fast SSD with several times the input size free. Planetiler checks memory and disk before it starts and
+stops with an estimate if it thinks they're too small (`--force` overrides this). Upstream Planetiler's
+[planet guide](https://github.com/onthegomap/planetiler/blob/main/PLANET.md) describes planet-scale setups.
+
+## Other commands
+
+| Command | What it does |
+|---|---|
+| `openmaptiles` (default) | Build an OpenMapTiles basemap |
+| `custom --schema=<file>`, `<file>.yml`, `shortbread` | Build a map from a YAML schema |
+| `verify <schema>.yml [--watch]` | Check a schema against its examples |
+| `example-toilets`, `example-bikeroutes`, `example-qa`, `overture`, ... | Example profiles |
+| `compare <a> <b>` | Compare two archives feature by feature (`--ignore-ids=true`, `--strict=false` to ignore metadata) |
+| `stats --input=<archive>` | Tile and layer size statistics (MVT archives) |
+| `verify-mbtiles <file>` | Check an MBTiles file's metadata and tiles |
+| `top-osm-tiles` | Build a tile-weights file from openstreetmap.org tile logs |
+
+## Building from source
+
+```sh
+cargo build --release            # target/release/planetiler
+cargo test --workspace           # tests
+```
+
+`mimalloc` is the default memory allocator; build with `--no-default-features` to use the system allocator.
+Benchmarks against Java are in `crates/planetiler-benchmarks` and `bench/` (see [bench/README.md](bench/README.md)).
 
 ## License
 
-Apache-2.0, like upstream Planetiler. Map data from OpenStreetMap is © OpenStreetMap contributors.
-
-## License
-
-Apache License 2.0 (see [LICENSE](LICENSE)); `crates/planetiler-openmaptiles` is BSD 3-Clause. See [NOTICE.md](NOTICE.md) for attributions, including the OpenMapTiles schema CC-BY 4.0 credit requirement.
+Apache License 2.0 (see [LICENSE](LICENSE)). `crates/planetiler-openmaptiles` is BSD 3-Clause. See
+[NOTICE.md](NOTICE.md) for attributions. OpenStreetMap data is © OpenStreetMap contributors (ODbL), and maps built
+with the OpenMapTiles schema must credit OpenMapTiles.
