@@ -19,8 +19,12 @@ pub mod earcut;
 pub mod encoding;
 pub mod fastpfor;
 pub mod fsst;
+#[cfg(test)]
+mod fsst_reference;
 pub mod geometry_encoder;
 pub mod integer_encoder;
+#[cfg(test)]
+mod integer_encoder_reference;
 pub mod metadata;
 pub mod property_encoder;
 pub mod string_encoder;

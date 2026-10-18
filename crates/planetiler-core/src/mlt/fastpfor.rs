@@ -63,6 +63,11 @@ fn bits(v: u32) -> usize {
 struct FastPfor {
     data_to_be_packed: Vec<Vec<u32>>,
     data_pointers: [usize; 33],
+    /// Number of leading entries of each `data_to_be_packed` array written by the current [`FastPfor::compress`]
+    /// call, zeroed again when it ends: the packing of a partial group of 32 exceptions reads entries past the
+    /// written ones, which are zeros in Java (fresh arrays per call), so they must be zeros here too.
+    dirty: [usize; 33],
+    byte_container: Vec<u8>,
     freqs: [i32; 33],
 }
 
@@ -71,50 +76,27 @@ impl FastPfor {
         // Java preallocates 32 zeroed arrays of 8192 ints per call; growing them on demand instead gives the same
         // output (the contents read by the bit packing are the same zeros / values from earlier pages) without
         // allocating 1MB per encoded stream.
-        FastPfor { data_to_be_packed: vec![Vec::new(); 33], data_pointers: [0; 33], freqs: [0; 33] }
+        FastPfor {
+            data_to_be_packed: vec![Vec::new(); 33],
+            data_pointers: [0; 33],
+            dirty: [0; 33],
+            byte_container: Vec::new(),
+            freqs: [0; 33],
+        }
     }
 
     /// `getBestBFromData`: returns `(bestb, cexcept, maxb)`.
-    fn get_best_b(&mut self, block: &[u32]) -> (usize, usize, usize) {
-        self.freqs = [0; 33];
-        for &v in &block[..BLOCK_SIZE] {
-            self.freqs[bits(v)] += 1;
-        }
-        let mut bestb = 32usize;
-        while self.freqs[bestb] == 0 {
-            bestb -= 1;
-        }
-        let maxb = bestb;
-        let mut bestcost = bestb as i32 * BLOCK_SIZE as i32;
-        let mut cexcept = 0i32;
-        let mut best_cexcept = 0i32;
-        let mut b = bestb as i32 - 1;
-        while b >= 0 {
-            cexcept += self.freqs[(b + 1) as usize];
-            if cexcept == BLOCK_SIZE as i32 {
-                break;
-            }
-            // the extra 8 is the cost of storing maxbits
-            let mut thiscost =
-                cexcept * OVERHEAD_OF_EACH_EXCEPT + cexcept * (maxb as i32 - b) + b * BLOCK_SIZE as i32 + 8;
-            if maxb as i32 - b == 1 {
-                thiscost -= cexcept;
-            }
-            if thiscost < bestcost {
-                bestcost = thiscost;
-                bestb = b as usize;
-                best_cexcept = cexcept;
-            }
-            b -= 1;
-        }
-        (bestb, best_cexcept as usize, maxb)
+    #[inline]
+    fn get_best_b(&mut self, block: &[u32; BLOCK_SIZE]) -> (usize, usize, usize) {
+        best_b(&mut self.freqs, block)
     }
 
     fn encode_page(&mut self, input: &[u32], out: &mut Vec<u32>) {
         let headerpos = out.len();
         out.push(0);
         self.data_pointers = [0; 33];
-        let mut byte_container: Vec<u8> = Vec::with_capacity(3 * input.len() / BLOCK_SIZE + 8);
+        let mut byte_container = std::mem::take(&mut self.byte_container);
+        byte_container.clear();
         for block in input.as_chunks::<BLOCK_SIZE>().0 {
             let (bestb, cexcept, maxb) = self.get_best_b(block);
             byte_container.push(bestb as u8);
@@ -143,6 +125,9 @@ impl FastPfor {
             }
         }
         out[headerpos] = (out.len() - headerpos) as u32;
+        for (dirty, &count) in self.dirty.iter_mut().zip(&self.data_pointers) {
+            *dirty = (*dirty).max(count);
+        }
         let bytesize = byte_container.len();
         while byte_container.len() & 3 != 0 {
             byte_container.push(0);
@@ -151,6 +136,7 @@ impl FastPfor {
         for chunk in byte_container.as_chunks::<4>().0 {
             out.push(u32::from_le_bytes(*chunk));
         }
+        self.byte_container = byte_container;
         let mut bitmap = 0u32;
         for k in 2..=32 {
             if self.data_pointers[k] != 0 {
@@ -186,6 +172,10 @@ impl FastPfor {
             let thissize = PAGE_SIZE.min(inlength - pos);
             self.encode_page(&input[pos..pos + thissize], out);
             pos += thissize;
+        }
+        for (packed, dirty) in self.data_to_be_packed.iter_mut().zip(&mut self.dirty) {
+            packed[..*dirty].fill(0);
+            *dirty = 0;
         }
         inlength
     }
@@ -231,19 +221,152 @@ fn variable_byte_compress(input: &[u32], out: &mut Vec<u32>) {
 /// `EncodingUtils.encodeFastPfor128(values, zigZagEncode=false, deltaEncode=false)` on already-transformed
 /// values: `Composition(FastPFOR, VariableByte)`, words written big-endian.
 pub fn encode(values: &[u32]) -> Vec<u8> {
-    let mut words: Vec<u32> = Vec::with_capacity(values.len() / 2 + 8);
-    if !values.is_empty() {
-        let consumed = FastPfor::new().compress(values, &mut words);
-        if words.is_empty() {
-            words.push(0);
-        }
-        variable_byte_compress(&values[consumed..], &mut words);
-    }
-    let mut out = Vec::with_capacity(words.len() * 4);
-    for w in words {
-        out.extend_from_slice(&w.to_be_bytes());
-    }
+    let mut out = Vec::new();
+    encode_into(values, &mut out);
     out
+}
+
+/// Per-thread encoder state and word buffer reused by [`encode_into`].
+struct EncodeScratch {
+    codec: FastPfor,
+    words: Vec<u32>,
+}
+
+thread_local! {
+    static ENCODE_SCRATCH: std::cell::RefCell<EncodeScratch> =
+        std::cell::RefCell::new(EncodeScratch { codec: FastPfor::new(), words: Vec::new() });
+}
+
+/// [`encode`], appending to `out`.
+pub fn encode_into(values: &[u32], out: &mut Vec<u8>) {
+    if values.is_empty() {
+        return;
+    }
+    if values.len() < BLOCK_SIZE {
+        // no FastPFOR block: a 0 header word, then the variable bytes
+        out.reserve(4 + 4 * variable_byte_words(values));
+        out.extend_from_slice(&[0; 4]);
+        variable_byte_compress_be(values, out);
+        return;
+    }
+    ENCODE_SCRATCH.with(|scratch| {
+        let scratch = &mut *scratch.borrow_mut();
+        let words = &mut scratch.words;
+        words.clear();
+        let consumed = scratch.codec.compress(values, words);
+        variable_byte_compress(&values[consumed..], words);
+        out.reserve(words.len() * 4);
+        for &w in words.iter() {
+            out.extend_from_slice(&w.to_be_bytes());
+        }
+    });
+}
+
+/// Number of words [`variable_byte_compress`] writes for `values`.
+#[inline]
+fn variable_byte_words(values: &[u32]) -> usize {
+    values.iter().map(|&v| super::encoding::varint_size(v)).sum::<usize>().div_ceil(4)
+}
+
+/// [`variable_byte_compress`] written straight to big-endian bytes (each little-endian word of 4 variable bytes
+/// becomes those 4 bytes reversed).
+fn variable_byte_compress_be(values: &[u32], out: &mut Vec<u8>) {
+    let mut word = [0u8; 4];
+    let mut n = 0;
+    let mut push = |b: u8, out: &mut Vec<u8>| {
+        word[n] = b;
+        n += 1;
+        if n == 4 {
+            out.extend_from_slice(&[word[3], word[2], word[1], word[0]]);
+            n = 0;
+        }
+    };
+    for &val in values {
+        let mut v = val;
+        while v >= 1 << 7 {
+            push((v & 0x7f) as u8, out);
+            v >>= 7;
+        }
+        push((v as u8) | 0x80, out);
+    }
+    if n > 0 {
+        word[n..].fill(0);
+        out.extend_from_slice(&[word[3], word[2], word[1], word[0]]);
+    }
+}
+
+/// `encode(values).len()`, computed without packing anything.
+pub fn encoded_size(values: &[u32]) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    let inlength = values.len() - values.len() % BLOCK_SIZE;
+    let tail = variable_byte_words(&values[inlength..]);
+    if inlength == 0 {
+        return 4 * (1 + tail);
+    }
+    let mut words = 1;
+    let mut freqs = [0i32; 33];
+    for page in values[..inlength].chunks(PAGE_SIZE) {
+        let mut data_pointers = [0usize; 33];
+        let mut bytesize = 0;
+        // header word, then the packed blocks
+        words += 1;
+        for block in page.as_chunks::<BLOCK_SIZE>().0 {
+            let (bestb, cexcept, maxb) = best_b(&mut freqs, block);
+            bytesize += 2;
+            if cexcept > 0 {
+                bytesize += 1 + cexcept;
+                data_pointers[maxb - bestb] += cexcept;
+            }
+            words += bestb * (BLOCK_SIZE / 32);
+        }
+        // byte size, the bytes, the bitmap
+        words += 1 + bytesize.div_ceil(4) + 1;
+        for (k, &count) in data_pointers.iter().enumerate().skip(2) {
+            if count != 0 {
+                let j = count.div_ceil(32) * 32;
+                words += 1 + j / 32 * k - (j - count) * k / 32;
+            }
+        }
+    }
+    4 * (words + tail)
+}
+
+/// `getBestBFromData` with caller-provided frequency counts.
+#[inline]
+fn best_b(freqs: &mut [i32; 33], block: &[u32; BLOCK_SIZE]) -> (usize, usize, usize) {
+    *freqs = [0; 33];
+    for &v in block {
+        freqs[bits(v)] += 1;
+    }
+    let mut bestb = 32usize;
+    while freqs[bestb] == 0 {
+        bestb -= 1;
+    }
+    let maxb = bestb;
+    let mut bestcost = bestb as i32 * BLOCK_SIZE as i32;
+    let mut cexcept = 0i32;
+    let mut best_cexcept = 0i32;
+    let mut b = bestb as i32 - 1;
+    while b >= 0 {
+        cexcept += freqs[(b + 1) as usize];
+        if cexcept == BLOCK_SIZE as i32 {
+            break;
+        }
+        // the extra 8 is the cost of storing maxbits
+        let mut thiscost = cexcept * OVERHEAD_OF_EACH_EXCEPT + cexcept * (maxb as i32 - b) + b * BLOCK_SIZE as i32 + 8;
+        if maxb as i32 - b == 1 {
+            thiscost -= cexcept;
+        }
+        if thiscost < bestcost {
+            bestcost = thiscost;
+            bestb = b as usize;
+            best_cexcept = cexcept;
+        }
+        b -= 1;
+    }
+    (bestb, best_cexcept as usize, maxb)
 }
 
 /// Decodes `num_values` values from FastPFOR-encoded `data` (inverse of [`encode`]).
@@ -375,6 +498,64 @@ mod tests {
     fn roundtrip(values: &[u32]) {
         let encoded = encode(values);
         assert_eq!(values, decode(&encoded, values.len()).unwrap().as_slice());
+    }
+
+    /// The straight port: a new codec per call.
+    fn encode_fresh(values: &[u32]) -> Vec<u8> {
+        let mut words: Vec<u32> = Vec::new();
+        if !values.is_empty() {
+            let consumed = FastPfor::new().compress(values, &mut words);
+            if words.is_empty() {
+                words.push(0);
+            }
+            variable_byte_compress(&values[consumed..], &mut words);
+        }
+        words.iter().flat_map(|w| w.to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn encoded_size_matches_encode() {
+        let mut state = 7u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 32) as u32
+        };
+        for len in
+            [0usize, 1, 2, 3, 4, 5, 100, 255, 256, 257, 511, 512, 1000, 4096, 65535, 65536, 65537, 70_000, 140_000]
+        {
+            for shape in 0..6 {
+                let values: Vec<u32> = (0..len)
+                    .map(|i| match shape {
+                        0 => 0,
+                        1 => next() % 17,
+                        2 => next() >> (next() % 32),
+                        3 => {
+                            if next() % 50 == 0 {
+                                next()
+                            } else {
+                                next() % 8
+                            }
+                        }
+                        4 => i as u32,
+                        _ => {
+                            if next() % 7 == 0 {
+                                1 << (next() % 32)
+                            } else {
+                                next() % 300
+                            }
+                        }
+                    })
+                    .collect();
+                let encoded = encode(&values);
+                // the per-thread codec is reused across calls: same output as a fresh one (like Java's)
+                assert_eq!(encode_fresh(&values), encoded, "len {len} shape {shape}");
+                assert_eq!(encoded.len(), encoded_size(&values), "len {len} shape {shape}");
+                let mut appended = vec![9u8];
+                encode_into(&values, &mut appended);
+                assert_eq!(&appended[1..], encoded.as_slice());
+                assert_eq!(values, decode(&encoded, values.len()).unwrap());
+            }
+        }
     }
 
     #[test]

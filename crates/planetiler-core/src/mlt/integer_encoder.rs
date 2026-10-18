@@ -1,11 +1,23 @@
 //! Port of `org.maplibre.mlt.converter.encodings.IntegerEncoder` (only the `IntegerEncodingOption.AUTO` mode, which
 //! is the only one Planetiler uses).
+//!
+//! Java materializes all four logical encodings of a stream (plain, delta, RLE, delta-RLE), physically encodes each
+//! and keeps the smallest. Here one pass over the values computes the varint size of every candidate (the RLE ones
+//! from the run boundaries), which is also the FastPFOR size of candidates shorter than one 256-value block (those
+//! are only variable bytes after a header word); longer FastPFOR candidates are materialized into a reused buffer
+//! and sized by [`fastpfor::encoded_size`] without packing. Only the chosen candidate is encoded, straight into the
+//! output. The bytes are the same (`integer_encoder_reference` keeps the straight port for differential tests).
+
+use std::cell::RefCell;
 
 use super::encoding::{
     LogicalLevelTechnique, LogicalStreamType, PhysicalLevelTechnique, PhysicalStreamType, StreamExtra, StreamMetadata,
-    encode_rle, put_varint, put_varlong, varint_size, varlong_size, zigzag, zigzag_long,
+    put_varint, put_varlong, varint_size, varlong_size, zigzag, zigzag_long,
 };
 use super::fastpfor;
+
+/// FastPFOR packs blocks of this many values; shorter inputs are only variable bytes.
+const FAST_PFOR_BLOCK: usize = 256;
 
 /// `IntegerEncoder.IntegerEncodingResult`.
 #[derive(Debug, Clone)]
@@ -18,307 +30,367 @@ pub struct IntegerEncodingResult {
     pub physical_level_encoded_values_length: u32,
 }
 
+thread_local! {
+    /// Buffer for materialized FastPFOR candidates.
+    static VALUES_SCRATCH: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn transform(v: i32, signed: bool) -> u32 {
+    if signed { zigzag(v) } else { v as u32 }
+}
+
+/// FastPFOR size of a candidate of `len` values whose varint sizes sum to `varint_bytes`, if it is shorter than a
+/// block (a header word and the variable bytes padded to words).
+#[inline]
+fn short_fast_pfor_size(len: usize, varint_bytes: usize) -> usize {
+    if len == 0 { 0 } else { 4 + 4 * varint_bytes.div_ceil(4) }
+}
+
 /// Physical encoding of `values` (Java `encodeFastPfor` / `EncodingUtils.encodeVarints`), zigzag-encoding them first
 /// if `signed`.
 pub fn encode_physical(values: &[i32], fast_pfor: bool, signed: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() + 4);
+    encode_physical_into(&mut out, values, fast_pfor, signed);
+    out
+}
+
+fn encode_physical_into(out: &mut Vec<u8>, values: &[i32], fast_pfor: bool, signed: bool) {
     if fast_pfor {
-        let transformed: Vec<u32> = if signed {
-            values.iter().map(|&v| zigzag(v)).collect()
-        } else {
-            values.iter().map(|&v| v as u32).collect()
-        };
-        fastpfor::encode(&transformed)
+        with_scratch(|buf| {
+            buf.extend(values.iter().map(|&v| transform(v, signed)));
+            fastpfor::encode_into(buf, out);
+        });
     } else {
-        let mut out = Vec::with_capacity(values.len() + 4);
-        if signed {
-            for &v in values {
-                put_varint(&mut out, zigzag(v));
-            }
-        } else {
-            for &v in values {
-                put_varint(&mut out, v as u32);
-            }
+        for &v in values {
+            put_varint(out, transform(v, signed));
         }
-        out
     }
 }
 
-/// Size in bytes of [`encode_physical`] without materializing varint output.
-fn physical_size(values: &[i32], fast_pfor: bool, signed: bool) -> usize {
+/// Runs `f` with the (cleared) per-thread candidate buffer.
+fn with_scratch<R>(f: impl FnOnce(&mut Vec<u32>) -> R) -> R {
+    VALUES_SCRATCH.with(|buf| match buf.try_borrow_mut() {
+        Ok(mut buf) => {
+            buf.clear();
+            f(&mut buf)
+        }
+        // not re-entered in practice, but stay correct if it ever is
+        Err(_) => f(&mut Vec::new()),
+    })
+}
+
+/// The logical encodings [`encode_int`] chooses between (the index Java uses).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Plain = 0,
+    Delta = 1,
+    Rle = 2,
+    DeltaRle = 3,
+}
+
+/// The chosen encoding of an int stream.
+#[derive(Clone, Copy, Debug)]
+struct Choice {
+    kind: Kind,
+    runs: u32,
+    delta_runs: u32,
+    /// Encoded size in bytes.
+    size: usize,
+}
+
+/// Writes the values of candidate `kind` (transformed, before the physical encoding) to `buf`.
+fn materialize(kind: Kind, values: &[i32], signed: bool, buf: &mut Vec<u32>) {
+    buf.clear();
+    match kind {
+        Kind::Plain => buf.extend(values.iter().map(|&v| transform(v, signed))),
+        Kind::Delta => {
+            let mut previous = 0i32;
+            buf.extend(values.iter().map(|&v| {
+                let d = v.wrapping_sub(previous);
+                previous = v;
+                zigzag(d)
+            }));
+        }
+        Kind::Rle | Kind::DeltaRle => {
+            // `EncodingUtils.encodeRle`: the run lengths, then the run values
+            let delta = kind == Kind::DeltaRle;
+            let mut run_values: Vec<u32> = Vec::new();
+            let mut previous_input = 0i32;
+            let mut current = 0i32;
+            let mut run = 0u32;
+            for (i, &v) in values.iter().enumerate() {
+                let x = if delta { v.wrapping_sub(previous_input) } else { v };
+                previous_input = v;
+                if i != 0 && x != current {
+                    buf.push(run);
+                    run_values.push(if delta { zigzag(current) } else { transform(current, signed) });
+                    run = 0;
+                }
+                run += 1;
+                current = x;
+            }
+            if !values.is_empty() {
+                buf.push(run);
+                run_values.push(if delta { zigzag(current) } else { transform(current, signed) });
+            }
+            buf.extend_from_slice(&run_values);
+        }
+    }
+}
+
+/// `IntegerEncoder.encodeInt` with `IntegerEncodingOption.AUTO`: picks the smallest of plain, delta, RLE and
+/// delta-RLE (forcing RLE for constant streams).
+fn choose(values: &[i32], fast_pfor: bool, signed: bool) -> Choice {
+    let n = values.len();
+    let (mut plain, mut delta, mut rle, mut delta_rle) = (0usize, 0usize, 0usize, 0usize);
+    let mut runs = 1usize;
+    let mut delta_runs = 1usize;
+    let mut previous_value = 0i32;
+    let mut previous_delta = 0i32;
+    let mut run = 0u32;
+    let mut delta_run = 0u32;
+    for (i, &value) in values.iter().enumerate() {
+        let d = value.wrapping_sub(previous_value);
+        plain += varint_size(transform(value, signed));
+        delta += varint_size(zigzag(d));
+        if i != 0 && value != previous_value {
+            runs += 1;
+            rle += varint_size(run) + varint_size(transform(previous_value, signed));
+            run = 0;
+        }
+        run += 1;
+        if i != 0 && d != previous_delta {
+            delta_runs += 1;
+            delta_rle += varint_size(delta_run) + varint_size(zigzag(previous_delta));
+            delta_run = 0;
+        }
+        delta_run += 1;
+        previous_value = value;
+        previous_delta = d;
+    }
+    if n > 0 {
+        rle += varint_size(run) + varint_size(transform(previous_value, signed));
+        delta_rle += varint_size(delta_run) + varint_size(zigzag(previous_delta));
+    }
+    let has_rle = n / runs >= 2;
+    let has_delta_rle = n / delta_runs >= 2;
+    let lens = [n, n, 2 * runs, 2 * delta_runs];
+    let mut sizes =
+        [plain, delta, if has_rle { rle } else { usize::MAX }, if has_delta_rle { delta_rle } else { usize::MAX }];
     if fast_pfor {
-        encode_physical(values, true, signed).len()
-    } else if signed {
-        values.iter().map(|&v| varint_size(zigzag(v))).sum()
+        let kinds = [Kind::Plain, Kind::Delta, Kind::Rle, Kind::DeltaRle];
+        for k in 0..4 {
+            if sizes[k] == usize::MAX {
+                continue;
+            }
+            sizes[k] = if lens[k] < FAST_PFOR_BLOCK {
+                short_fast_pfor_size(lens[k], sizes[k])
+            } else {
+                with_scratch(|buf| {
+                    materialize(kinds[k], values, signed, buf);
+                    fastpfor::encoded_size(buf)
+                })
+            };
+        }
+    }
+    // Since we want to force that all const streams use RLE encoding we use this current workaround
+    let is_const_stream = has_rle && runs == 1;
+    let index = if is_const_stream {
+        2
     } else {
-        values.iter().map(|&v| varint_size(v as u32)).sum()
+        let min = *sizes.iter().min().expect("non-empty");
+        sizes.iter().position(|&s| s == min).expect("min exists")
+    };
+    let kind = [Kind::Plain, Kind::Delta, Kind::Rle, Kind::DeltaRle][index];
+    Choice { kind, runs: runs as u32, delta_runs: delta_runs as u32, size: sizes[index] }
+}
+
+/// Appends the chosen encoding of `values`.
+fn write_choice(out: &mut Vec<u8>, choice: &Choice, values: &[i32], fast_pfor: bool, signed: bool) {
+    let start = out.len();
+    if fast_pfor {
+        with_scratch(|buf| {
+            materialize(choice.kind, values, signed, buf);
+            fastpfor::encode_into(buf, out);
+        });
+    } else {
+        match choice.kind {
+            Kind::Plain => encode_physical_into(out, values, false, signed),
+            _ => with_scratch(|buf| {
+                materialize(choice.kind, values, signed, buf);
+                for &v in buf.iter() {
+                    put_varint(out, v);
+                }
+            }),
+        }
     }
+    debug_assert_eq!(choice.size, out.len() - start);
 }
 
-/// One candidate encoding of [`encode_int`]: lazily materialized for varints.
-enum Candidate {
-    Bytes(Vec<u8>),
-    /// `(values, signed)` to varint-encode, with the precomputed size.
-    Varint(Vec<i32>, bool, usize),
-}
-
-impl Candidate {
-    fn new(values: Vec<i32>, fast_pfor: bool, signed: bool) -> Candidate {
-        if fast_pfor {
-            Candidate::Bytes(encode_physical(&values, true, signed))
-        } else {
-            let size = physical_size(&values, false, signed);
-            Candidate::Varint(values, signed, size)
+impl Choice {
+    fn techniques(&self) -> (LogicalLevelTechnique, LogicalLevelTechnique) {
+        match self.kind {
+            Kind::Plain => (LogicalLevelTechnique::None, LogicalLevelTechnique::None),
+            Kind::Delta => (LogicalLevelTechnique::Delta, LogicalLevelTechnique::None),
+            Kind::Rle => (LogicalLevelTechnique::Rle, LogicalLevelTechnique::None),
+            Kind::DeltaRle => (LogicalLevelTechnique::Delta, LogicalLevelTechnique::Rle),
         }
     }
 
-    fn len(&self) -> usize {
-        match self {
-            Candidate::Bytes(b) => b.len(),
-            Candidate::Varint(_, _, size) => *size,
+    /// `(num_runs, physical_level_encoded_values_length)`.
+    fn lengths(&self, num_values: usize) -> (u32, u32) {
+        match self.kind {
+            Kind::Plain | Kind::Delta => (0, num_values as u32),
+            Kind::Rle => (self.runs, 2 * self.runs),
+            Kind::DeltaRle => (self.delta_runs, 2 * self.delta_runs),
         }
     }
-
-    fn into_bytes(self) -> Vec<u8> {
-        match self {
-            Candidate::Bytes(b) => b,
-            Candidate::Varint(values, signed, _) => encode_physical(&values, false, signed),
-        }
-    }
-}
-
-fn concat(a: Vec<i32>, b: impl IntoIterator<Item = i32>) -> Vec<i32> {
-    let mut a = a;
-    a.extend(b);
-    a
 }
 
 /// `IntegerEncoder.encodeInt` with `IntegerEncodingOption.AUTO`: picks the smallest of plain, delta, RLE and
 /// delta-RLE (forcing RLE for constant streams).
 pub fn encode_int(values: &[i32], fast_pfor: bool, signed: bool) -> IntegerEncodingResult {
-    let (mut result, chosen) = encode_int_impl(values, fast_pfor, signed);
-    result.encoded_values = chosen.into_bytes();
-    result
+    let choice = choose(values, fast_pfor, signed);
+    let mut encoded_values = Vec::with_capacity(choice.size);
+    write_choice(&mut encoded_values, &choice, values, fast_pfor, signed);
+    let (logical_level_technique1, logical_level_technique2) = choice.techniques();
+    let (num_runs, physical_level_encoded_values_length) = choice.lengths(values.len());
+    IntegerEncodingResult {
+        logical_level_technique1,
+        logical_level_technique2,
+        encoded_values,
+        num_runs,
+        physical_level_encoded_values_length,
+    }
 }
 
-/// Size of `encode_int(values, fast_pfor, signed).encoded_values` (avoids materializing varint output).
+/// Size of `encode_int(values, fast_pfor, signed).encoded_values` (without encoding anything).
 pub fn encoded_int_size(values: &[i32], fast_pfor: bool, signed: bool) -> usize {
-    encode_int_impl(values, fast_pfor, signed).1.len()
+    choose(values, fast_pfor, signed).size
 }
 
-/// Returns the result (without its `encoded_values`) and the chosen candidate encoding.
-fn encode_int_impl(values: &[i32], fast_pfor: bool, signed: bool) -> (IntegerEncodingResult, Candidate) {
-    let mut previous_value = 0i32;
-    let mut previous_delta = 0i32;
+/// `IntegerEncoder.encodeLong` with `IntegerEncodingOption.AUTO` (always varint: FastPFOR only supports 32 bits),
+/// appending the stream header and data.
+fn encode_long_into(
+    out: &mut Vec<u8>,
+    values: &[i64],
+    signed: bool,
+    stream_type: PhysicalStreamType,
+    logical_stream_type: Option<LogicalStreamType>,
+) {
+    let t = |v: i64| if signed { zigzag_long(v) } else { v as u64 };
+    let n = values.len();
+    let (mut plain, mut delta, mut rle, mut delta_rle) = (0usize, 0usize, 0usize, 0usize);
     let mut runs = 1usize;
     let mut delta_runs = 1usize;
-    let mut delta_values = Vec::with_capacity(values.len());
-    for (i, &value) in values.iter().enumerate() {
-        let delta = value.wrapping_sub(previous_value);
-        delta_values.push(delta);
-        if value != previous_value && i != 0 {
-            runs += 1;
-        }
-        if delta != previous_delta && i != 0 {
-            delta_runs += 1;
-        }
-        previous_value = value;
-        previous_delta = delta;
-    }
-
-    let plain = Candidate::new(values.to_vec(), fast_pfor, signed);
-    let delta = Candidate::new(delta_values.clone(), fast_pfor, true);
-    let mut rle: Option<Candidate> = None;
-    let mut delta_rle: Option<Candidate> = None;
-    let mut rle_physical_len = 0usize;
-    let mut delta_rle_physical_len = 0usize;
-
-    // Since we want to force that all const streams use RLE encoding we use this current workaround
-    let mut is_const_stream = false;
-    if values.len() / runs >= 2 {
-        let (rle_runs, rle_values) = encode_rle(values);
-        rle_physical_len = rle_runs.len() + rle_values.len();
-        is_const_stream = rle_runs.len() == 1;
-        let combined = if signed {
-            concat(rle_runs, rle_values.iter().map(|&v| zigzag(v) as i32))
-        } else {
-            concat(rle_runs, rle_values)
-        };
-        rle = Some(Candidate::new(combined, fast_pfor, false));
-    }
-
-    if delta_values.len() / delta_runs >= 2 {
-        let (rle_runs, rle_values) = encode_rle(&delta_values);
-        delta_rle_physical_len = rle_runs.len() + rle_values.len();
-        let combined = concat(rle_runs, rle_values.iter().map(|&v| zigzag(v) as i32));
-        delta_rle = Some(Candidate::new(combined, fast_pfor, false));
-    }
-
-    let sizes = [
-        plain.len(),
-        delta.len(),
-        rle.as_ref().map_or(usize::MAX, Candidate::len),
-        delta_rle.as_ref().map_or(usize::MAX, Candidate::len),
-    ];
-    let index = if is_const_stream {
-        2
-    } else {
-        let min = *sizes.iter().min().expect("non-empty");
-        sizes.iter().position(|&s| s == min).expect("min exists")
-    };
-    let chosen = match index {
-        0 => plain,
-        1 => delta,
-        2 => rle.expect("rle candidate"),
-        _ => delta_rle.expect("delta rle candidate"),
-    };
-    let mut result = IntegerEncodingResult {
-        logical_level_technique1: LogicalLevelTechnique::None,
-        logical_level_technique2: LogicalLevelTechnique::None,
-        encoded_values: Vec::new(),
-        num_runs: 0,
-        physical_level_encoded_values_length: values.len() as u32,
-    };
-    match index {
-        2 => {
-            result.num_runs = runs as u32;
-            result.physical_level_encoded_values_length = rle_physical_len as u32;
-            result.logical_level_technique1 = LogicalLevelTechnique::Rle;
-        }
-        3 => {
-            result.num_runs = delta_runs as u32;
-            result.physical_level_encoded_values_length = delta_rle_physical_len as u32;
-            result.logical_level_technique1 = LogicalLevelTechnique::Delta;
-            result.logical_level_technique2 = LogicalLevelTechnique::Rle;
-        }
-        1 => result.logical_level_technique1 = LogicalLevelTechnique::Delta,
-        _ => {}
-    }
-    (result, chosen)
-}
-
-/// `IntegerEncoder.encodeLong` with `IntegerEncodingOption.AUTO` (always varint: FastPFOR only supports 32 bits).
-pub fn encode_long(values: &[i64], signed: bool) -> IntegerEncodingResult {
     let mut previous_value = 0i64;
     let mut previous_delta = 0i64;
-    let mut runs = 1usize;
-    let mut delta_runs = 1usize;
-    let mut delta_values = Vec::with_capacity(values.len());
+    let mut run = 0u64;
+    let mut delta_run = 0u64;
     for (i, &value) in values.iter().enumerate() {
-        let delta = value.wrapping_sub(previous_value);
-        delta_values.push(delta);
-        if value != previous_value && i != 0 {
+        let d = value.wrapping_sub(previous_value);
+        plain += varlong_size(t(value));
+        delta += varlong_size(zigzag_long(d));
+        if i != 0 && value != previous_value {
             runs += 1;
+            rle += varlong_size(run) + varlong_size(t(previous_value));
+            run = 0;
         }
-        if delta != previous_delta && i != 0 {
+        run += 1;
+        if i != 0 && d != previous_delta {
             delta_runs += 1;
+            delta_rle += varlong_size(delta_run) + varlong_size(zigzag_long(previous_delta));
+            delta_run = 0;
         }
+        delta_run += 1;
         previous_value = value;
-        previous_delta = delta;
+        previous_delta = d;
     }
-    let varints = |vals: &[i64], signed: bool| -> Vec<u8> {
-        let mut out = Vec::with_capacity(vals.iter().map(|&v| varlong_size(v as u64)).sum());
-        for &v in vals {
-            put_varlong(&mut out, if signed { zigzag_long(v) } else { v as u64 });
-        }
-        out
-    };
-
-    let plain = varints(values, signed);
-    let delta = varints(&delta_values, true);
-    let mut rle: Option<Vec<u8>> = None;
-    let mut delta_rle: Option<Vec<u8>> = None;
-    let mut rle_physical_len = 0usize;
-    let mut delta_rle_physical_len = 0usize;
-    let mut is_const_stream = false;
-    if values.len() / runs >= 2 {
-        let (rle_runs, rle_values) = encode_rle(values);
-        rle_physical_len = rle_runs.len() + rle_values.len();
-        is_const_stream = rle_runs.len() == 1;
-        let mut combined = rle_runs;
-        if signed {
-            combined.extend(rle_values.iter().map(|&v| zigzag_long(v) as i64));
-        } else {
-            combined.extend(rle_values);
-        }
-        rle = Some(varints(&combined, false));
+    if n > 0 {
+        rle += varlong_size(run) + varlong_size(t(previous_value));
+        delta_rle += varlong_size(delta_run) + varlong_size(zigzag_long(previous_delta));
     }
-    if delta_values.len() / delta_runs >= 2 {
-        let (rle_runs, rle_values) = encode_rle(&delta_values);
-        delta_rle_physical_len = rle_runs.len() + rle_values.len();
-        let mut combined = rle_runs;
-        combined.extend(rle_values.iter().map(|&v| zigzag_long(v) as i64));
-        delta_rle = Some(varints(&combined, false));
-    }
-    let sizes = [
-        plain.len(),
-        delta.len(),
-        rle.as_ref().map_or(usize::MAX, Vec::len),
-        delta_rle.as_ref().map_or(usize::MAX, Vec::len),
-    ];
-    let index = if is_const_stream {
+    let has_rle = n / runs >= 2;
+    let has_delta_rle = n / delta_runs >= 2;
+    let sizes =
+        [plain, delta, if has_rle { rle } else { usize::MAX }, if has_delta_rle { delta_rle } else { usize::MAX }];
+    let index = if has_rle && runs == 1 {
         2
     } else {
         let min = *sizes.iter().min().expect("non-empty");
         sizes.iter().position(|&s| s == min).expect("min exists")
     };
-    let mut result = IntegerEncodingResult {
-        logical_level_technique1: LogicalLevelTechnique::None,
-        logical_level_technique2: LogicalLevelTechnique::None,
-        encoded_values: Vec::new(),
-        num_runs: 0,
-        physical_level_encoded_values_length: values.len() as u32,
-    };
-    match index {
-        0 => result.encoded_values = plain,
-        1 => {
-            result.encoded_values = delta;
-            result.logical_level_technique1 = LogicalLevelTechnique::Delta;
+    let kind = [Kind::Plain, Kind::Delta, Kind::Rle, Kind::DeltaRle][index];
+    let choice = Choice { kind, runs: runs as u32, delta_runs: delta_runs as u32, size: sizes[index] };
+    write_header(out, &choice, PhysicalLevelTechnique::Varint, stream_type, logical_stream_type, n);
+    let start = out.len();
+    match kind {
+        Kind::Plain => values.iter().for_each(|&v| put_varlong(out, t(v))),
+        Kind::Delta => {
+            let mut previous = 0i64;
+            for &v in values {
+                put_varlong(out, zigzag_long(v.wrapping_sub(previous)));
+                previous = v;
+            }
         }
-        2 => {
-            result.encoded_values = rle.expect("rle");
-            result.num_runs = runs as u32;
-            result.physical_level_encoded_values_length = rle_physical_len as u32;
-            result.logical_level_technique1 = LogicalLevelTechnique::Rle;
-        }
-        _ => {
-            result.encoded_values = delta_rle.expect("delta rle");
-            result.num_runs = delta_runs as u32;
-            result.physical_level_encoded_values_length = delta_rle_physical_len as u32;
-            result.logical_level_technique1 = LogicalLevelTechnique::Delta;
-            result.logical_level_technique2 = LogicalLevelTechnique::Rle;
+        Kind::Rle | Kind::DeltaRle => {
+            // the run lengths, then the run values
+            let delta = kind == Kind::DeltaRle;
+            let mut run_values: Vec<u64> = Vec::new();
+            let mut previous_input = 0i64;
+            let mut current = 0i64;
+            let mut run = 0u64;
+            for (i, &v) in values.iter().enumerate() {
+                let x = if delta { v.wrapping_sub(previous_input) } else { v };
+                previous_input = v;
+                if i != 0 && x != current {
+                    put_varlong(out, run);
+                    run_values.push(if delta { zigzag_long(current) } else { t(current) });
+                    run = 0;
+                }
+                run += 1;
+                current = x;
+            }
+            if n > 0 {
+                put_varlong(out, run);
+                run_values.push(if delta { zigzag_long(current) } else { t(current) });
+            }
+            for v in run_values {
+                put_varlong(out, v);
+            }
         }
     }
-    result
+    debug_assert_eq!(choice.size, out.len() - start);
 }
 
 fn physical(fast_pfor: bool) -> PhysicalLevelTechnique {
     if fast_pfor { PhysicalLevelTechnique::FastPfor } else { PhysicalLevelTechnique::Varint }
 }
 
-fn write_stream(
+fn write_header(
     out: &mut Vec<u8>,
-    encoded: IntegerEncodingResult,
+    choice: &Choice,
     physical_level_technique: PhysicalLevelTechnique,
     stream_type: PhysicalStreamType,
     logical_stream_type: Option<LogicalStreamType>,
     num_values: usize,
 ) {
+    let (technique1, technique2) = choice.techniques();
+    let (num_runs, physical_length) = choice.lengths(num_values);
     let mut metadata = StreamMetadata::new(
         stream_type,
         logical_stream_type,
-        encoded.logical_level_technique1,
-        encoded.logical_level_technique2,
+        technique1,
+        technique2,
         physical_level_technique,
-        encoded.physical_level_encoded_values_length,
-        encoded.encoded_values.len() as u32,
+        physical_length,
+        choice.size as u32,
     );
-    if encoded.logical_level_technique1 == LogicalLevelTechnique::Rle
-        || encoded.logical_level_technique2 == LogicalLevelTechnique::Rle
-    {
-        metadata.extra = StreamExtra::Rle(encoded.num_runs, num_values as u32);
+    if matches!(choice.kind, Kind::Rle | Kind::DeltaRle) {
+        metadata.extra = StreamExtra::Rle(num_runs, num_values as u32);
     }
     metadata.encode_into(out);
-    out.extend_from_slice(&encoded.encoded_values);
 }
 
 /// `IntegerEncoder.encodeIntStream`: an integer stream with its metadata header.
@@ -330,8 +402,10 @@ pub fn encode_int_stream(
     stream_type: PhysicalStreamType,
     logical_stream_type: Option<LogicalStreamType>,
 ) {
-    let encoded = encode_int(values, fast_pfor, signed);
-    write_stream(out, encoded, physical(fast_pfor), stream_type, logical_stream_type, values.len());
+    let choice = choose(values, fast_pfor, signed);
+    write_header(out, &choice, physical(fast_pfor), stream_type, logical_stream_type, values.len());
+    out.reserve(choice.size);
+    write_choice(out, &choice, values, fast_pfor, signed);
 }
 
 /// `IntegerEncoder.encodeLongStream`.
@@ -342,65 +416,70 @@ pub fn encode_long_stream(
     stream_type: PhysicalStreamType,
     logical_stream_type: Option<LogicalStreamType>,
 ) {
-    let encoded = encode_long(values, signed);
-    write_stream(out, encoded, PhysicalLevelTechnique::Varint, stream_type, logical_stream_type, values.len());
+    encode_long_into(out, values, signed, stream_type, logical_stream_type);
 }
 
-/// `IntegerEncoder.encodeMortonCodes`: delta (not zigzag) encoded morton codes.
-pub fn encode_morton_codes(values: &[i32], fast_pfor: bool) -> IntegerEncodingResult {
+/// Morton code deltas (not zigzag encoded) into `buf`.
+fn morton_deltas(values: &[i32], buf: &mut Vec<u32>) {
     let mut previous = 0i32;
-    let deltas: Vec<i32> = values
-        .iter()
-        .map(|&v| {
-            let d = v.wrapping_sub(previous);
-            previous = v;
-            d
-        })
-        .collect();
-    IntegerEncodingResult {
-        logical_level_technique1: LogicalLevelTechnique::Morton,
-        logical_level_technique2: LogicalLevelTechnique::Delta,
-        encoded_values: encode_physical(&deltas, fast_pfor, false),
-        num_runs: 0,
-        physical_level_encoded_values_length: values.len() as u32,
-    }
+    buf.extend(values.iter().map(|&v| {
+        let d = v.wrapping_sub(previous);
+        previous = v;
+        d as u32
+    }));
 }
 
-/// Size of [`encode_morton_codes`] output.
+/// Size of the `encodedValues` of `IntegerEncoder.encodeMortonCodes` (delta, not zigzag, encoded morton codes).
 pub fn encoded_morton_codes_size(values: &[i32], fast_pfor: bool) -> usize {
-    if fast_pfor {
-        return encode_morton_codes(values, true).encoded_values.len();
+    if fast_pfor && values.len() >= FAST_PFOR_BLOCK {
+        return with_scratch(|buf| {
+            morton_deltas(values, buf);
+            fastpfor::encoded_size(buf)
+        });
     }
     let mut previous = 0i32;
-    values
+    let varint_bytes = values
         .iter()
         .map(|&v| {
             let d = v.wrapping_sub(previous);
             previous = v;
             varint_size(d as u32)
         })
-        .sum()
+        .sum();
+    if fast_pfor { short_fast_pfor_size(values.len(), varint_bytes) } else { varint_bytes }
 }
 
 /// `IntegerEncoder.encodeMortonStream`.
 pub fn encode_morton_stream(out: &mut Vec<u8>, values: &[i32], num_bits: u32, coordinate_shift: u32, fast_pfor: bool) {
-    let encoded = encode_morton_codes(values, fast_pfor);
+    let size = encoded_morton_codes_size(values, fast_pfor);
     StreamMetadata::new(
         PhysicalStreamType::Data,
         Some(LogicalStreamType::Dictionary(super::encoding::DictionaryType::Morton)),
-        encoded.logical_level_technique1,
-        encoded.logical_level_technique2,
+        LogicalLevelTechnique::Morton,
+        LogicalLevelTechnique::Delta,
         physical(fast_pfor),
-        encoded.physical_level_encoded_values_length,
-        encoded.encoded_values.len() as u32,
+        values.len() as u32,
+        size as u32,
     )
     .with_extra(StreamExtra::Morton(num_bits, coordinate_shift))
     .encode_into(out);
-    out.extend_from_slice(&encoded.encoded_values);
+    let start = out.len();
+    with_scratch(|buf| {
+        morton_deltas(values, buf);
+        if fast_pfor {
+            fastpfor::encode_into(buf, out);
+        } else {
+            for &v in buf.iter() {
+                put_varint(out, v);
+            }
+        }
+    });
+    debug_assert_eq!(size, out.len() - start);
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::integer_encoder_reference as reference;
     use super::*;
 
     #[test]
@@ -432,7 +511,99 @@ mod tests {
 
     #[test]
     fn long_stream() {
-        let r = encode_long(&[1 << 40, 1 << 40], false);
+        let mut out = Vec::new();
+        encode_long_stream(&mut out, &[1 << 40, 1 << 40], false, PhysicalStreamType::Data, None);
+        let r = reference::encode_long(&[1 << 40, 1 << 40], false);
         assert_eq!(LogicalLevelTechnique::Rle, r.logical_level_technique1);
+    }
+
+    /// Deterministic streams of many shapes: constant, sequences, runs, small / large / negative values, around the
+    /// 256-value FastPFOR block size.
+    fn streams() -> Vec<Vec<i64>> {
+        let mut state = 11u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 16) as i64
+        };
+        let mut result = vec![vec![], vec![0], vec![7], vec![-3, -3], vec![i32::MIN as i64, i32::MAX as i64]];
+        for len in [1usize, 2, 3, 5, 17, 100, 127, 128, 129, 255, 256, 257, 300, 511, 512, 513, 1000, 5000, 70_000] {
+            for shape in 0..9 {
+                let mut v = Vec::with_capacity(len);
+                let mut x = 0i64;
+                for i in 0..len {
+                    let r = next();
+                    x = match shape {
+                        0 => 5,
+                        1 => i as i64,
+                        2 => i as i64 * 3 + 1000,
+                        3 => r % 100,
+                        4 => (r % 2_000_000) - 1_000_000,
+                        5 => {
+                            if r % 10 == 0 {
+                                r % 1000
+                            } else {
+                                x
+                            }
+                        }
+                        6 => x + (r % 5) - 2,
+                        7 => r as i32 as i64,
+                        _ => (i / 7) as i64 * ((r % 3) - 1),
+                    };
+                    v.push(x);
+                }
+                result.push(v);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn same_bytes_as_straight_port() {
+        for values in streams() {
+            let ints: Vec<i32> = values.iter().map(|&v| v as i32).collect();
+            for fast_pfor in [false, true] {
+                for signed in [false, true] {
+                    let mut expected = Vec::new();
+                    reference::encode_int_stream(
+                        &mut expected,
+                        &ints,
+                        fast_pfor,
+                        signed,
+                        PhysicalStreamType::Length,
+                        None,
+                    );
+                    let mut actual = Vec::new();
+                    encode_int_stream(&mut actual, &ints, fast_pfor, signed, PhysicalStreamType::Length, None);
+                    assert_eq!(expected, actual, "{} values, fast_pfor {fast_pfor} signed {signed}", ints.len());
+                    assert_eq!(
+                        reference::encoded_int_size(&ints, fast_pfor, signed),
+                        encoded_int_size(&ints, fast_pfor, signed)
+                    );
+                    assert_eq!(
+                        reference::encode_int(&ints, fast_pfor, signed).encoded_values,
+                        encode_int(&ints, fast_pfor, signed).encoded_values
+                    );
+                }
+                let mut expected = Vec::new();
+                reference::encode_morton_stream(&mut expected, &ints, 13, 7, fast_pfor);
+                let mut actual = Vec::new();
+                encode_morton_stream(&mut actual, &ints, 13, 7, fast_pfor);
+                assert_eq!(expected, actual);
+                assert_eq!(
+                    reference::encoded_morton_codes_size(&ints, fast_pfor),
+                    encoded_morton_codes_size(&ints, fast_pfor)
+                );
+            }
+            for signed in [false, true] {
+                let longs: Vec<i64> = values.iter().map(|&v| v.wrapping_mul(1 << 20)).collect();
+                for input in [&values, &longs] {
+                    let mut expected = Vec::new();
+                    reference::encode_long_stream(&mut expected, input, signed, PhysicalStreamType::Data, None);
+                    let mut actual = Vec::new();
+                    encode_long_stream(&mut actual, input, signed, PhysicalStreamType::Data, None);
+                    assert_eq!(expected, actual, "{} longs, signed {signed}", input.len());
+                }
+            }
+        }
     }
 }

@@ -4,9 +4,16 @@
 //!   re-encodes every gzipped MVT tile to MLT like `TileArchiveWriter` and writes `z, x, y, length` (big-endian
 //!   ints) + bytes per tile, the same format as `MltReference.java encode`. Also checks that decoding each MLT tile
 //!   gives back the features of the MVT tile.
+//! - `bench <in.mbtiles> <step> [options as for encode]`: decodes every `step`-th tile up front, then times only the
+//!   MLT encoding (with layer stats, like `TileArchiveWriter`) of those tiles on one thread (for profiling).
 //! - `compare <a.bin> <b.bin>`: compares two such files tile by tile: identical bytes, or decoded contents.
 //! - `decode <tiles.bin>`: prints one line per decoded feature in the format of `MltReference.java decode`
 //!   (normalize Java's `Integer`/`Long` type names to `Int` before diffing).
+
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -182,6 +189,38 @@ fn encode(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn bench(args: &[String]) -> anyhow::Result<()> {
+    let step: usize = args[1].parse()?;
+    let (include_ids, options) = options(&args[2..]);
+    let db = Mbtiles::new_read_only_database(Path::new(&args[0]))?;
+    let mut tiles: Vec<_> = db.get_all_tiles()?.collect::<anyhow::Result<Vec<_>>>()?;
+    tiles.sort_by_key(|t| (t.coord.z, t.coord.x, t.coord.y));
+    let mut vts = Vec::new();
+    for tile in tiles.iter().step_by(step) {
+        let features = vector_tile::decode(&planetiler_core::util::gzip::gunzip(&tile.bytes)?)?;
+        let mut by_layer: indexmap::IndexMap<String, Vec<vector_tile::Feature>> = indexmap::IndexMap::new();
+        for f in features {
+            by_layer.entry(f.layer.clone()).or_default().push(f);
+        }
+        let mut vt = VectorTile::new();
+        for (layer, features) in &by_layer {
+            vt.add_layer_features(layer, features);
+        }
+        vts.push(vt);
+    }
+    let mut elapsed = std::time::Duration::ZERO;
+    let (mut bytes, mut hash) = (0usize, 0xcbf29ce484222325u64);
+    for vt in &vts {
+        let start = Instant::now();
+        let (encoded, _) = vt.encode_mlt_with_layer_stats(include_ids, &options, None)?;
+        elapsed += start.elapsed();
+        bytes += encoded.len();
+        hash = encoded.iter().fold(hash, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    }
+    eprintln!("encoded {} tiles in {elapsed:?}: {bytes} bytes, fnv1a64 {hash:016x}", vts.len());
+    Ok(())
+}
+
 fn compare(args: &[String]) -> anyhow::Result<()> {
     let a = read_bin(Path::new(&args[0]))?;
     let b = read_bin(Path::new(&args[1]))?;
@@ -291,7 +330,8 @@ fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("encode") => encode(&args[1..]),
         Some("compare") => compare(&args[1..]),
+        Some("bench") => bench(&args[1..]),
         Some("decode") => decode(&args[1..]),
-        _ => anyhow::bail!("usage: mlt_reference encode|compare|decode ..."),
+        _ => anyhow::bail!("usage: mlt_reference encode|bench|compare|decode ..."),
     }
 }

@@ -1,19 +1,15 @@
 //! Port of `org.maplibre.mlt.converter.encodings.GeometryEncoder`, the space filling curves from
 //! `org.maplibre.mlt.converter.geometry` and `TessellationUtils`.
 
-use std::collections::HashMap;
-
 use geo_types::{Coord, Geometry, LineString, Polygon};
 
 use super::earcut;
 use super::encoding::{
     DictionaryType, LengthType, LogicalLevelTechnique, LogicalStreamType, OffsetType, PhysicalLevelTechnique,
-    PhysicalStreamType, StreamMetadata, zigzag,
+    PhysicalStreamType, StreamMetadata, put_varint, varint_size, zigzag,
 };
 use super::fastpfor;
-use super::integer_encoder::{
-    encode_int_stream, encode_morton_stream, encode_physical, encoded_int_size, encoded_morton_codes_size,
-};
+use super::integer_encoder::{encode_int_stream, encode_morton_stream, encoded_int_size, encoded_morton_codes_size};
 
 /// `GeometryType` ordinals.
 pub const POINT: i32 = 0;
@@ -261,22 +257,28 @@ fn zigzag_delta_encode_vertices(vertices: &[(i32, i32)]) -> Vec<i32> {
 
 /// `encodeVertexBuffer`: componentwise delta encoded vertices with the physical technique applied directly.
 fn encode_vertex_buffer(out: &mut Vec<u8>, values: &[i32], fast_pfor: bool) {
-    let encoded = if fast_pfor {
-        fastpfor::encode(&values.iter().map(|&v| v as u32).collect::<Vec<_>>())
-    } else {
-        encode_physical(values, false, false)
+    let header = |out: &mut Vec<u8>, size: usize| {
+        StreamMetadata::new(
+            PhysicalStreamType::Data,
+            Some(LogicalStreamType::Dictionary(DictionaryType::Vertex)),
+            LogicalLevelTechnique::ComponentwiseDelta,
+            LogicalLevelTechnique::None,
+            if fast_pfor { PhysicalLevelTechnique::FastPfor } else { PhysicalLevelTechnique::Varint },
+            values.len() as u32,
+            size as u32,
+        )
+        .encode_into(out)
     };
-    StreamMetadata::new(
-        PhysicalStreamType::Data,
-        Some(LogicalStreamType::Dictionary(DictionaryType::Vertex)),
-        LogicalLevelTechnique::ComponentwiseDelta,
-        LogicalLevelTechnique::None,
-        if fast_pfor { PhysicalLevelTechnique::FastPfor } else { PhysicalLevelTechnique::Varint },
-        values.len() as u32,
-        encoded.len() as u32,
-    )
-    .encode_into(out);
-    out.extend_from_slice(&encoded);
+    if fast_pfor {
+        let encoded = fastpfor::encode(&values.iter().map(|&v| v as u32).collect::<Vec<_>>());
+        header(out, encoded.len());
+        out.extend_from_slice(&encoded);
+    } else {
+        header(out, values.iter().map(|&v| varint_size(v as u32)).sum());
+        for &v in values {
+            put_varint(out, v as u32);
+        }
+    }
 }
 
 fn length_stream(out: &mut Vec<u8>, values: &[i32], fast_pfor: bool, length_type: Option<LengthType>) {
@@ -288,6 +290,29 @@ fn length_stream(out: &mut Vec<u8>, values: &[i32], fast_pfor: bool, length_type
         PhysicalStreamType::Length,
         length_type.map(LogicalStreamType::Length),
     );
+}
+
+/// `code << 32 | position` with the (signed) code's order preserved.
+#[inline]
+fn sort_key(code: i32, position: usize) -> u64 {
+    (((code ^ i32::MIN) as u32 as u64) << 32) | position as u64
+}
+
+/// For sorted `keys` (see [`sort_key`]), calls `f(position, end)` for each key with the end (exclusive) of the run
+/// of keys with the same code.
+fn for_each_run_end(keys: &[u64], mut f: impl FnMut(usize, usize)) {
+    let mut start = 0;
+    while start < keys.len() {
+        let code = keys[start] >> 32;
+        let mut end = start + 1;
+        while end < keys.len() && keys[end] >> 32 == code {
+            end += 1;
+        }
+        for &k in &keys[start..end] {
+            f((k & 0xFFFF_FFFF) as usize, end);
+        }
+        start = end;
+    }
 }
 
 /// The vertex dictionary candidates computed for every geometry column.
@@ -313,26 +338,25 @@ impl Dictionaries {
         }
         let curve = CurveParams::new(min, max);
 
-        // addVerticesToDictionary: a stable sort by hilbert index. (Java does not actually remove duplicates here.)
-        let mut hilbert: Vec<(i32, (i32, i32))> =
-            vertices.iter().map(|&(x, y)| (curve.hilbert(x, y), (x, y))).collect();
-        hilbert.sort_by_key(|(h, _)| *h);
-        let dictionary_vertices: Vec<(i32, i32)> = hilbert.iter().map(|(_, v)| *v).collect();
-        let mut hilbert_index: HashMap<i32, i32> = HashMap::with_capacity(hilbert.len());
-        for (i, (h, _)) in hilbert.iter().enumerate() {
-            hilbert_index.insert(*h, i as i32);
-        }
+        // addVerticesToDictionary: a stable sort by hilbert index (Java does not actually remove duplicates here),
+        // then each vertex's offset is the last dictionary position of its hilbert index (Java's index map keeps the
+        // last put). Sorting `hilbert << 32 | position` gives the stable order without a hash map.
+        let n = vertices.len();
+        let mut keys: Vec<u64> = Vec::with_capacity(n);
+        keys.extend(vertices.iter().enumerate().map(|(i, &(x, y))| sort_key(curve.hilbert(x, y), i)));
+        keys.sort_unstable();
+        let mut dictionary_vertices: Vec<(i32, i32)> = Vec::with_capacity(n);
+        dictionary_vertices.extend(keys.iter().map(|&k| vertices[(k & 0xFFFF_FFFF) as usize]));
+        let mut dictionary_offsets = vec![0i32; n];
+        for_each_run_end(&keys, |position, end| dictionary_offsets[position] = end as i32 - 1);
 
         // addVerticesToMortonDictionary: sorted morton codes, also without removing duplicates
-        let mut morton_dictionary: Vec<i32> = vertices.iter().map(|&(x, y)| curve.morton(x, y)).collect();
-        morton_dictionary.sort_unstable();
-        let mut morton_index: HashMap<i32, i32> = HashMap::with_capacity(morton_dictionary.len());
-        for (i, m) in morton_dictionary.iter().enumerate() {
-            morton_index.insert(*m, i as i32);
-        }
-
-        let dictionary_offsets: Vec<i32> = vertices.iter().map(|&(x, y)| hilbert_index[&curve.hilbert(x, y)]).collect();
-        let morton_offsets: Vec<i32> = vertices.iter().map(|&(x, y)| morton_index[&curve.morton(x, y)]).collect();
+        keys.clear();
+        keys.extend(vertices.iter().enumerate().map(|(i, &(x, y))| sort_key(curve.morton(x, y), i)));
+        keys.sort_unstable();
+        let morton_dictionary: Vec<i32> = keys.iter().map(|&k| (k >> 32) as u32 as i32 ^ i32::MIN).collect();
+        let mut morton_offsets = vec![0i32; n];
+        for_each_run_end(&keys, |position, end| morton_offsets[position] = end as i32 - 1);
 
         let zigzag_delta_vertex_buffer = zigzag_delta_encode_vertices(vertices);
         let zigzag_delta_vertex_dictionary = zigzag_delta_encode_vertices(&dictionary_vertices);
