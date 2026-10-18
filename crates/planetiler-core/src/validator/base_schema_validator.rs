@@ -169,7 +169,7 @@ fn print_failure(example: &ExampleResult, out: &mut dyn Write) {
 }
 
 /// Java `String.indent(n)` for positive `n`: prefixes every line with `n` spaces and terminates it with `\n`.
-pub(crate) fn indent(string: &str, n: usize) -> String {
+pub fn indent(string: &str, n: usize) -> String {
     let prefix = " ".repeat(n);
     string.lines().map(|line| format!("{prefix}{line}\n")).collect()
 }
