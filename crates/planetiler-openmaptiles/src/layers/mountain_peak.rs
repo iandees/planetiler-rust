@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use geo::{BoundingRect, Intersects};
-use geo_types::{Geometry, Rect};
+use geo_types::{Geometry, Polygon, Rect};
 use planetiler_core::config::planetiler_config::PlanetilerConfig;
 use planetiler_core::feature_collector::FeatureCollector;
 use planetiler_core::forwarding_profile::{Handler, LayerPostProcessor};
@@ -39,11 +39,33 @@ use crate::util::utils::{elevation, null_if_empty};
 struct PreparedPolygon {
     bounds: Rect<f64>,
     geometry: Geometry<f64>,
+    /// the parts of `geometry` with their bounding boxes, to test points without recomputing the bounding box of the
+    /// whole (multi)polygon on every call
+    parts: Vec<(Rect<f64>, Polygon<f64>)>,
 }
 
 impl PreparedPolygon {
+    fn new(bounds: Rect<f64>, geometry: Geometry<f64>) -> PreparedPolygon {
+        let polygons: Vec<&Polygon<f64>> = match &geometry {
+            Geometry::Polygon(p) => vec![p],
+            Geometry::MultiPolygon(mp) => mp.0.iter().collect(),
+            _ => vec![],
+        };
+        let parts = polygons.into_iter().filter_map(|p| Some((p.bounding_rect()?, p.clone()))).collect();
+        PreparedPolygon { bounds, geometry, parts }
+    }
+
     fn intersects(&self, other: &Geometry<f64>) -> bool {
-        other.bounding_rect().is_some_and(|b| b.intersects(&self.bounds)) && self.geometry.intersects(other)
+        if !other.bounding_rect().is_some_and(|b| b.intersects(&self.bounds)) {
+            return false;
+        }
+        match other {
+            // same result as the (multi)polygon test: a point intersects a multipolygon if it intersects any part
+            Geometry::Point(point) if !self.parts.is_empty() => {
+                self.parts.iter().any(|(rect, polygon)| rect.intersects(point) && polygon.intersects(point))
+            }
+            _ => self.geometry.intersects(other),
+        }
     }
 }
 
@@ -96,7 +118,7 @@ impl NaturalEarthProcessor for MountainPeak {
             match feature.polygon() {
                 Ok(boundary) => {
                     if let Some(bounds) = boundary.bounding_rect() {
-                        let _ = self.united_states.set(PreparedPolygon { bounds, geometry: boundary.clone() });
+                        let _ = self.united_states.set(PreparedPolygon::new(bounds, boundary.clone()));
                     }
                 }
                 Err(e) => error!("Failed to get United States Polygon for mountain_peak layer: {e}"),
