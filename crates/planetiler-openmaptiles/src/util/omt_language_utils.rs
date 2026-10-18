@@ -62,7 +62,7 @@ pub fn get_names_without_translations(tags: &Tags) -> Tags {
 /// Returns a map with default name attributes that [`get_names_without_translations`] adds, but also translations
 /// for every language that `translations` is configured to handle.
 pub fn get_names(tags: &Tags, translations: Option<&Translations>) -> Tags {
-    let mut result = Tags::new();
+    let mut result = Tags::default();
 
     let name = string(tags.get("name"));
     let int_name = string(tags.get("int_name"));

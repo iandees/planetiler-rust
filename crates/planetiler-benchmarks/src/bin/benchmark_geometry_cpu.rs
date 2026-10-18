@@ -7,7 +7,13 @@
 //! Merge-lines resources are read from `$PLANETILER_REF/planetiler-core/src/test/resources/mergelines` (defaults to
 //! `../planetiler-ref/planetiler` next to the workspace).
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
+
+// count allocations on top of the same allocator the other binaries use (see the `mimalloc` feature in Cargo.toml)
+#[cfg(feature = "mimalloc")]
+use mimalloc::MiMalloc as Inner;
+#[cfg(not(feature = "mimalloc"))]
+use std::alloc::System as Inner;
 use std::hint::black_box;
 use std::io::Read;
 use std::path::PathBuf;
@@ -27,16 +33,16 @@ static ALLOCS: AtomicU64 = AtomicU64::new(0);
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
+        unsafe { Inner.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
+        unsafe { Inner.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.realloc(ptr, layout, new_size) }
+        unsafe { Inner.realloc(ptr, layout, new_size) }
     }
 }
 

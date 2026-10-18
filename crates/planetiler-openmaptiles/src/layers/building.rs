@@ -323,8 +323,8 @@ mod tests {
     #[test]
     fn test_merge_polygons_z13() {
         let t = LayerTest::new();
-        let poly1 = vt_feature(LAYER_NAME, 1, &rectangle(10.0, 20.0).into(), Tags::new(), 0);
-        let poly2 = vt_feature(LAYER_NAME, 1, &rectangle_xy(20.0, 10.0, 22.0, 20.0).into(), Tags::new(), 0);
+        let poly1 = vt_feature(LAYER_NAME, 1, &rectangle(10.0, 20.0).into(), Tags::default(), 0);
+        let poly2 = vt_feature(LAYER_NAME, 1, &rectangle_xy(20.0, 10.0, 22.0, 20.0).into(), Tags::default(), 0);
         let num_geometries = |f: &vector_tile::Feature| match f.geometry.decode().unwrap() {
             geo_types::Geometry::MultiPolygon(mp) => mp.0.len(),
             geo_types::Geometry::Polygon(_) => 1,

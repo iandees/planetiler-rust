@@ -10,7 +10,16 @@
 //!   `FeatureGroup`
 //! - `iterations` (default 1)
 //! - `tmpdir` (default `data/tmp/benchmark_osm_reader`)
+//!
+//! Debugging (same in the Java version): `DUMP_TILES=<file>` writes `z/x/y <feature count>` for every tile after
+//! each iteration, and `DUMP_TILE=z/x/y` additionally writes that tile's encoded vector tile to `<file>.tile`.
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -126,7 +135,21 @@ fn main() -> anyhow::Result<()> {
             group.num_features_written(),
             stats.data_errors(),
         );
-        drop(group);
+        if let Ok(dump) = std::env::var("DUMP_TILES") {
+            // debugging aid: write "z/x/y count" for every tile to compare outputs with the Java benchmark
+            let mut group = Arc::try_unwrap(group).map_err(|_| anyhow::anyhow!("feature group still shared"))?;
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&dump)?);
+            for tile in group.iter()? {
+                let c = tile.tile_coord();
+                let name = format!("{}/{}/{}", c.z, c.x, c.y);
+                writeln!(out, "{name} {}", tile.num_features_processed())?;
+                if std::env::var("DUMP_TILE").is_ok_and(|t| t == name) {
+                    std::fs::write(format!("{dump}.tile"), tile.get_vector_tile().encode())?;
+                }
+            }
+        } else {
+            drop(group);
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
     Ok(())

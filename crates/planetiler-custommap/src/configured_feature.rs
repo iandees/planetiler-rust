@@ -105,7 +105,7 @@ impl Builder<'_> {
         let attr_type = attribute.attr_type.as_ref();
         // some expression features are hoisted to the top-level for attribute values for brevity, so just map them to
         // what the equivalent expression syntax would be and parse as an expression.
-        let mut value = planetiler_core::value::Tags::new();
+        let mut value = planetiler_core::value::Tags::default();
         if attr_type.and_then(Value::as_str) == Some("match_key") {
             value.insert("value".into(), Value::str("${match_key}"));
         } else if attr_type.and_then(Value::as_str) == Some("match_value") {

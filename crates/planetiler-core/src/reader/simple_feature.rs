@@ -131,7 +131,7 @@ impl SimpleFeature {
 
     /// Returns a new feature with no tags and a geometry specified in latitude/longitude coordinates.
     pub fn from_lat_lon_geometry_with_id(lat_lon_geometry: impl Into<Geometry<f64>>, id: i64) -> SimpleFeature {
-        Self::create_tags_with_id(lat_lon_geometry, Tags::new(), id)
+        Self::create_tags_with_id(lat_lon_geometry, Tags::default(), id)
     }
 
     /// Alias for [`SimpleFeature::from_lat_lon_geometry_with_id`] with no ID set.
@@ -145,7 +145,7 @@ impl SimpleFeature {
         Self::new(
             None,
             Some(world_geometry.into()),
-            SourceFeatureBase::new(Tags::new(), None, None, Vec::new(), id),
+            SourceFeatureBase::new(Tags::default(), None, None, Vec::new(), id),
             None,
         )
     }

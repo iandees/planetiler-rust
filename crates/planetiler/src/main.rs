@@ -10,6 +10,11 @@
 //! planetiler compare a.mbtiles b.mbtiles
 //! ```
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::process::ExitCode;
 
 use anyhow::bail;

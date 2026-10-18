@@ -24,7 +24,7 @@ pub fn verify(mbtiles: &Mbtiles) -> Verify<'_> {
         mbtiles,
         &MONACO_BOUNDS,
         "building",
-        &Tags::new(),
+        &Tags::default(),
         13,
         14,
         100,
@@ -35,17 +35,17 @@ pub fn verify(mbtiles: &Mbtiles) -> Verify<'_> {
         mbtiles,
         &MONACO_BOUNDS,
         "transportation",
-        &Tags::new(),
+        &Tags::default(),
         10,
         14,
         5,
         GeometryType::Line,
     );
-    let mut park = Tags::new();
+    let mut park = Tags::default();
     park.insert("class".into(), "grass".into());
     park.insert("subclass".into(), "park".into());
     check_min_feature_count(&mut verify, mbtiles, &MONACO_BOUNDS, "landcover", &park, 14, 10, GeometryType::Polygon);
-    let mut ocean = Tags::new();
+    let mut ocean = Tags::default();
     ocean.insert("class".into(), "ocean".into());
     check_min_feature_count_range(
         &mut verify,
@@ -58,7 +58,7 @@ pub fn verify(mbtiles: &Mbtiles) -> Verify<'_> {
         1,
         GeometryType::Polygon,
     );
-    let mut country = Tags::new();
+    let mut country = Tags::default();
     country.insert("class".into(), "country".into());
     check_min_feature_count_range(
         &mut verify,
@@ -205,7 +205,7 @@ mod tests {
                     "layer",
                     1,
                     vector_tile::encode_geometry(&new_point(0.0, 0.0).into()),
-                    Tags::new(),
+                    Tags::default(),
                 )],
             );
             writer

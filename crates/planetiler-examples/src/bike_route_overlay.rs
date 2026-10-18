@@ -197,7 +197,7 @@ mod tests {
                 10.0, 20.0, // point 1: 10 east 20 north
                 30.0, 40.0, // point 2: 30 east 40 north
             ]),
-            Tags::new(),
+            Tags::default(),
             None::<&str>,
             None::<&str>,
             3,

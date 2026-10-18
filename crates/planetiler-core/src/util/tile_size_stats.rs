@@ -325,7 +325,10 @@ mod tests {
     fn compute_stats_2_features() {
         let stats = compute_tile_stats(
             &VectorTile::new()
-                .add_layer_features("b", &[Feature::new("b", 1, encode_geometry(&new_point(0.0, 0.0)), Tags::new())])
+                .add_layer_features(
+                    "b",
+                    &[Feature::new("b", 1, encode_geometry(&new_point(0.0, 0.0)), Tags::default())],
+                )
                 .add_layer_features(
                     "a",
                     &[

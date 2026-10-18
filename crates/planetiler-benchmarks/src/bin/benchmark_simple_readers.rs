@@ -9,6 +9,11 @@
 //! - `iterations` (default `1`)
 //! - `only` (`water` or `natural_earth`) to run just one
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;

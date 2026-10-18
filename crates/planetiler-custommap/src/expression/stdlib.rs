@@ -123,7 +123,7 @@ pub(crate) fn val_to_value(val: &dyn Val) -> Result<Value, ExecutionError> {
             let iterable = val.as_iterable().ok_or_else(|| type_error(val, "map"))?;
             let indexer = val.as_indexer().ok_or_else(|| type_error(val, "map"))?;
             let mut iter = iterable.iter();
-            let mut tags = Tags::new();
+            let mut tags = Tags::default();
             while let Some(key) = iter.next() {
                 let key_string = match val_to_value(key)? {
                     Value::String(s) => s.to_string(),

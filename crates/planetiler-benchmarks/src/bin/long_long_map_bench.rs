@@ -10,6 +10,11 @@
 //! the Java benchmark so results can be compared directly. Periodic progress lines are a simplified version of
 //! Java's `ProgressLoggers` output.
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};

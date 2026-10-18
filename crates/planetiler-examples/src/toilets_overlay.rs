@@ -117,7 +117,7 @@ mod tests {
             let feature = features[0];
             assert_eq!("toilets", feature.get_layer());
             // no attributes
-            assert_eq!(&Tags::new(), &**feature.get_attrs_at_zoom(14));
+            assert_eq!(&Tags::default(), &**feature.get_attrs_at_zoom(14));
             assert_eq!(0, feature.get_min_zoom());
             assert_eq!(14, feature.get_max_zoom());
             assert_eq!(1, feature.get_sort_key());
@@ -149,6 +149,6 @@ mod tests {
         .unwrap();
         let mbtiles = Mbtiles::new_read_only_database(&db_path).unwrap();
         assert_metadata(&mbtiles, "Toilets Overlay");
-        assert_num_features(&mbtiles, "toilets", 14, &Tags::new(), 34, GeometryType::Point);
+        assert_num_features(&mbtiles, "toilets", 14, &Tags::default(), 34, GeometryType::Point);
     }
 }

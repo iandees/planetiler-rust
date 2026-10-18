@@ -56,19 +56,27 @@ pub fn ring_signed_area(ring: &[Coord<f64>]) -> f64 {
 ///
 /// If `geom` contains points (Java throws `IllegalArgumentException`).
 pub fn extract_groups(geom: &Geometry<f64>, min_size: f64) -> Groups {
+    extract_groups_with_rings(geom, min_size, false)
+}
+
+/// Same as [`extract_groups`], but when `linear_rings` is true, closed linestrings with at least 4 points are treated
+/// like JTS `LinearRing`s: as the shell of a polygon whose area must be at least `min_size`. That is what Java does
+/// with the rings left over when simplifying a polygon collapses its shell (JTS keeps them as `LinearRing`s, which geo
+/// can't represent).
+pub fn extract_groups_with_rings(geom: &Geometry<f64>, min_size: f64, linear_rings: bool) -> Groups {
     let mut result = Vec::new();
-    extract_groups_into(geom, &mut result, min_size);
+    extract_groups_into(geom, &mut result, min_size, linear_rings);
     result
 }
 
-fn extract_groups_into(geom: &Geometry<f64>, groups: &mut Groups, min_size: f64) {
+fn extract_groups_into(geom: &Geometry<f64>, groups: &mut Groups, min_size: f64, linear_rings: bool) {
     if geometry_transformer::is_empty(geom) {
         return;
     }
     match geom {
         Geometry::GeometryCollection(gc) => {
             for g in &gc.0 {
-                extract_groups_into(g, groups, min_size);
+                extract_groups_into(g, groups, min_size, linear_rings);
             }
         }
         Geometry::MultiPolygon(mp) => {
@@ -81,23 +89,26 @@ fn extract_groups_into(geom: &Geometry<f64>, groups: &mut Groups, min_size: f64)
         Geometry::MultiLineString(ml) => {
             for l in &ml.0 {
                 if !l.0.is_empty() {
-                    extract_line(groups, min_size, l);
+                    extract_line(groups, min_size, l, linear_rings);
                 }
             }
         }
         Geometry::Polygon(p) => extract_groups_from_polygon(groups, min_size, p),
         Geometry::Rect(r) => extract_groups_from_polygon(groups, min_size, &r.to_polygon()),
         Geometry::Triangle(t) => extract_groups_from_polygon(groups, min_size, &t.to_polygon()),
-        Geometry::LineString(l) => extract_line(groups, min_size, l),
-        Geometry::Line(l) => extract_line(groups, min_size, &LineString(vec![l.start, l.end])),
+        Geometry::LineString(l) => extract_line(groups, min_size, l, linear_rings),
+        Geometry::Line(l) => extract_line(groups, min_size, &LineString(vec![l.start, l.end]), false),
         Geometry::Point(_) | Geometry::MultiPoint(_) => {
             panic!("unrecognized geometry type: {:?}", crate::geo::geometry_type::GeometryType::type_of(geom))
         }
     }
 }
 
-fn extract_line(groups: &mut Groups, min_size: f64, line: &LineString<f64>) {
-    if line_length(&line.0) >= min_size {
+fn extract_line(groups: &mut Groups, min_size: f64, line: &LineString<f64>, linear_rings: bool) {
+    if linear_rings && line.0.len() >= 4 && line.0.first() == line.0.last() {
+        // Java: extractGroups(JTS_FACTORY.createPolygon(linearRing), groups, minSize)
+        extract_groups_from_polygon(groups, min_size, &Polygon::new(line.clone(), vec![]));
+    } else if line_length(&line.0) >= min_size {
         groups.push(vec![line.0.clone()]);
     }
 }

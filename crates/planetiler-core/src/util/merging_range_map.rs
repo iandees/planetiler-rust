@@ -46,7 +46,7 @@ pub fn merge_tags(a: &Tags, b: &Tags) -> Tags {
 impl MergingRangeMap<Tags> {
     /// Returns a new range map where values are [`Tags`] maps that get merged together when they overlap from `[0, 1)`.
     pub fn unit_map() -> MergingRangeMap<Tags> {
-        Self::unit(Tags::new(), merge_tags)
+        Self::unit(Tags::default(), merge_tags)
     }
 }
 

@@ -665,7 +665,7 @@ mod tests {
         translations.put(1, "en", "en value");
         translations.put(1, "es", "es value");
         assert_eq!(Some(&expected), translations.get(1));
-        let mut elem = Tags::new();
+        let mut elem = Tags::default();
         assert_eq!(None, translations.get_name_translations(&elem));
         elem.insert("wikidata".into(), Value::str("Qgarbage"));
         assert_eq!(None, translations.get_name_translations(&elem));

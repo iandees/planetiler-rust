@@ -1,5 +1,10 @@
 //! Port of `BenchmarkVarInt.java`: encodes then decodes 100M var-longs, 3 times, printing throughput to stderr.
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use planetiler_core::stats::timer::Timer;
 use planetiler_core::util::format;
 use planetiler_core::util::var_int;

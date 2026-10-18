@@ -313,7 +313,7 @@ impl ShapefileReader {
     }
 
     fn decode_attributes(&self, record: &[u8]) -> Tags {
-        let mut tags = Tags::with_capacity(self.dbf.fields.len());
+        let mut tags = crate::value::tags_with_capacity(self.dbf.fields.len());
         for field in &self.dbf.fields {
             let value = record
                 .get(field.offset..field.offset + field.length)

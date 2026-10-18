@@ -76,7 +76,7 @@ fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<OutputFeature>, D:
 fn yaml_tags<'de, D: Deserializer<'de>>(d: D) -> Result<Tags, D::Error> {
     match yaml::to_value(&serde_yaml::Value::deserialize(d)?) {
         Value::Map(m) => Ok((*m).clone()),
-        _ => Ok(Tags::new()),
+        _ => Ok(Tags::default()),
     }
 }
 
@@ -215,7 +215,7 @@ fn validate(profile: &dyn Profile, spec: &Spec, config: Arc<PlanetilerConfig>) -
                         }
                     }
                 } else {
-                    result.push(Candidate { feature: f, attrs: Tags::new() });
+                    result.push(Candidate { feature: f, attrs: Tags::default() });
                 }
             }
             if result.len() != example.output.len() {

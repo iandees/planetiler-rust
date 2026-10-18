@@ -115,7 +115,7 @@ mod tests {
         .unwrap();
         let mbtiles = Mbtiles::new_read_only_database(&db_path).unwrap();
         assert_metadata(&mbtiles, "Water Infrastructure Map");
-        assert_num_features(&mbtiles, "water_supply", 14, &Tags::new(), 16, GeometryType::Point);
+        assert_num_features(&mbtiles, "water_supply", 14, &Tags::default(), 16, GeometryType::Point);
         assert_tile_duplicates(&mbtiles, 0);
     }
 }

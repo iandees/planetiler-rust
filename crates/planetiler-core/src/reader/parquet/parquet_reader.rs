@@ -96,7 +96,7 @@ pub struct ParquetReader {
 
 /// Returns `key=value` fields from the components of `path` (hive partitioning), or `None` if there are none.
 pub fn get_hive_partition_fields(path: &Path) -> Option<Tags> {
-    let mut fields = Tags::new();
+    let mut fields = Tags::default();
     for part in path.iter() {
         let string = part.to_string_lossy();
         if string.contains('=') {

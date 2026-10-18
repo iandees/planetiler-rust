@@ -448,7 +448,7 @@ pub fn osm_type_name(t: OsmElementType) -> &'static str {
     }
 }
 
-static EMPTY_TAGS: LazyLock<Tags> = LazyLock::new(Tags::new);
+static EMPTY_TAGS: LazyLock<Tags> = LazyLock::new(Tags::default);
 
 impl<'a> FeatureRef<'a> {
     pub fn tags(&self) -> &'a Tags {

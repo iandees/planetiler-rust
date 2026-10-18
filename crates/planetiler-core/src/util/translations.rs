@@ -137,7 +137,7 @@ impl Translations {
 
     /// Convenience wrapper for [`Self::add_translations`] that creates a new map for results.
     pub fn get_translations(&self, tags: &Tags) -> Tags {
-        let mut result = Tags::new();
+        let mut result = Tags::default();
         self.add_translations(&mut result, tags);
         result
     }
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn test_null() {
         let translations = Translations::null_provider(&["en"]);
-        assert_eq!(Tags::new(), translations.get_translations(&tags! {"name:en" => "name"}));
+        assert_eq!(Tags::default(), translations.get_translations(&tags! {"name:en" => "name"}));
     }
 
     #[test]
@@ -237,8 +237,8 @@ mod tests {
             tags! {"name:zh-Hant-TW" => "name"},
             translations.get_translations(&tags! {"name:zh-Hant-TW" => "name"})
         );
-        assert_eq!(Tags::new(), translations.get_translations(&tags! {"name:left" => "name"}));
-        assert_eq!(Tags::new(), translations.get_translations(&tags! {"name:etymology:wikidata" => "name"}));
+        assert_eq!(Tags::default(), translations.get_translations(&tags! {"name:left" => "name"}));
+        assert_eq!(Tags::default(), translations.get_translations(&tags! {"name:etymology:wikidata" => "name"}));
     }
 
     #[test]
@@ -294,11 +294,11 @@ mod tests {
             "name:de" => "german name",
         };
         let mut translations = Translations::default_provider(&["en", "es", "de"]);
-        let mut output1 = Tags::new();
+        let mut output1 = Tags::default();
         translations.add_translations(&mut output1, &input);
         assert!(!output1.contains_key("extra"));
 
-        let mut output2 = Tags::new();
+        let mut output2 = Tags::default();
         translations.set_extra_name_tags(&["extra"]);
         translations.add_translations(&mut output2, &input);
         assert!(output2.contains_key("extra"));

@@ -4,6 +4,11 @@
 //! Arguments (same as Java): `--bench_mbtiles=a.mbtiles,b.mbtiles --bench_repetitions=10
 //! --bench_nr_tile_reads=500000 --bench_pre_warms=3`
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;

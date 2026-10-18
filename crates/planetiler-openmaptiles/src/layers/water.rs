@@ -405,12 +405,12 @@ mod tests {
             &[
                 tags! {"class" => "ocean", "intermittent" => "<null>", "_layer" => "water", "_type" => "polygon", "_minzoom" => 0},
             ],
-            &t.process(&ne(rectangle(0.0, 10.0), Tags::new(), "ne_110m_ocean")),
+            &t.process(&ne(rectangle(0.0, 10.0), Tags::default(), "ne_110m_ocean")),
         );
         assert_features(
             6,
             &[tags! {"class" => "ocean", "_layer" => "water", "_type" => "polygon", "_maxzoom" => 5}],
-            &t.process(&ne(rectangle(0.0, 10.0), Tags::new(), "ne_10m_ocean")),
+            &t.process(&ne(rectangle(0.0, 10.0), Tags::default(), "ne_10m_ocean")),
         );
     }
 
@@ -418,9 +418,9 @@ mod tests {
     fn test_lake_natural_earth_by_intersection() {
         let t = LayerTest::new();
         let polygon = rectangle(0.0, 0.1);
-        t.process(&ne(polygon.clone(), Tags::new(), "ne_110m_lakes"));
-        t.process(&ne(polygon.clone(), Tags::new(), "ne_10m_lakes"));
-        t.process(&osm_lake(polygon, Tags::new(), 123));
+        t.process(&ne(polygon.clone(), Tags::default(), "ne_110m_lakes"));
+        t.process(&ne(polygon.clone(), Tags::default(), "ne_10m_lakes"));
+        t.process(&osm_lake(polygon, Tags::default(), 123));
         assert_finish(
             &t,
             &[
@@ -435,9 +435,9 @@ mod tests {
         let t = LayerTest::new();
         let polygon1 = rectangle(0.0, 0.1);
         let polygon2 = rectangle(0.2, 0.3);
-        t.process(&ne(polygon1.clone(), Tags::new(), "ne_110m_lakes"));
-        t.process(&ne(polygon1, Tags::new(), "ne_10m_lakes"));
-        t.process(&osm_lake(polygon2, Tags::new(), 123));
+        t.process(&ne(polygon1.clone(), Tags::default(), "ne_110m_lakes"));
+        t.process(&ne(polygon1, Tags::default(), "ne_10m_lakes"));
+        t.process(&osm_lake(polygon2, Tags::default(), 123));
         assert_finish(
             &t,
             &[
@@ -452,10 +452,10 @@ mod tests {
         let t = LayerTest::new();
         let polygon1 = rectangle(0.0, 0.1);
         let polygon2 = rectangle(0.0, 0.2);
-        t.process(&ne(polygon2.clone(), Tags::new(), "ne_110m_lakes"));
-        t.process(&ne(polygon2.clone(), Tags::new(), "ne_10m_lakes"));
-        t.process(&osm_lake(polygon1, Tags::new(), 123));
-        t.process(&osm_lake(polygon2, Tags::new(), 234));
+        t.process(&ne(polygon2.clone(), Tags::default(), "ne_110m_lakes"));
+        t.process(&ne(polygon2.clone(), Tags::default(), "ne_10m_lakes"));
+        t.process(&osm_lake(polygon1, Tags::default(), 123));
+        t.process(&osm_lake(polygon2, Tags::default(), 234));
         assert_finish(
             &t,
             &[
@@ -527,7 +527,7 @@ mod tests {
             &[
                 tags! {"class" => "ocean", "intermittent" => "<null>", "_layer" => "water", "_type" => "polygon", "_minzoom" => 6, "_maxzoom" => 14},
             ],
-            &t.process(&feature(rectangle(0.0, 10.0), Tags::new(), WATER_POLYGON_SOURCE, None, 0)),
+            &t.process(&feature(rectangle(0.0, 10.0), Tags::default(), WATER_POLYGON_SOURCE, None, 0)),
         );
     }
 
@@ -540,7 +540,7 @@ mod tests {
             &[
                 tags! {"class" => "lake", "id" => id, "_layer" => "water", "_type" => "polygon", "_minzoom" => 6, "_maxzoom" => 14},
             ],
-            &t.process(&osm_lake(geo_utils::world_to_lat_lon_coords(&rectangle(0.0, 1.0).into()), Tags::new(), id)),
+            &t.process(&osm_lake(geo_utils::world_to_lat_lon_coords(&rectangle(0.0, 1.0).into()), Tags::default(), id)),
         );
     }
 
@@ -561,7 +561,7 @@ mod tests {
             &t.process(&polygon_feature(tags! {"leisure" => "swimming_pool"})),
         );
         assert_features(14, &[], &t.process(&polygon_feature(tags! {"natural" => "bay"})));
-        assert_features(14, &[Tags::new()], &t.process(&polygon_feature(tags! {"natural" => "water"})));
+        assert_features(14, &[Tags::default()], &t.process(&polygon_feature(tags! {"natural" => "water"})));
         assert_features(14, &[], &t.process(&polygon_feature(tags! {"natural" => "water", "covered" => "yes"})));
         assert_features(
             14,
@@ -591,7 +591,7 @@ mod tests {
             &t.process(&polygon_feature(tags! {"natural" => "water", "water" => "reservoir"})),
         );
         assert_features(14, &[], &t.process(&polygon_feature(tags! {"natural" => "bay"})));
-        assert_features(14, &[Tags::new()], &t.process(&polygon_feature(tags! {"natural" => "water"})));
+        assert_features(14, &[Tags::default()], &t.process(&polygon_feature(tags! {"natural" => "water"})));
         assert_features(14, &[], &t.process(&polygon_feature(tags! {"natural" => "water", "covered" => "yes"})));
         assert_features(
             11,
@@ -659,17 +659,17 @@ mod tests {
     #[test]
     fn test_ocean_zoom_levels() {
         let t = LayerTest::new();
-        let f1 = ne(rectangle(0.0, 10.0), Tags::new(), "ne_110m_ocean");
-        let f2 = ne(rectangle(0.0, 10.0), Tags::new(), "ne_50m_ocean");
-        let f3 = ne(rectangle(0.0, 10.0), Tags::new(), "ne_10m_ocean");
-        let f4 = feature(rectangle(0.0, 10.0), Tags::new(), WATER_POLYGON_SOURCE, None, 0);
+        let f1 = ne(rectangle(0.0, 10.0), Tags::default(), "ne_110m_ocean");
+        let f2 = ne(rectangle(0.0, 10.0), Tags::default(), "ne_50m_ocean");
+        let f3 = ne(rectangle(0.0, 10.0), Tags::default(), "ne_10m_ocean");
+        let f4 = feature(rectangle(0.0, 10.0), Tags::default(), WATER_POLYGON_SOURCE, None, 0);
         assert_covers_zoom_range(0, 14, "water", &[&t.process(&f1), &t.process(&f2), &t.process(&f3), &t.process(&f4)]);
     }
 
     #[test]
     fn test_lake_zoom_levels() {
         let t = LayerTest::new();
-        let f = osm_lake(rectangle(0.0, 10.0), Tags::new(), 0);
+        let f = osm_lake(rectangle(0.0, 10.0), Tags::default(), 0);
         assert_covers_zoom_range(6, 14, "water", &[&t.process(&f)]);
     }
 }

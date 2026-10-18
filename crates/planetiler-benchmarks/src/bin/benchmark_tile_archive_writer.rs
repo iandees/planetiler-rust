@@ -9,6 +9,11 @@
 //! Usage: `cargo run --release -p planetiler-benchmarks --bin benchmark_tile_archive_writer -- [features] [rounds]
 //! [tmpdir]`
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,7 +60,7 @@ const WIDTH: f64 = 4.6;
 const HEIGHT: f64 = 2.0;
 
 fn tags(t: i64, minzoom: i64, rng: &mut Rng) -> Tags {
-    let mut tags = Tags::new();
+    let mut tags = Tags::default();
     tags.insert("t".into(), Value::Int(t));
     tags.insert("minzoom".into(), Value::Int(minzoom));
     tags.insert("kind".into(), Value::str(KINDS[rng.next_int(10) as usize]));

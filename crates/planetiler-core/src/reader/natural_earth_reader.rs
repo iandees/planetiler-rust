@@ -24,7 +24,7 @@ use crate::reader::simple_reader::{
     FeatureSink, ReaderFeature, SimpleReader, default_decode_threads, extract_from_zip,
 };
 use crate::util::file_utils;
-use crate::value::{Tags, Value};
+use crate::value::Value;
 
 /// Reads features from a Natural Earth sqlite file.
 pub struct NaturalEarthReader {
@@ -190,7 +190,7 @@ impl NaturalEarthReader {
                 continue;
             }
             let geometry = geo_utils::read_wkb(geometry).map_err(|e| anyhow!("{e} in {table} (row {id})"))?;
-            let mut tags = Tags::with_capacity(columns.len() - 1);
+            let mut tags = crate::value::tags_with_capacity(columns.len() - 1);
             for (c, name) in columns.iter().enumerate() {
                 if c != geometry_column {
                     tags.insert(name.clone(), sqlite_value(row.get_ref(c)?));
