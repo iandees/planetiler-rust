@@ -2,7 +2,6 @@
 //! file.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -12,6 +11,7 @@ use crate::geo::envelope::Envelope;
 use crate::reader::osm::osm_block_source::OsmBlockSource;
 use crate::reader::osm::osm_element::OsmElement;
 use crate::reader::osm::osm_input_file::OsmInputFile;
+use crate::reader::osm::osm_phaser::{OsmPhaser, Phase};
 use crate::stats::progress_loggers::ProgressLoggers;
 use crate::stats::stats::StatsRef;
 use crate::worker::worker_pipeline::WorkerPipeline;
@@ -36,15 +36,16 @@ impl OsmNodeBoundsProvider {
         );
         let timer = self.stats.start_stage("osm_bounds");
 
-        // TODO(port): use OsmPhaser once it is ported to validate nodes -> ways -> relations ordering
+        // If the node location writer supports parallel writes, then parse, process, and write node locations from
+        // worker threads
         let parse_threads = self.config.threads.saturating_sub(1).max(1);
+        let phaser = Arc::new(OsmPhaser::new(parse_threads));
         let envelopes: Arc<Mutex<Vec<Envelope>>> = Arc::default();
-        let counters: Arc<[AtomicI64; 3]> = Arc::default();
         let source = Arc::new(self.file.get()?);
 
         let pipeline = {
             let envelopes = envelopes.clone();
-            let counters = counters.clone();
+            let phaser = phaser.clone();
             WorkerPipeline::start("osm_bounds", self.stats.clone())
                 .from_generator("read", move |next| {
                     source.for_each_block(&mut |block| {
@@ -55,43 +56,38 @@ impl OsmNodeBoundsProvider {
                 .add_buffer("pbf_blocks", parse_threads * 2)
                 .sink_to("process", parse_threads, move |blocks| {
                     let mut envelope = Envelope::null();
-                    let (mut nodes, mut ways, mut rels) = (0, 0, 0);
+                    let mut worker = phaser.for_worker();
                     for block in blocks {
                         for element in block.decode_elements()? {
                             match element {
                                 OsmElement::Node(node) => {
-                                    nodes += 1;
+                                    worker.arrive(Phase::Nodes)?;
                                     envelope.expand_to_include(node.lon, node.lat);
                                 }
-                                OsmElement::Way(_) => ways += 1,
-                                OsmElement::Relation(_) => rels += 1,
+                                OsmElement::Way(_) => worker.arrive(Phase::Ways)?,
+                                OsmElement::Relation(_) => worker.arrive(Phase::Relations)?,
                                 OsmElement::Other(_) => {}
                             }
                         }
-                        counters[0].fetch_add(nodes, Ordering::Relaxed);
-                        counters[1].fetch_add(ways, Ordering::Relaxed);
-                        counters[2].fetch_add(rels, Ordering::Relaxed);
-                        (nodes, ways, rels) = (0, 0, 0);
                     }
+                    worker.close()?;
                     envelopes.lock().push(envelope);
                     Ok(())
                 })
         };
 
-        let counter = |i: usize| {
-            let counters = counters.clone();
-            move || counters[i].load(Ordering::Relaxed)
-        };
+        let (p1, p2, p3) = (phaser.clone(), phaser.clone(), phaser.clone());
         let loggers = ProgressLoggers::create()
-            .add_rate_counter("nodes", counter(0))
-            .add_rate_counter("ways", counter(1))
-            .add_rate_counter("rels", counter(2))
+            .add_rate_counter_colored("nodes", move || p1.nodes(), true)
+            .add_rate_counter_colored("ways", move || p2.ways(), true)
+            .add_rate_counter_colored("rels", move || p3.relations(), true)
             .new_line()
             .add_process_stats()
             .new_line()
             .add_pipeline_stats(&pipeline);
 
         pipeline.await_and_log(&loggers, self.config.log_interval)?;
+        phaser.print_summary();
         timer.stop();
 
         let mut all_bounds = Envelope::null();

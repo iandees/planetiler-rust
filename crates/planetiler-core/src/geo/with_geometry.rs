@@ -23,8 +23,14 @@ use crate::geo::unit;
 pub use crate::reader::with_geometry_type::WithGeometryType;
 
 /// Memoized results for the provided methods of [`WithGeometry`].
+///
+/// The memoized values are allocated on first use, so that creating (and moving) a source feature whose derived
+/// geometries are never requested stays cheap (most OSM elements never need them).
 #[derive(Default)]
-pub struct GeometryCache {
+pub struct GeometryCache(OnceLock<Box<CacheEntries>>);
+
+#[derive(Default)]
+struct CacheEntries {
     centroid: OnceLock<GeometryResult<Geometry<f64>>>,
     point_on_surface: OnceLock<GeometryResult<Geometry<f64>>>,
     centroid_if_convex: OnceLock<GeometryResult<Geometry<f64>>>,
@@ -49,6 +55,11 @@ impl std::fmt::Debug for GeometryCache {
 impl GeometryCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[inline]
+    fn get(&self) -> &CacheEntries {
+        self.0.get_or_init(Box::default)
     }
 }
 
@@ -96,14 +107,14 @@ pub trait WithGeometry: WithGeometryType {
 
     /// Area of this feature in world web mercator coordinates where `1` means the area of the entire planet.
     fn area(&self) -> GeometryResult<f64> {
-        cached_f64(&self.geometry_cache().area, || {
+        cached_f64(&self.geometry_cache().get().area, || {
             if self.can_be_polygon() { Ok(geo_utils::area(self.polygon()?).abs()) } else { Ok(0.0) }
         })
     }
 
     /// Length of this feature in world web mercator coordinates where `1` means the circumference of the planet.
     fn length(&self) -> GeometryResult<f64> {
-        cached_f64(&self.geometry_cache().length, || {
+        cached_f64(&self.geometry_cache().get().length, || {
             if self.is_point() || self.can_be_polygon() || self.can_be_line() {
                 Ok(geo_utils::length(self.world_geometry()?))
             } else {
@@ -125,7 +136,7 @@ pub trait WithGeometry: WithGeometryType {
 
     /// The approximate area of the geometry in square meters.
     fn area_meters(&self) -> GeometryResult<f64> {
-        cached_f64(&self.geometry_cache().area_meters, || {
+        cached_f64(&self.geometry_cache().get().area_meters, || {
             if self.is_point() || self.can_be_polygon() || self.can_be_line() {
                 Ok(geo_utils::area_in_meters(self.lat_lon_geometry()?))
             } else {
@@ -136,7 +147,7 @@ pub trait WithGeometry: WithGeometryType {
 
     /// The approximate length of the geometry in meters.
     fn length_meters(&self) -> GeometryResult<f64> {
-        cached_f64(&self.geometry_cache().length_meters, || {
+        cached_f64(&self.geometry_cache().get().length_meters, || {
             if self.is_point() || self.can_be_polygon() || self.can_be_line() {
                 Ok(geo_utils::length_in_meters(self.lat_lon_geometry()?))
             } else {
@@ -177,7 +188,7 @@ pub trait WithGeometry: WithGeometryType {
 
     /// The centroid of this geometry in world coordinates.
     fn centroid(&self) -> GeometryResult<&Geometry<f64>> {
-        cached(&self.geometry_cache().centroid, || {
+        cached(&self.geometry_cache().get().centroid, || {
             let geom = if self.can_be_polygon() {
                 self.polygon()?
             } else if self.can_be_line() {
@@ -191,7 +202,7 @@ pub trait WithGeometry: WithGeometryType {
 
     /// A point on the surface of this geometry (JTS `getInteriorPoint`) in world coordinates.
     fn point_on_surface(&self) -> GeometryResult<&Geometry<f64>> {
-        cached(&self.geometry_cache().point_on_surface, || {
+        cached(&self.geometry_cache().get().point_on_surface, || {
             let geom = if self.can_be_polygon() {
                 self.polygon()?
             } else if self.can_be_line() {
@@ -209,7 +220,7 @@ pub trait WithGeometry: WithGeometryType {
     /// the area. Values between 0.05-0.1 are a good compromise of performance vs. precision.
     fn innermost_point(&self, tolerance: f64) -> GeometryResult<Geometry<f64>> {
         if self.can_be_polygon() {
-            let cache = self.geometry_cache();
+            let cache = self.geometry_cache().get();
             if let Some((tol, point)) = &*cache.innermost_point.lock()
                 && *tol == tolerance
             {
@@ -228,13 +239,13 @@ pub trait WithGeometry: WithGeometryType {
 
     /// The midpoint of this line, or the longest segment if it is a multilinestring.
     fn line_midpoint(&self) -> GeometryResult<&Geometry<f64>> {
-        cached(&self.geometry_cache().line_midpoint, || self.point_along_line(0.5))
+        cached(&self.geometry_cache().get().line_midpoint, || self.point_along_line(0.5))
     }
 
     /// A point along this line where `ratio=0` is the start, `ratio=1` the end and `0.5` the midpoint. When this is
     /// a multilinestring, the longest segment is used.
     fn point_along_line(&self, ratio: f64) -> GeometryResult<Geometry<f64>> {
-        let splitter = self.geometry_cache().line_splitter.get_or_init(|| {
+        let splitter = self.geometry_cache().get().line_splitter.get_or_init(|| {
             let line = self.line()?;
             match line {
                 Geometry::MultiLineString(multi) => match geo_utils::get_longest_line(multi) {
@@ -251,7 +262,7 @@ pub trait WithGeometry: WithGeometryType {
     /// A point inside the geometry: the centroid if it is a convex polygon, otherwise
     /// [`WithGeometry::point_on_surface`].
     fn centroid_if_convex(&self) -> GeometryResult<&Geometry<f64>> {
-        cached(&self.geometry_cache().centroid_if_convex, || {
+        cached(&self.geometry_cache().get().centroid_if_convex, || {
             if !self.can_be_polygon() {
                 return self.centroid().cloned();
             }
@@ -270,7 +281,7 @@ pub trait WithGeometry: WithGeometryType {
         if !self.can_be_line() {
             return Err(GeometryException::non_fatal("feature_not_line", "cannot be line"));
         }
-        match self.geometry_cache().linear_geometry.get_or_init(|| self.compute_line()) {
+        match self.geometry_cache().get().linear_geometry.get_or_init(|| self.compute_line()) {
             Ok(Some(line)) => Ok(line),
             Ok(None) => self.world_geometry(),
             Err(e) => Err(e.clone()),
@@ -287,7 +298,8 @@ pub trait WithGeometry: WithGeometryType {
         }
         match line {
             Geometry::LineString(_) | Geometry::Line(_) => {
-                let splitter = self.geometry_cache().line_splitter.get_or_init(|| LineSplitter::from_geometry(line));
+                let splitter =
+                    self.geometry_cache().get().line_splitter.get_or_init(|| LineSplitter::from_geometry(line));
                 let splitter = splitter.as_ref().map_err(Clone::clone)?;
                 Ok(Geometry::LineString(splitter.get(start, end)))
             }
@@ -300,7 +312,7 @@ pub trait WithGeometry: WithGeometryType {
         if !self.can_be_polygon() {
             return Err(GeometryException::non_fatal("feature_not_polygon", "cannot be polygon"));
         }
-        match self.geometry_cache().polygon_geometry.get_or_init(|| self.compute_polygon()) {
+        match self.geometry_cache().get().polygon_geometry.get_or_init(|| self.compute_polygon()) {
             Ok(Some(polygon)) => Ok(polygon),
             Ok(None) => self.world_geometry(),
             Err(e) => Err(e.clone()),
@@ -313,7 +325,7 @@ pub trait WithGeometry: WithGeometryType {
         if !self.can_be_polygon() {
             return Err(GeometryException::non_fatal("feature_not_polygon", "cannot be polygon"));
         }
-        cached(&self.geometry_cache().valid_polygon, || {
+        cached(&self.geometry_cache().get().valid_polygon, || {
             let polygon = self.polygon()?;
             if geo_utils::is_valid(polygon) { Ok(polygon.clone()) } else { geo_utils::fix_polygon(polygon) }
         })

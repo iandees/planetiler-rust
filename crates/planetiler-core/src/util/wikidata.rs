@@ -1,8 +1,8 @@
 //! Port of `util/Wikidata.java`: a utility to download name translations from wikidata for all OSM elements with a
 //! [wikidata tag](https://wiki.openstreetmap.org/wiki/Key:wikidata).
 //!
-//! TODO(port): Java takes a `Profile` and calls `profile.caresAboutWikidataTranslation(elem)`; here callers pass a
-//! filter closure instead (wire up `|elem| profile.cares_about_wikidata_translation(elem)` once `Profile` is ported).
+//! Java takes a `Profile` and calls `profile.caresAboutWikidataTranslation(elem)`; here the core functions take a
+//! filter closure and [`profile_filter`] / [`fetch_for_profile`] adapt a [`Profile`](crate::profile::Profile).
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -280,6 +280,25 @@ impl<W: Write> Wikidata<W> {
         self.writer.flush()?;
         Ok(())
     }
+}
+
+/// Returns a filter that accepts elements `profile` wants wikidata translations for
+/// ([`Profile::cares_about_wikidata_translation`](crate::profile::Profile::cares_about_wikidata_translation)).
+pub fn profile_filter(
+    profile: std::sync::Arc<dyn crate::profile::Profile>,
+) -> impl Fn(&OsmElement) -> bool + Send + Sync + 'static {
+    move |elem| profile.cares_about_wikidata_translation(elem)
+}
+
+/// Java `Wikidata.fetch(infile, outfile, config, profile, stats)`: [`fetch`] filtered by [`profile_filter`].
+pub fn fetch_for_profile(
+    infile: &OsmInputFile,
+    outfile: &Path,
+    config: &PlanetilerConfig,
+    profile: std::sync::Arc<dyn crate::profile::Profile>,
+    stats: StatsRef,
+) -> anyhow::Result<()> {
+    fetch(infile, outfile, config, profile_filter(profile), stats)
 }
 
 /// Loads any existing translations from `outfile`, then downloads translations for any wikidata element in `infile`

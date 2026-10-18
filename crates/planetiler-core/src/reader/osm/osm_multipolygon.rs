@@ -32,8 +32,7 @@ use crate::geo::is_valid::{Location, locate_in_ring};
 pub const MIN_CLOSE_RING_GAP: f64 = 0.1 / geo_utils::WORLD_CIRCUMFERENCE_METERS;
 
 /// Port of `OsmReader.NodeLocationProvider`: looks up the location of OSM nodes by ID.
-///
-/// TODO(port): `OsmReader` should use (or re-export) this trait once it is ported.
+/// Re-exported as `osm_reader::NodeLocationProvider`; `osm_reader::NodeLocations` implements it.
 pub trait NodeLocationProvider {
     /// Returns the coordinate of node `id`, or an error if it is missing (Java throws `IllegalArgumentException`).
     fn get_coordinate(&self, id: i64) -> anyhow::Result<Coord<f64>>;
