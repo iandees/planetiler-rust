@@ -11,6 +11,7 @@ tracing.workspace = true
 indexmap.workspace = true
 geo.workspace = true
 geo-types.workspace = true
+rstar.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true
@@ -20,9 +21,6 @@ parking_lot.workspace = true
 # StringUtils.stripAccents (NFD) in the place layer
 icu_normalizer = "2.3"
 # used by the temporary feature_merge copy (see src/feature_merge_shim.rs)
-rstar.workspace = true
-hashbrown.workspace = true
-ahash.workspace = true
 
 [[bin]]
 name = "generate_openmaptiles"

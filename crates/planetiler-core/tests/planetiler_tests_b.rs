@@ -7,10 +7,6 @@
 //! testPreprocessOsmNodesAndWays, testOsmProfileFinish, testOsmProfileFinishForwardingProfile, testBadRelation,
 //! testIssue496BaseballMultipolygon, testIssue509LenaDelta, testHandleProfileException) or the `Planetiler`
 //! orchestrator (testPlanetilerRunner*, testPlanetilerMemoryCheck*) are not ported here.
-//!
-//! TODO(port): tests that use `FeatureMerge` (testMergeLineStrings, testMergeLineStringsIgnoresRoundingIntersections,
-//! testMergePolygons, testCombineMultiPoint) are written in the `feature_merge_tests` module below but compiled out
-//! with `#[cfg(any())]` until `feature_merge` is ported (the module is currently empty); remove the `cfg` to enable.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -381,7 +377,6 @@ fn post_process_tile_features() {
     }
 }
 
-#[cfg(any())] // TODO(port): enable once `feature_merge` is ported
 mod feature_merge_tests {
     use planetiler_core::feature_merge;
 

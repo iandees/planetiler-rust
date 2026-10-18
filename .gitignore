@@ -1,5 +1,5 @@
 /target
 /data
-*.mbtiles
-*.pmtiles
+/*.mbtiles
+/*.pmtiles
 /.claude/worktrees
