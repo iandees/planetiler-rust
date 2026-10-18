@@ -5,9 +5,15 @@
 use super::append_store::{AppendStore, Ints, Longs, check_index_in_bounds};
 
 /// Primitive element types that can be stored in an append store.
+///
+/// Encoding and decoding go through bounds-checked byte slices, so an implementation with a wrong `BYTES` can only
+/// produce wrong values or panics, never undefined behavior.
 pub trait Primitive: Copy + Default + Send + Sync + 'static {
     const BYTES: usize;
+    /// Writes this value into `out` (exactly `BYTES` long) in native byte order.
     fn write_ne(self, out: &mut [u8]);
+    /// Reads a value from `bytes` (exactly `BYTES` long) in native byte order.
+    fn read_ne(bytes: &[u8]) -> Self;
 }
 
 impl Primitive for i32 {
@@ -16,6 +22,10 @@ impl Primitive for i32 {
     fn write_ne(self, out: &mut [u8]) {
         out.copy_from_slice(&self.to_ne_bytes());
     }
+    #[inline]
+    fn read_ne(bytes: &[u8]) -> Self {
+        Self::from_ne_bytes(bytes.try_into().expect("primitive width"))
+    }
 }
 
 impl Primitive for i64 {
@@ -23,6 +33,10 @@ impl Primitive for i64 {
     #[inline]
     fn write_ne(self, out: &mut [u8]) {
         out.copy_from_slice(&self.to_ne_bytes());
+    }
+    #[inline]
+    fn read_ne(bytes: &[u8]) -> Self {
+        Self::from_ne_bytes(bytes.try_into().expect("primitive width"))
     }
 }
 

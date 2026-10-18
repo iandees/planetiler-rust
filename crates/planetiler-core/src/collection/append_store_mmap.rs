@@ -106,10 +106,8 @@ impl<T: Primitive> AppendStoreMmap<T> {
     fn get(&self, index: u64) -> T {
         check_index_in_bounds(index, self.size);
         let map = self.mapped().expect("non-empty store has a mapping");
-        debug_assert!((index as usize + 1) * T::BYTES <= map.len());
-        // SAFETY: index < size and the file contains exactly `size` elements of T::BYTES each, so the read is within
-        // the mapping. T is a primitive integer (any bit pattern valid) and read_unaligned has no alignment needs.
-        unsafe { (map.as_ptr() as *const T).add(index as usize).read_unaligned() }
+        let start = index as usize * T::BYTES;
+        T::read_ne(&map[start..start + T::BYTES])
     }
 }
 
@@ -144,5 +142,38 @@ impl Longs for AppendStoreMmap<i64> {
     #[inline]
     fn get_long(&self, index: u64) -> i64 {
         self.get(index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Primitive` whose encoded width differs from its in-memory size: decoding must use `BYTES`, not
+    /// `size_of::<T>()`, and goes through bounds-checked slices.
+    #[derive(Clone, Copy, Default, Debug, PartialEq)]
+    struct ThreeBytes(u32);
+
+    impl Primitive for ThreeBytes {
+        const BYTES: usize = 3;
+        fn write_ne(self, out: &mut [u8]) {
+            out.copy_from_slice(&self.0.to_le_bytes()[..3]);
+        }
+        fn read_ne(bytes: &[u8]) -> Self {
+            ThreeBytes(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]))
+        }
+    }
+
+    #[test]
+    fn decodes_with_encoded_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AppendStoreMmap::<ThreeBytes>::new(&dir.path().join("store"), false).unwrap();
+        for i in 0..1000u32 {
+            store.append(ThreeBytes(i * 7)).unwrap();
+        }
+        for i in 0..1000u32 {
+            assert_eq!(ThreeBytes(i * 7), store.get(i as u64));
+        }
+        assert_eq!(3000, store.disk_usage_bytes());
     }
 }
