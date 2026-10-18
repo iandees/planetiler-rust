@@ -11,17 +11,13 @@
 //!
 //! Differences from Java:
 //! - Functions take the feature list by value (unchanged features are moved to the output, not cloned).
-//! - JTS `BufferOp` (mitre joins, mitre limit 5) is replaced by `geo`'s `Buffer` (backed by `i_overlay`'s outline
-//!   offset) with `LineJoin::Miter(2 * asin(1 / 5))`, the equivalent minimum corner angle. `i_overlay` limits sharp
-//!   corners slightly differently than JTS so buffered vertices can differ by a small fraction of the buffer distance.
-//!   `buffer(0)` uses [`polygon_overlay::buffer_zero`] and union uses [`polygon_overlay::union_all`].
-//! - Negative buffers of a collection with more than one polygon are applied to the union of the polygons (JTS
-//!   treats a collection passed to `BufferOp` as a union; `geo` would offset each polygon independently).
+//! - JTS `BufferOp` (mitre joins) is [`crate::geo::buffer`], a port of JTS's offset curve generation whose raw curves
+//!   are noded and resolved by `i_overlay` (see that module for the small differences). `buffer(0)` uses
+//!   [`polygon_overlay::buffer_zero`] and union uses [`polygon_overlay::union_all`].
 //! - JTS `isWithinDistance` is the envelope check followed by `geo`'s Euclidean distance.
 //! - The adjacency list passed to [`extract_connected_components`] is indexed by item (`&[Vec<usize>]`) instead of a
 //!   hash map.
 
-use geo::algorithm::buffer::{Buffer, BufferStyle, LineJoin};
 use geo::{Area, Distance, Euclidean};
 use geo_types::{Coord, Geometry, LineString, MultiPolygon, Polygon};
 use hashbrown::HashMap;
@@ -29,6 +25,8 @@ use rstar::primitives::{GeomWithData, Rectangle};
 use rstar::{AABB, RTree};
 use tracing::warn;
 
+use crate::geo::buffer::{self, BufferParameters};
+use crate::geo::cascaded_polygon_union;
 use crate::geo::envelope::Envelope;
 use crate::geo::geo_utils;
 use crate::geo::geometry_exception::GeometryResult;
@@ -531,13 +529,13 @@ pub fn buffer_union_unbuffer<G: std::borrow::Borrow<Geometry<f64>>>(
         buffered.push(buffer_geometry(buffer, geometry)?);
     }
     let before_union = geo_utils::create_geometry_collection(buffered);
-    let merged = match polygon_overlay::union_all(&before_union) {
+    let merged = match cascaded_polygon_union::union_geometry(&before_union) {
         Ok(merged) => merged,
         Err(_) => {
             // buffer result is sometimes invalid, which makes union throw so fix it and try again (see #700)
             stats.data_error("buffer_union_unbuffer_union_failed");
             let fixed = polygon_overlay::geometry_fixer(&before_union)?;
-            polygon_overlay::union_all(&fixed)?
+            cascaded_polygon_union::union_geometry(&fixed)?
         }
     };
     let mut merged = unbuffer(buffer, &merged)?;
@@ -552,7 +550,7 @@ pub fn buffer_union_unbuffer<G: std::borrow::Borrow<Geometry<f64>>>(
                 stats.data_error("buffer_union_unbuffer_still_too_small");
                 // and if that still fails, just union all of the input polygons without buffer/unbuffering
                 let all = polygon_group.iter().map(|g| g.borrow().clone()).collect();
-                return polygon_overlay::union_all(&geo_utils::create_geometry_collection(all));
+                return cascaded_polygon_union::union_geometry(&geo_utils::create_geometry_collection(all));
             } else {
                 stats.data_error("buffer_union_unbuffer_too_small");
             }
@@ -564,149 +562,19 @@ pub fn buffer_union_unbuffer<G: std::borrow::Borrow<Geometry<f64>>>(
     Ok(merged)
 }
 
-/// Minimum corner angle that gets a full mitre join, equivalent to the JTS default mitre limit of 5.
-fn mitre_angle() -> f64 {
-    2.0 * (1.0f64 / 5.0).asin()
-}
-
 fn unbuffer(buffer: f64, merged: &Geometry<f64>) -> GeometryResult<Geometry<f64>> {
     buffer_geometry(-buffer, merged)
 }
 
-/// JTS `BufferOp(geom, JOIN_MITRE).getResultGeometry(distance)` for polygonal geometries.
+/// JTS `BufferParameters` with `JOIN_MITRE` (Java `FeatureMerge.bufferOps`).
+const BUFFER_PARAMS: BufferParameters = BufferParameters::mitre();
+
+/// JTS `new BufferOp(geom, bufferOps).getResultGeometry(distance)` for polygonal geometries.
 fn buffer_geometry(distance: f64, geom: &Geometry<f64>) -> GeometryResult<Geometry<f64>> {
     if distance == 0.0 {
         return polygon_overlay::buffer_zero(geom);
     }
-    let mut polys: Vec<Polygon<f64>> =
-        polygon_overlay::polygons_of(geom).into_iter().filter(|p| !p.exterior().0.is_empty()).cloned().collect();
-    if polys.is_empty() {
-        return Ok(polygon_overlay::to_polygonal(vec![]));
-    }
-    if distance < 0.0 && polys.len() > 1 {
-        // JTS buffers a collection as the union of its parts; contracting each part separately would not erase the
-        // boundaries between overlapping parts
-        polys =
-            polygon_overlay::polygons_of(&polygon_overlay::buffer_zero(&Geometry::MultiPolygon(MultiPolygon(polys)))?)
-                .into_iter()
-                .cloned()
-                .collect();
-    }
-    let style = BufferStyle::new(distance).line_join(LineJoin::Miter(mitre_angle()));
-    let tolerance = collinear_tolerance(&polys, distance);
-    let result = if polys.len() == 1 {
-        polys.pop().unwrap().buffer_with_style(style)
-    } else {
-        MultiPolygon(polys).buffer_with_style(style)
-    };
-    let result = result.0.into_iter().filter_map(|p| remove_near_collinear_vertices(p, tolerance)).collect();
-    Ok(polygon_overlay::to_polygonal(result))
-}
-
-/// Tolerance for [`remove_near_collinear_vertices`] on the buffer output of `polys` by `distance`.
-///
-/// geo's `Buffer` (i_overlay) works on an integer grid fitted to the output bounds; its mitre joins emit the two ends
-/// of the adjacent offset segments plus the mitre point, and the two ends are rounded to that grid independently, so
-/// they end up a few grid units off the true (straight) edge. `H * 2^-25` with `H = 0.5 * max(width, height) + 6|d|`
-/// is about 16-32 grid units: well above that rounding error, and far below the offset of any real vertex on the
-/// 1/16 px tile grid.
-fn collinear_tolerance(polys: &[Polygon<f64>], distance: f64) -> f64 {
-    let mut min = Coord { x: f64::INFINITY, y: f64::INFINITY };
-    let mut max = Coord { x: f64::NEG_INFINITY, y: f64::NEG_INFINITY };
-    for c in polys.iter().flat_map(|p| p.exterior().0.iter()) {
-        min = Coord { x: min.x.min(c.x), y: min.y.min(c.y) };
-        max = Coord { x: max.x.max(c.x), y: max.y.max(c.y) };
-    }
-    let half_extent = 0.5 * (max.x - min.x).max(max.y - min.y);
-    (half_extent + 6.0 * distance.abs()) * 2f64.powi(-25)
-}
-
-/// Removes vertices that lie within `tolerance` of the line through their neighbors from the rings of a `geo::Buffer`
-/// output polygon (JTS buffer output never has collinear vertices). Spikes (where the path doubles back) are kept.
-/// Returns `None` if the exterior ring collapses; collapsed holes are dropped.
-fn remove_near_collinear_vertices(poly: Polygon<f64>, tolerance: f64) -> Option<Polygon<f64>> {
-    let (exterior, interiors) = poly.into_inner();
-    let exterior = remove_near_collinear_ring(exterior, tolerance)?;
-    let interiors = interiors.into_iter().filter_map(|r| remove_near_collinear_ring(r, tolerance)).collect();
-    Some(Polygon::new(exterior, interiors))
-}
-
-/// Distance of `b` from the line through `a` and `c`, or `None` if `b` is not between them (a spike, where the path
-/// doubles back at `b`, or a degenerate `a == c`).
-fn collinear_deviation(a: Coord<f64>, b: Coord<f64>, c: Coord<f64>) -> Option<f64> {
-    let (ab, ac, bc) = (b - a, c - a, c - b);
-    let len = ac.x.hypot(ac.y);
-    if len == 0.0 || ab.x * bc.x + ab.y * bc.y <= 0.0 {
-        return None;
-    }
-    Some((ab.x * ac.y - ab.y * ac.x).abs() / len)
-}
-
-/// Removes vertices within `tolerance` of the line through their (remaining) neighbors, smallest deviation first.
-///
-/// Going smallest-first matters at very shallow outside corners: there geo emits three vertices (the two offset
-/// segment ends and the mitre point) that are all within `tolerance` of each other's lines, but only the two ends lie
-/// on the true edges. Removing greedily leaves one of the three (all within `d * tan(angle / 2)` of the corner), which
-/// is then far from the line through the next real vertices on either side and is kept, like the single vertex JTS
-/// emits for such corners.
-fn remove_near_collinear_ring(ring: LineString<f64>, tolerance: f64) -> Option<LineString<f64>> {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-
-    let mut pts = ring.0;
-    if pts.len() > 1 && pts.first() == pts.last() {
-        pts.pop();
-    }
-    let n = pts.len();
-    if n < 3 {
-        return None;
-    }
-    let mut prev: Vec<usize> = (0..n).map(|i| (i + n - 1) % n).collect();
-    let mut next: Vec<usize> = (0..n).map(|i| (i + 1) % n).collect();
-    let mut version = vec![0u32; n];
-    let mut alive = vec![true; n];
-    let mut remaining = n;
-    // deviations are non-negative, so their bit patterns sort like the values
-    let mut heap: BinaryHeap<Reverse<(u64, usize, u32)>> = BinaryHeap::new();
-    let push = |heap: &mut BinaryHeap<_>, i: usize, prev: &[usize], next: &[usize], version: &[u32]| {
-        if let Some(dev) = collinear_deviation(pts[prev[i]], pts[i], pts[next[i]])
-            && dev <= tolerance
-        {
-            heap.push(Reverse((dev.to_bits(), i, version[i])));
-        }
-    };
-    for i in 0..n {
-        push(&mut heap, i, &prev, &next, &version);
-    }
-    while let Some(Reverse((_, i, v))) = heap.pop() {
-        if !alive[i] || v != version[i] {
-            continue;
-        }
-        if remaining <= 3 {
-            return None;
-        }
-        alive[i] = false;
-        remaining -= 1;
-        let (p, q) = (prev[i], next[i]);
-        next[p] = q;
-        prev[q] = p;
-        for j in [p, q] {
-            version[j] += 1;
-            push(&mut heap, j, &prev, &next, &version);
-        }
-    }
-    let start = (0..n).find(|&i| alive[i])?;
-    let mut out = Vec::with_capacity(remaining + 1);
-    let mut i = start;
-    loop {
-        out.push(pts[i]);
-        i = next[i];
-        if i == start {
-            break;
-        }
-    }
-    out.push(pts[start]);
-    Some(LineString(out))
+    buffer::buffer(geom, distance, &BUFFER_PARAMS)
 }
 
 /// Puts all polygons within `geom` over `min_area` into `result`, removing holes under `min_hole_area`.
@@ -1410,9 +1278,7 @@ mod tests {
             };
             validate_geometry(&geometry);
         }
-        // NOTE: buffering is not bit-for-bit identical to JTS so the number of output polygons differs slightly
-        let diff = (total as f64 - expected as f64).abs() / expected as f64;
-        assert!(diff <= 0.01, "expected ~{expected} polygons (Java), got {total}");
+        assert_eq!(expected, total);
     }
 
     #[test]
@@ -1437,6 +1303,453 @@ mod tests {
     #[ignore = "slow in debug builds (~20s); run with --release -- --ignored"]
     fn test_merge_many_polygons_jakarta() {
         merge_many_polygons("jakartabuildings.mbtiles", 6527, 4240, 13, 410);
+    }
+
+    /// Java `FeatureMerge.mergeNearbyPolygons` output for a tile, from `tests/resources/buffer/merge_*.txt.gz`
+    /// (`FEATURE <id> <WKB of the decoded geometry>` per output feature, generated with the planetiler-dist jar).
+    fn read_java_merge(name: &str) -> Vec<(i64, Geometry<f64>)> {
+        let data = gunzip(&std::fs::read(resource(&format!("buffer/{name}"))).unwrap()).unwrap();
+        String::from_utf8(data)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let parts: Vec<&str> = line.split(' ').collect();
+                assert_eq!("FEATURE", parts[0]);
+                let hex = parts[2];
+                let bytes: Vec<u8> =
+                    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+                (parts[1].parse().unwrap(), geo_utils::read_wkb(&bytes).unwrap())
+            })
+            .collect()
+    }
+
+    /// Normalized polygons of a (multi)polygon.
+    fn normalized_parts(geom: &Geometry<f64>) -> Vec<Geometry<f64>> {
+        let mut parts: Vec<Geometry<f64>> = polygon_overlay::polygons_of(geom)
+            .into_iter()
+            .map(|p| crate::geo::normalize::norm(&p.clone().into()))
+            .collect();
+        parts.sort_by(crate::geo::normalize::compare_geometries);
+        parts
+    }
+
+    /// `poly` with exactly collinear vertices (and repeated points) removed from its rings.
+    fn without_collinear(poly: &Geometry<f64>) -> Geometry<f64> {
+        let ring = |r: &LineString<f64>| -> LineString<f64> {
+            let mut pts: Vec<Coord<f64>> = r.0.clone();
+            pts.pop();
+            let mut changed = true;
+            while changed && pts.len() > 3 {
+                changed = false;
+                let n = pts.len();
+                for i in 0..n {
+                    let (a, b, c) = (pts[(i + n - 1) % n], pts[i], pts[(i + 1) % n]);
+                    if a == b || (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x) == 0.0 {
+                        pts.remove(i);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            pts.push(pts[0]);
+            LineString(pts)
+        };
+        let polys = polygon_overlay::polygons_of(poly)
+            .into_iter()
+            .map(|p| Polygon::new(ring(p.exterior()), p.interiors().iter().map(ring).collect()))
+            .collect();
+        crate::geo::normalize::norm(&polygon_overlay::to_polygonal(polys))
+    }
+
+    /// Distinct vertices of a geometry in 1/16 px units.
+    fn vertices_of(geom: &Geometry<f64>) -> Vec<(i64, i64)> {
+        let mut v: Vec<(i64, i64)> = polygon_overlay::polygons_of(geom)
+            .iter()
+            .flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()))
+            .flat_map(|r| r.0.iter().map(|c| ((c.x * 16.0).round() as i64, (c.y * 16.0).round() as i64)))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Runs `merge_nearby_polygons` on a tile and compares every output polygon with Java's, allowing up to
+    /// `max_different_polygons` polygons on each side without an identical one on the other.
+    ///
+    /// The remaining differences (1-2% of the polygons, almost always a single vertex one 1/16 px grid unit off or
+    /// missing) come from where `i_overlay`'s noding of nearly coincident curves differs from JTS's floating point
+    /// noding (clusters of intersection points a few ulps apart that JTS keeps and later rounds differently), and
+    /// from the rare cases where the prediction of JTS's fixed precision fallback is wrong.
+    fn assert_merge_matches_java(
+        expected_file: &str,
+        tile: (&str, u32, u32, u32),
+        args: (f64, f64, f64, f64),
+        max_different_polygons: usize,
+    ) {
+        let expected = read_java_merge(expected_file);
+        let features = read_tile(tile.0, tile.1, tile.2, tile.3);
+        let stats = InMemoryStats::new();
+        let merged = merge_nearby_polygons_with(features, args.0, args.1, args.2, args.3, &stats, None).unwrap();
+        assert_eq!(expected.len(), merged.len(), "feature count");
+        let (mut total, mut java_only, mut rust_only, mut not_collinear_only) = (0, 0, 0, 0);
+        let mut examples = Vec::new();
+        for ((id, java), rust) in expected.iter().zip(&merged) {
+            assert_eq!(*id, rust.id);
+            let rust = rust.geometry.decode().unwrap();
+            let (java, rust) = (normalized_parts(java), normalized_parts(&rust));
+            total += java.len();
+            let rust_simplified: Vec<Geometry<f64>> = rust.iter().map(without_collinear).collect();
+            let rust_unmatched: Vec<&Geometry<f64>> = rust.iter().filter(|p| !java.contains(p)).collect();
+            rust_only += rust_unmatched.len();
+            for p in &java {
+                if !rust.contains(p) {
+                    java_only += 1;
+                    if !rust_simplified.contains(&without_collinear(p)) {
+                        not_collinear_only += 1;
+                    }
+                    // the most similar Rust polygon, and the vertices that differ
+                    let pv = vertices_of(p);
+                    if let Some(r) =
+                        rust_unmatched.iter().max_by_key(|r| vertices_of(r).iter().filter(|v| pv.contains(v)).count())
+                    {
+                        let rv = vertices_of(r);
+                        let jo: Vec<_> = pv.iter().filter(|v| !rv.contains(v)).collect();
+                        let ro: Vec<_> = rv.iter().filter(|v| !pv.contains(v)).collect();
+                        examples.push(format!("{} vertices; java only {jo:?}, rust only {ro:?}", pv.len()));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{expected_file}: {total} polygons, {java_only} only in Java ({not_collinear_only} not just collinear \
+             vertices), {rust_only} only in Rust"
+        );
+        assert!(
+            java_only <= max_different_polygons && rust_only <= max_different_polygons,
+            "{expected_file}: {total} polygons, {java_only} only in Java, {rust_only} only in Rust\n{}",
+            examples.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    #[ignore = "slow in debug builds; run with --release -- --ignored"]
+    fn merge_boston_1_matches_java() {
+        assert_merge_matches_java(
+            "merge_boston_2477_3028.txt.gz",
+            ("bostonbuildings.mbtiles", 2477, 3028, 13),
+            (4.0, 0.0, 0.5, 0.5),
+            15,
+        );
+    }
+
+    #[test]
+    #[ignore = "slow in debug builds; run with --release -- --ignored"]
+    fn merge_boston_2_matches_java() {
+        assert_merge_matches_java(
+            "merge_boston_2481_3026.txt.gz",
+            ("bostonbuildings.mbtiles", 2481, 3026, 13),
+            (4.0, 0.0, 0.5, 0.5),
+            8,
+        );
+    }
+
+    #[test]
+    #[ignore = "slow in debug builds; run with --release -- --ignored"]
+    fn merge_boston_3_matches_java() {
+        assert_merge_matches_java(
+            "merge_boston_2479_3028.txt.gz",
+            ("bostonbuildings.mbtiles", 2479, 3028, 13),
+            (4.0, 0.0, 0.5, 0.5),
+            25,
+        );
+    }
+
+    #[test]
+    #[ignore = "slow in debug builds; run with --release -- --ignored"]
+    fn merge_jakarta_matches_java() {
+        assert_merge_matches_java(
+            "merge_jakarta_6527_4240.txt.gz",
+            ("jakartabuildings.mbtiles", 6527, 4240, 13),
+            (4.0, 0.0, 0.5, 0.5),
+            15,
+        );
+    }
+
+    #[test]
+    fn merge_protomaps538_matches_java() {
+        assert_merge_matches_java(
+            "merge_protomaps538.txt.gz",
+            ("protomaps538lakemerge.mbtiles", 35, 46, 7),
+            (1.0, 1.0, 0.5, 0.0625),
+            3,
+        );
+    }
+
+    /// The buffer/union/unbuffer implementation before the JTS buffer port (`geo::Buffer` with the near-collinear
+    /// vertex removal and a single-pass union), kept to benchmark against.
+    mod legacy {
+        use super::*;
+        use geo::algorithm::buffer::{Buffer, BufferStyle, LineJoin};
+
+        /// Merges nearby polygons by expanding each individual polygon by `buffer`, unioning them, and contracting the
+        /// result.
+        pub(super) fn buffer_union_unbuffer<G: std::borrow::Borrow<Geometry<f64>>>(
+            buffer: f64,
+            polygon_group: &[G],
+            stats: &dyn Stats,
+        ) -> GeometryResult<Geometry<f64>> {
+            // A simpler alternative that might initially appear faster would be:
+            //
+            // merged = unbuffer(buffer, buffer(buffer, collection(polygonGroup)))
+            //
+            // But since buffer() is faster than union() only when the amount of overlap is small, this technique becomes very
+            // slow for merging many small nearby polygons.
+            //
+            // The following approach is slower most of the time, but faster on average because it does not choke on dense
+            // nearby polygons:
+            let mut buffered: Vec<Geometry<f64>> = Vec::with_capacity(polygon_group.len());
+            let mut max_area_before: f64 = 0.0;
+            for geometry in polygon_group {
+                let geometry = geometry.borrow();
+                max_area_before = max_area_before.max(geometry.unsigned_area());
+                buffered.push(buffer_geometry(buffer, geometry)?);
+            }
+            let before_union = geo_utils::create_geometry_collection(buffered);
+            let merged = match polygon_overlay::union_all(&before_union) {
+                Ok(merged) => merged,
+                Err(_) => {
+                    // buffer result is sometimes invalid, which makes union throw so fix it and try again (see #700)
+                    stats.data_error("buffer_union_unbuffer_union_failed");
+                    let fixed = polygon_overlay::geometry_fixer(&before_union)?;
+                    polygon_overlay::union_all(&fixed)?
+                }
+            };
+            let mut merged = unbuffer(buffer, &merged)?;
+            // in extremely rare cases this can make output too small (see https://github.com/locationtech/jts/issues/1183).
+            // Until that issue is fixed, try un-buffering the output of the buffer step before unioning
+            if max_area_before > 100.0 {
+                let area_after = merged.unsigned_area();
+                if area_after < max_area_before * 0.95 {
+                    let merged2 = unbuffer(buffer, &before_union)?;
+                    let area_after2 = merged2.unsigned_area();
+                    if area_after2 < max_area_before * 0.95 {
+                        stats.data_error("buffer_union_unbuffer_still_too_small");
+                        // and if that still fails, just union all of the input polygons without buffer/unbuffering
+                        let all = polygon_group.iter().map(|g| g.borrow().clone()).collect();
+                        return polygon_overlay::union_all(&geo_utils::create_geometry_collection(all));
+                    } else {
+                        stats.data_error("buffer_union_unbuffer_too_small");
+                    }
+                    if area_after2 > area_after {
+                        merged = merged2;
+                    }
+                }
+            }
+            Ok(merged)
+        }
+
+        /// Minimum corner angle that gets a full mitre join, equivalent to the JTS default mitre limit of 5.
+        fn mitre_angle() -> f64 {
+            2.0 * (1.0f64 / 5.0).asin()
+        }
+
+        fn unbuffer(buffer: f64, merged: &Geometry<f64>) -> GeometryResult<Geometry<f64>> {
+            buffer_geometry(-buffer, merged)
+        }
+
+        /// JTS `BufferOp(geom, JOIN_MITRE).getResultGeometry(distance)` for polygonal geometries.
+        fn buffer_geometry(distance: f64, geom: &Geometry<f64>) -> GeometryResult<Geometry<f64>> {
+            if distance == 0.0 {
+                return polygon_overlay::buffer_zero(geom);
+            }
+            let mut polys: Vec<Polygon<f64>> = polygon_overlay::polygons_of(geom)
+                .into_iter()
+                .filter(|p| !p.exterior().0.is_empty())
+                .cloned()
+                .collect();
+            if polys.is_empty() {
+                return Ok(polygon_overlay::to_polygonal(vec![]));
+            }
+            if distance < 0.0 && polys.len() > 1 {
+                // JTS buffers a collection as the union of its parts; contracting each part separately would not erase the
+                // boundaries between overlapping parts
+                polys = polygon_overlay::polygons_of(&polygon_overlay::buffer_zero(&Geometry::MultiPolygon(
+                    MultiPolygon(polys),
+                ))?)
+                .into_iter()
+                .cloned()
+                .collect();
+            }
+            let style = BufferStyle::new(distance).line_join(LineJoin::Miter(mitre_angle()));
+            let tolerance = collinear_tolerance(&polys, distance);
+            let result = if polys.len() == 1 {
+                polys.pop().unwrap().buffer_with_style(style)
+            } else {
+                MultiPolygon(polys).buffer_with_style(style)
+            };
+            let result = result.0.into_iter().filter_map(|p| remove_near_collinear_vertices(p, tolerance)).collect();
+            Ok(polygon_overlay::to_polygonal(result))
+        }
+
+        /// Tolerance for [`remove_near_collinear_vertices`] on the buffer output of `polys` by `distance`.
+        ///
+        /// geo's `Buffer` (i_overlay) works on an integer grid fitted to the output bounds; its mitre joins emit the two ends
+        /// of the adjacent offset segments plus the mitre point, and the two ends are rounded to that grid independently, so
+        /// they end up a few grid units off the true (straight) edge. `H * 2^-25` with `H = 0.5 * max(width, height) + 6|d|`
+        /// is about 16-32 grid units: well above that rounding error, and far below the offset of any real vertex on the
+        /// 1/16 px tile grid.
+        fn collinear_tolerance(polys: &[Polygon<f64>], distance: f64) -> f64 {
+            let mut min = Coord { x: f64::INFINITY, y: f64::INFINITY };
+            let mut max = Coord { x: f64::NEG_INFINITY, y: f64::NEG_INFINITY };
+            for c in polys.iter().flat_map(|p| p.exterior().0.iter()) {
+                min = Coord { x: min.x.min(c.x), y: min.y.min(c.y) };
+                max = Coord { x: max.x.max(c.x), y: max.y.max(c.y) };
+            }
+            let half_extent = 0.5 * (max.x - min.x).max(max.y - min.y);
+            (half_extent + 6.0 * distance.abs()) * 2f64.powi(-25)
+        }
+
+        /// Removes vertices that lie within `tolerance` of the line through their neighbors from the rings of a `geo::Buffer`
+        /// output polygon (JTS buffer output never has collinear vertices). Spikes (where the path doubles back) are kept.
+        /// Returns `None` if the exterior ring collapses; collapsed holes are dropped.
+        fn remove_near_collinear_vertices(poly: Polygon<f64>, tolerance: f64) -> Option<Polygon<f64>> {
+            let (exterior, interiors) = poly.into_inner();
+            let exterior = remove_near_collinear_ring(exterior, tolerance)?;
+            let interiors = interiors.into_iter().filter_map(|r| remove_near_collinear_ring(r, tolerance)).collect();
+            Some(Polygon::new(exterior, interiors))
+        }
+
+        /// Distance of `b` from the line through `a` and `c`, or `None` if `b` is not between them (a spike, where the path
+        /// doubles back at `b`, or a degenerate `a == c`).
+        fn collinear_deviation(a: Coord<f64>, b: Coord<f64>, c: Coord<f64>) -> Option<f64> {
+            let (ab, ac, bc) = (b - a, c - a, c - b);
+            let len = ac.x.hypot(ac.y);
+            if len == 0.0 || ab.x * bc.x + ab.y * bc.y <= 0.0 {
+                return None;
+            }
+            Some((ab.x * ac.y - ab.y * ac.x).abs() / len)
+        }
+
+        /// Removes vertices within `tolerance` of the line through their (remaining) neighbors, smallest deviation first.
+        ///
+        /// Going smallest-first matters at very shallow outside corners: there geo emits three vertices (the two offset
+        /// segment ends and the mitre point) that are all within `tolerance` of each other's lines, but only the two ends lie
+        /// on the true edges. Removing greedily leaves one of the three (all within `d * tan(angle / 2)` of the corner), which
+        /// is then far from the line through the next real vertices on either side and is kept, like the single vertex JTS
+        /// emits for such corners.
+        fn remove_near_collinear_ring(ring: LineString<f64>, tolerance: f64) -> Option<LineString<f64>> {
+            use std::cmp::Reverse;
+            use std::collections::BinaryHeap;
+
+            let mut pts = ring.0;
+            if pts.len() > 1 && pts.first() == pts.last() {
+                pts.pop();
+            }
+            let n = pts.len();
+            if n < 3 {
+                return None;
+            }
+            let mut prev: Vec<usize> = (0..n).map(|i| (i + n - 1) % n).collect();
+            let mut next: Vec<usize> = (0..n).map(|i| (i + 1) % n).collect();
+            let mut version = vec![0u32; n];
+            let mut alive = vec![true; n];
+            let mut remaining = n;
+            // deviations are non-negative, so their bit patterns sort like the values
+            let mut heap: BinaryHeap<Reverse<(u64, usize, u32)>> = BinaryHeap::new();
+            let push = |heap: &mut BinaryHeap<_>, i: usize, prev: &[usize], next: &[usize], version: &[u32]| {
+                if let Some(dev) = collinear_deviation(pts[prev[i]], pts[i], pts[next[i]])
+                    && dev <= tolerance
+                {
+                    heap.push(Reverse((dev.to_bits(), i, version[i])));
+                }
+            };
+            for i in 0..n {
+                push(&mut heap, i, &prev, &next, &version);
+            }
+            while let Some(Reverse((_, i, v))) = heap.pop() {
+                if !alive[i] || v != version[i] {
+                    continue;
+                }
+                if remaining <= 3 {
+                    return None;
+                }
+                alive[i] = false;
+                remaining -= 1;
+                let (p, q) = (prev[i], next[i]);
+                next[p] = q;
+                prev[q] = p;
+                for j in [p, q] {
+                    version[j] += 1;
+                    push(&mut heap, j, &prev, &next, &version);
+                }
+            }
+            let start = (0..n).find(|&i| alive[i])?;
+            let mut out = Vec::with_capacity(remaining + 1);
+            let mut i = start;
+            loop {
+                out.push(pts[i]);
+                i = next[i];
+                if i == start {
+                    break;
+                }
+            }
+            out.push(pts[start]);
+            Some(LineString(out))
+        }
+    }
+
+    /// CPU time of buffer/union/unbuffer + snap on every group of nearby buildings in the Boston/Jakarta tiles, with
+    /// the JTS buffer port and with the previous `geo::Buffer` implementation, and of the whole
+    /// `merge_nearby_polygons` (release: `cargo test --release -p planetiler-core --lib bench_merge_building_tiles --
+    /// --ignored --nocapture`; `BENCH_ITERS` sets the number of iterations).
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_merge_building_tiles() {
+        let tiles = [
+            ("bostonbuildings.mbtiles", 2477, 3028),
+            ("bostonbuildings.mbtiles", 2481, 3026),
+            ("bostonbuildings.mbtiles", 2479, 3028),
+            ("jakartabuildings.mbtiles", 6527, 4240),
+        ];
+        let iterations: usize = std::env::var("BENCH_ITERS").map(|s| s.parse().unwrap()).unwrap_or(5);
+        let cpu = || crate::stats::process_info::get_process_cpu_time().unwrap();
+        let stats = InMemoryStats::new();
+        for (file, x, y) in tiles {
+            let features = read_tile(file, x, y, 13);
+            let geoms: Vec<Geometry<f64>> = features.iter().map(|f| f.geometry.decode().unwrap()).collect();
+            let groups: Vec<Vec<&Geometry<f64>>> =
+                group_polygons_by_proximity(&geoms, 0.5).into_iter().filter(|g| g.len() > 1).collect();
+            let (mut new, mut old, mut full) = (f64::MAX, f64::MAX, f64::MAX);
+            for _ in 0..iterations {
+                let start = cpu();
+                for group in &groups {
+                    let merged = buffer_union_unbuffer(0.5, group, &stats).unwrap();
+                    std::hint::black_box(geo_utils::snap_and_fix_polygon(&merged, &stats, "merge").unwrap());
+                }
+                new = new.min((cpu() - start).as_secs_f64());
+                if std::env::var("BENCH_NEW_ONLY").is_ok() {
+                    continue;
+                }
+                let start = cpu();
+                for group in &groups {
+                    let merged = legacy::buffer_union_unbuffer(0.5, group, &stats).unwrap();
+                    std::hint::black_box(geo_utils::snap_and_fix_polygon(&merged, &stats, "merge").unwrap());
+                }
+                old = old.min((cpu() - start).as_secs_f64());
+                let start = cpu();
+                std::hint::black_box(merge_nearby(features.clone(), 4.0, 0.0, 0.5, 0.5));
+                full = full.min((cpu() - start).as_secs_f64());
+            }
+            eprintln!(
+                "{file} {x}/{y}: {} groups; buffer/union/unbuffer+snap: JTS port {:.1} ms, geo::Buffer {:.1} ms \
+                 ({:+.0}%); merge_nearby_polygons {:.1} ms (min CPU of {iterations})",
+                groups.len(),
+                new * 1000.0,
+                old * 1000.0,
+                (new / old - 1.0) * 100.0,
+                full * 1000.0
+            );
+        }
     }
 
     #[test]
@@ -1490,9 +1803,11 @@ mod tests {
             let area_after = merged.unsigned_area();
             validate_geometry(&merged);
             let ratio = area_after / area_before;
-            // NOTE: Java requires the ratio to be < 1.01, but for 3 of these inputs JTS's negative buffer collapses
-            // (locationtech/jts#1183) so Java falls back to unioning the unbuffered input polygons. The Rust
-            // buffer/union/unbuffer succeeds, which fills sub-pixel gaps between the input polygons (up to ~3% area).
+            // NOTE: Java requires the ratio to be < 1.01, but for 3 of these inputs JTS's floating point noding of the
+            // negative buffer's curves is invalid and, instead of throwing (which would trigger its snap-rounding
+            // fallback), JTS returns an empty result (locationtech/jts#1183), so Java falls back to unioning the
+            // unbuffered input polygons. The port uses the snap-rounding result whenever the noding is invalid,
+            // which fills sub-pixel gaps between the input polygons (up to ~3% area).
             if !(ratio > 0.99 && ratio < 1.03) {
                 failures.push(format!(
                     "{file}: Area changed too much {area_before} -> {area_after} {:?}",
@@ -1899,24 +2214,5 @@ mod tests {
             assert_eq!(r_points, r.exterior().0.len(), "rectangles rotated {degrees}: {r:?}");
             assert_same_normalized_feature(&new_polygon(r_java).into(), &r.into());
         }
-    }
-
-    #[test]
-    fn remove_near_collinear_ring_keeps_corners_and_spikes() {
-        let ring = |c: &[f64]| LineString(c.chunks(2).map(|p| Coord { x: p[0], y: p[1] }).collect::<Vec<_>>());
-        // a point 1e-9 off the bottom edge, and one exactly on the closing edge (the ring's start)
-        let input = ring(&[5.0, 0.0, 10.0, 1e-9, 20.0, 0.0, 20.0, 10.0, 0.0, 10.0, 0.0, 0.0, 5.0, 0.0]);
-        let out = remove_near_collinear_ring(input, 1e-6).unwrap();
-        assert_eq!(ring(&[20.0, 0.0, 20.0, 10.0, 0.0, 10.0, 0.0, 0.0, 20.0, 0.0]), out);
-        // spikes double back so they are kept
-        let spike = ring(&[0.0, 0.0, 10.0, 0.0, 5.0, 0.0, 5.0, 5.0, 0.0, 0.0]);
-        assert_eq!(spike.clone(), remove_near_collinear_ring(spike, 1e-6).unwrap());
-        // a very shallow corner emitted as (offset end, mitre point, offset end) keeps exactly one vertex
-        let input = ring(&[0.0, 0.0, 49.999, 0.0, 50.0, 0.0, 50.001, 0.00001, 100.0, 0.5, 100.0, 50.0, 0.0, 50.0]);
-        let out = remove_near_collinear_ring(input, 1e-5).unwrap();
-        assert_eq!(6, out.0.len(), "{out:?}");
-        assert!(out.0.iter().any(|c| (c.x - 50.0).abs() < 0.002 && c.y.abs() < 0.001), "{out:?}");
-        // degenerate rings collapse
-        assert_eq!(None, remove_near_collinear_ring(ring(&[0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 0.0]), 1e-6));
     }
 }

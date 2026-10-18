@@ -11,6 +11,7 @@ geo-types.workspace = true
 geo-traits.workspace = true
 rstar.workspace = true
 i_overlay.workspace = true
+libm.workspace = true
 wkb.workspace = true
 proj4rs.workspace = true
 prost.workspace = true

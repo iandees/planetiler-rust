@@ -20,6 +20,7 @@ geo-types = "0.7"
 geo-traits = "0.3"
 rstar = "0.13"
 i_overlay = "9"
+libm = "0.2"
 wkb = "0.9"
 proj4rs = "0.1"
 

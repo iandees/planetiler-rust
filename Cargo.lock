@@ -2090,6 +2090,7 @@ dependencies = [
  "indexmap",
  "libc",
  "libdeflater",
+ "libm",
  "lz4_flex",
  "memmap2",
  "num_cpus",

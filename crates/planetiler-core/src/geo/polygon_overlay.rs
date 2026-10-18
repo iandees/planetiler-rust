@@ -38,9 +38,10 @@ struct Grid {
     round: bool,
 }
 
-/// Largest absolute integer coordinate allowed for each engine (with a safety margin below the documented limits).
+/// Largest absolute integer coordinate allowed for each engine: `i_overlay` supports `2^(N - 2)` for an N-bit
+/// engine and uses `2^(N - 3)` itself for its float adapters; the i32 limit has an extra safety margin.
 const I32_LIMIT: f64 = (1u64 << 28) as f64;
-const I64_LIMIT: f64 = (1u64 << 59) as f64;
+const I64_LIMIT: f64 = (1u64 << 61) as f64;
 
 impl Grid {
     #[inline]
@@ -69,12 +70,17 @@ fn max_abs_coord<'a>(polys: impl Iterator<Item = &'a Polygon<f64>>) -> f64 {
 }
 
 /// A grid that represents coordinates with (nearly) full double precision.
+///
+/// The largest power of 2 such that `max_abs * scale <= 2^61` (`I64_LIMIT`). Every coordinate with magnitude at
+/// least `max_abs / 2^9` is represented exactly (its ulp is a multiple of the grid unit), e.g. everything >= 1 in
+/// magnitude for tile coordinates up to 512. This matters where edges are collinear or a vertex lies on another edge
+/// in double precision: rounding to a coarser grid can turn that into a spurious crossing or move the vertex to the
+/// other side of the edge, which changes which vertices end up in the output (JTS works on the doubles).
 fn exact_grid(max_abs: f64) -> Grid {
     if max_abs == 0.0 || !max_abs.is_finite() {
         return Grid { scale: 1.0, round: false };
     }
-    // largest power of 2 such that max_abs * scale <= 2^52 (exactly representable, below the i64 limit)
-    let exp = 52 - (max_abs.log2().ceil() as i32);
+    let exp = 61 - (max_abs.log2().ceil() as i32);
     Grid { scale: 2f64.powi(exp), round: false }
 }
 
@@ -387,21 +393,32 @@ impl HotPixel {
 /// TODO(port): JTS also adds hot pixels for segment intersections (and vertices within a tiny tolerance of other
 /// segments); here those are only rounded by the integer overlay.
 fn snap_rounded_contours(polys: &[&Polygon<f64>], grid: Grid) -> Vec<Contour> {
-    let rings: Vec<(&LineString<f64>, bool)> = polys
+    let rings: Vec<(&[Coord<f64>], Option<bool>)> = polys
         .iter()
         .filter(|p| !p.exterior().0.is_empty())
-        .flat_map(|p| std::iter::once((p.exterior(), true)).chain(p.interiors().iter().map(|h| (h, false))))
+        .flat_map(|p| {
+            std::iter::once((p.exterior().0.as_slice(), Some(true)))
+                .chain(p.interiors().iter().map(|h| (h.0.as_slice(), Some(false))))
+        })
         .collect();
-    let mut pixels: Vec<(i64, i64)> = rings.iter().flat_map(|(r, _)| r.0.iter().map(|c| grid.to_int(*c))).collect();
+    snap_round_rings(&rings, &[], grid)
+}
+
+/// Snap-rounds `rings` to `grid` (see [`snap_rounded_contours`]) with `extra_pixels` (in grid units) as additional
+/// hot pixels. Each ring is oriented counter-clockwise (`Some(true)`), clockwise (`Some(false)`) or kept as is
+/// (`None`).
+fn snap_round_rings(rings: &[(&[Coord<f64>], Option<bool>)], extra_pixels: &[(i64, i64)], grid: Grid) -> Vec<Contour> {
+    let mut pixels: Vec<(i64, i64)> = rings.iter().flat_map(|(r, _)| r.iter().map(|c| grid.to_int(*c))).collect();
+    pixels.extend_from_slice(extra_pixels);
     pixels.sort_unstable();
     pixels.dedup();
     let index = rstar::RTree::bulk_load(pixels.iter().map(|&(x, y)| HotPixel { x, y }).collect());
     let scaled = |c: &Coord<f64>| (c.x * grid.scale, c.y * grid.scale);
     let mut out = Vec::with_capacity(rings.len());
     let mut nodes: Vec<(f64, (i64, i64))> = Vec::new();
-    for (ring, shell) in rings {
-        let mut contour: Contour = Vec::with_capacity(ring.0.len());
-        for w in ring.0.windows(2) {
+    for &(ring, orientation) in rings {
+        let mut contour: Contour = Vec::with_capacity(ring.len());
+        for w in ring.windows(2) {
             let (a, b) = (grid.to_int(w[0]), grid.to_int(w[1]));
             if contour.last() != Some(&a) {
                 contour.push(a);
@@ -433,7 +450,10 @@ fn snap_rounded_contours(polys: &[&Polygon<f64>], grid: Grid) -> Vec<Contour> {
         if contour.len() > 1 && contour.first() == contour.last() {
             contour.pop();
         }
-        out.push(oriented(contour, shell));
+        out.push(match orientation {
+            Some(ccw) => oriented(contour, ccw),
+            None => contour,
+        });
     }
     out
 }
@@ -446,6 +466,283 @@ pub fn buffer_zero(geom: &Geometry<f64>) -> GeometryResult<Geometry<f64>> {
     let contours = Contours { subject: positive_contours(&polys, grid), clip: vec![] };
     let max_int = max_abs_coord(polys.iter().copied()) * grid.scale;
     Ok(to_polygonal(overlay(&contours, grid, max_int, OverlayRule::Subject, FillRule::Positive, true)?))
+}
+
+/// Nodes a set of closed curves (which may self-intersect and overlap) and returns the region where their winding
+/// number is positive, i.e. counter-clockwise curves add area and clockwise curves remove it. This is how JTS's
+/// `BufferBuilder` turns raw offset curves into the buffer polygon (it keeps edges with depth >= 1 on one side and
+/// <= 0 on the other).
+pub fn positive_winding_region(curves: &[Vec<Coord<f64>>]) -> GeometryResult<Vec<Polygon<f64>>> {
+    let mut max = 0f64;
+    for c in curves.iter().flatten() {
+        max = max.max(c.x.abs()).max(c.y.abs());
+    }
+    let grid = exact_grid(max);
+    let mut subject = Vec::with_capacity(curves.len());
+    for curve in curves {
+        let mut contour: Contour = Vec::with_capacity(curve.len());
+        for c in curve {
+            let p = grid.to_int(*c);
+            if contour.last() != Some(&p) {
+                contour.push(p);
+            }
+        }
+        if contour.len() > 1 && contour.first() == contour.last() {
+            contour.pop();
+        }
+        subject.push(contour);
+    }
+    let contours = Contours { subject, clip: vec![] };
+    let mut result = overlay(&contours, grid, max * grid.scale, OverlayRule::Subject, FillRule::Positive, true)?;
+    // JTS's raw curves have the interior on their right (like the output shells), the reverse of `curves`
+    let reversed: Vec<Vec<Coord<f64>>> = curves.iter().map(|c| c.iter().rev().copied().collect()).collect();
+    InputEdges::new(reversed.iter().map(|c| c.as_slice()), max).match_jts(&mut result);
+    Ok(result)
+}
+
+type SegmentTree = rstar::RTree<rstar::primitives::GeomWithData<rstar::primitives::Rectangle<[f64; 2]>, (u32, u32)>>;
+
+/// Position of an output edge along the input rings: `(ring, segment, parameter along the segment)`.
+type EdgePosition = (u32, u32, f64);
+
+#[inline]
+fn position_lt(a: EdgePosition, b: EdgePosition) -> bool {
+    (a.0, a.1) < (b.0, b.1) || ((a.0, a.1) == (b.0, b.1) && a.2 < b.2)
+}
+
+#[inline]
+fn coord_key(c: &Coord<f64>) -> (u64, u64) {
+    (c.x.to_bits(), c.y.to_bits())
+}
+
+/// [`positive_winding_region`] with JTS's fixed precision noding (`ScaledNoder(SnapRoundingNoder)` at `scale`):
+/// every curve vertex and every intersection between curve segments is a hot pixel on the `1 / scale` grid, curve
+/// segments are noded at the hot pixels they pass through, and the output is on the grid. The curves' vertices
+/// should already be rounded to the grid.
+pub fn positive_winding_region_snap_rounded(
+    curves: &[Vec<Coord<f64>>],
+    intersections: &[Coord<f64>],
+    scale: f64,
+) -> GeometryResult<Vec<Polygon<f64>>> {
+    let grid = Grid { scale, round: true };
+    let mut max = 0f64;
+    for c in curves.iter().flatten() {
+        max = max.max(c.x.abs()).max(c.y.abs());
+    }
+    let extra: Vec<(i64, i64)> = intersections.iter().map(|c| grid.to_int(*c)).collect();
+    let rings: Vec<(&[Coord<f64>], Option<bool>)> = curves.iter().map(|c| (c.as_slice(), None)).collect();
+    let contours = Contours { subject: snap_round_rings(&rings, &extra, grid), clip: vec![] };
+    overlay(&contours, grid, max * scale + 1.0, OverlayRule::Subject, FillRule::Positive, true)
+}
+
+/// The edges of the input rings of an overlay, used to make the output vertices and ring start points match what
+/// JTS's overlay / buffer builders produce for the same input.
+struct InputEdges<'a> {
+    rings: Vec<&'a [Coord<f64>]>,
+    /// input vertex -> index in `occurrences` of its last occurrence
+    vertices: hashbrown::HashMap<(u64, u64), u32>,
+    /// (ring, index) of each vertex occurrence, and the index of the previous occurrence of the same vertex
+    occurrences: Vec<((u32, u32), u32)>,
+    tree: std::cell::OnceCell<SegmentTree>,
+    tolerance: f64,
+}
+
+impl<'a> InputEdges<'a> {
+    fn new(rings: impl Iterator<Item = &'a [Coord<f64>]>, max_abs: f64) -> InputEdges<'a> {
+        let rings: Vec<&[Coord<f64>]> = rings.collect();
+        let n: usize = rings.iter().map(|r| r.len()).sum();
+        let mut vertices: hashbrown::HashMap<(u64, u64), u32> = hashbrown::HashMap::with_capacity(n);
+        let mut occurrences = Vec::with_capacity(n);
+        for (r, ring) in rings.iter().enumerate() {
+            // the closing vertex of a closed ring is its first vertex (and starts no segment)
+            let len = if ring.len() > 1 && ring[0] == ring[ring.len() - 1] { ring.len() - 1 } else { ring.len() };
+            for (s, c) in ring[..len].iter().enumerate() {
+                let index = occurrences.len() as u32;
+                let previous = vertices.insert(coord_key(c), index).unwrap_or(u32::MAX);
+                occurrences.push(((r as u32, s as u32), previous));
+            }
+        }
+        InputEdges {
+            rings,
+            vertices,
+            occurrences,
+            tree: std::cell::OnceCell::new(),
+            tolerance: max_abs * 2f64.powi(-40),
+        }
+    }
+
+    /// The segment `s` of ring `r` (the closing segment wraps around for unclosed rings), or `None` past the end.
+    #[inline]
+    fn segment(&self, r: u32, s: u32) -> Option<(Coord<f64>, Coord<f64>)> {
+        let ring = self.rings[r as usize];
+        let s = s as usize;
+        if s + 1 < ring.len() {
+            Some((ring[s], ring[s + 1]))
+        } else if s + 1 == ring.len() && ring.len() > 1 && ring[0] != ring[s] {
+            Some((ring[s], ring[0]))
+        } else {
+            None
+        }
+    }
+
+    fn tree(&self) -> &SegmentTree {
+        use rstar::primitives::{GeomWithData, Rectangle};
+        self.tree.get_or_init(|| {
+            let mut items = Vec::new();
+            for (r, ring) in self.rings.iter().enumerate() {
+                for s in 0..ring.len() {
+                    if let Some((a, b)) = self.segment(r as u32, s as u32)
+                        && a != b
+                    {
+                        let rect = Rectangle::from_corners([a.x, a.y], [b.x, b.y]);
+                        items.push(GeomWithData::new(rect, (r as u32, s as u32)));
+                    }
+                }
+            }
+            rstar::RTree::bulk_load(items)
+        })
+    }
+
+    /// Input segments within the tolerance of `c`.
+    fn segments_near(&self, c: Coord<f64>, out: &mut Vec<(u32, u32)>) {
+        use crate::geo::cg_algorithms::point_to_segment;
+        let t = self.tolerance;
+        let envelope = rstar::AABB::from_corners([c.x - t, c.y - t], [c.x + t, c.y + t]);
+        out.clear();
+        for item in self.tree().locate_in_envelope_intersecting(envelope) {
+            let (r, s) = item.data;
+            let (a, b) = self.segment(r, s).expect("indexed segment");
+            if point_to_segment(c, a, b) <= t {
+                out.push((r, s));
+            }
+        }
+    }
+
+    /// Replaces the output vertices that are not input vertices (the intersection points between input edges,
+    /// which `i_overlay` computes on its integer grid with a few ulps of error) with the intersection point JTS
+    /// computes for the same pair of input segments (`RobustLineIntersector`, double-double arithmetic), so that
+    /// results that land exactly on a rounding boundary later (e.g. half a tile pixel unit) round the same way as in
+    /// Java.
+    fn refine_intersection_vertices(&self, polys: &mut [Polygon<f64>]) {
+        use crate::geo::cg_algorithms::{LineIntersector, distance};
+        let is_new = |c: &Coord<f64>| !self.vertices.contains_key(&coord_key(c));
+        let mut li = LineIntersector::new();
+        let mut candidates: Vec<(u32, u32)> = Vec::new();
+        let mut refine = |c: &mut Coord<f64>| {
+            self.segments_near(*c, &mut candidates);
+            let mut best: Option<(f64, Coord<f64>)> = None;
+            for (n, &i) in candidates.iter().enumerate() {
+                for &j in &candidates[n + 1..] {
+                    let (p1, p2) = self.segment(i.0, i.1).expect("indexed segment");
+                    let (q1, q2) = self.segment(j.0, j.1).expect("indexed segment");
+                    li.compute_intersection(p1, p2, q1, q2);
+                    for k in 0..li.intersection_num() as usize {
+                        let p = li.intersection(k);
+                        let d = distance(p, *c);
+                        if d <= self.tolerance && best.is_none_or(|(bd, _)| d < bd) {
+                            best = Some((d, p));
+                        }
+                    }
+                }
+            }
+            if let Some((_, p)) = best {
+                *c = p;
+            }
+        };
+        let fix_ring = |ring: &mut LineString<f64>, refine: &mut dyn FnMut(&mut Coord<f64>)| {
+            let n = ring.0.len();
+            if n < 2 {
+                return;
+            }
+            let mut changed = false;
+            for c in &mut ring.0[..n - 1] {
+                if is_new(c) {
+                    refine(c);
+                    changed = true;
+                }
+            }
+            ring.0[n - 1] = ring.0[0];
+            if changed {
+                // two output vertices within a few ulps of the same intersection collapse into one
+                ring.0.dedup();
+            }
+        };
+        for poly in polys.iter_mut() {
+            poly.exterior_mut(|r| fix_ring(r, &mut refine));
+            poly.interiors_mut(|rings| rings.iter_mut().for_each(|r| fix_ring(r, &mut refine)));
+        }
+    }
+
+    /// Position of the output edge `p -> q` along the input rings (the first input segment it follows forward), or
+    /// `None` if there is none.
+    fn edge_position(&self, p: Coord<f64>, q: Coord<f64>, scratch: &mut Vec<(u32, u32)>) -> Option<EdgePosition> {
+        use crate::geo::cg_algorithms::point_to_segment;
+        let mut best: Option<EdgePosition> = None;
+        let consider = |r: u32, s: u32, best: &mut Option<EdgePosition>| {
+            let Some((a, b)) = self.segment(r, s) else { return };
+            let (dx, dy) = (b.x - a.x, b.y - a.y);
+            if a == b || dx * (q.x - p.x) + dy * (q.y - p.y) <= 0.0 || point_to_segment(q, a, b) > self.tolerance {
+                return;
+            }
+            let key = (r, s, ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy));
+            if best.is_none_or(|b| position_lt(key, b)) {
+                *best = Some(key);
+            }
+        };
+        if let Some(&last) = self.vertices.get(&coord_key(&p)) {
+            let mut index = last;
+            while index != u32::MAX {
+                let ((r, s), previous) = self.occurrences[index as usize];
+                consider(r, s, &mut best);
+                index = previous;
+            }
+        }
+        if best.is_none() {
+            self.segments_near(p, scratch);
+            for &(r, s) in scratch.iter() {
+                consider(r, s, &mut best);
+            }
+        }
+        best
+    }
+
+    /// Rotates each output ring to start where JTS's overlay graph would start it: at the start of the result edge
+    /// that comes first along the input rings (JTS builds each result ring from the first result edge in the order
+    /// the noded input edges were added to the graph).
+    fn rotate_to_jts_start(&self, polys: &mut [Polygon<f64>]) {
+        let mut scratch = Vec::new();
+        let mut rotate = |ring: &mut LineString<f64>| {
+            let n = ring.0.len();
+            if n < 4 {
+                return;
+            }
+            let mut best: Option<(usize, EdgePosition)> = None;
+            for i in 0..n - 1 {
+                if let Some(key) = self.edge_position(ring.0[i], ring.0[i + 1], &mut scratch)
+                    && best.is_none_or(|(_, b)| position_lt(key, b))
+                {
+                    best = Some((i, key));
+                }
+            }
+            if let Some((start, _)) = best
+                && start != 0
+            {
+                ring.0.pop();
+                ring.0.rotate_left(start);
+                ring.0.push(ring.0[0]);
+            }
+        };
+        for poly in polys.iter_mut() {
+            poly.exterior_mut(&mut rotate);
+            poly.interiors_mut(|rings| rings.iter_mut().for_each(&mut rotate));
+        }
+    }
+
+    /// [`Self::refine_intersection_vertices`] then [`Self::rotate_to_jts_start`].
+    fn match_jts(&self, polys: &mut [Polygon<f64>]) {
+        self.refine_intersection_vertices(polys);
+        self.rotate_to_jts_start(polys);
+    }
 }
 
 /// Equivalent of JTS `GeometryPrecisionReducer.reduce(geom, precisionModel)`.
@@ -567,6 +864,33 @@ fn collect_fixed_non_polygonal(geom: &Geometry<f64>, out: &mut Vec<Geometry<f64>
     }
 }
 
+/// Union of two (each valid) polygonal geometries like JTS's classic `OverlayOp.overlayOp(a, b, UNION)`: the
+/// intersection points between their edges are the ones JTS computes for the same pair of input segments.
+pub fn union_pair(a: &[Polygon<f64>], b: &[Polygon<f64>]) -> GeometryResult<Vec<Polygon<f64>>> {
+    let bounds =
+        |polys: &[Polygon<f64>]| {
+            polys.iter().map(|p| ring_bounds(p.exterior())).fold(
+                (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
+                |(a, b, c, d), (e, f, g, h)| (a.min(e), b.min(f), c.max(g), d.max(h)),
+            )
+        };
+    let (ea, eb) = (bounds(a), bounds(b));
+    if ea.0 > eb.2 || eb.0 > ea.2 || ea.1 > eb.3 || eb.1 > ea.3 {
+        // disjoint envelopes: JTS's result rings are the input rings (each one an unsplit result edge)
+        return Ok(a.iter().chain(b).cloned().collect());
+    }
+    let pa: Vec<&Polygon<f64>> = a.iter().collect();
+    let pb: Vec<&Polygon<f64>> = b.iter().collect();
+    let max = max_abs_coord(pa.iter().chain(pb.iter()).copied());
+    let grid = exact_grid(max);
+    let contours = Contours { subject: positive_contours(&pa, grid), clip: positive_contours(&pb, grid) };
+    let mut result = overlay(&contours, grid, max * grid.scale, OverlayRule::Union, FillRule::Positive, true)?;
+    let rings =
+        a.iter().chain(b).flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors())).map(|r| r.0.as_slice());
+    InputEdges::new(rings, max).match_jts(&mut result);
+    Ok(result)
+}
+
 fn boolean_op(a: &Geometry<f64>, b: &Geometry<f64>, rule: OverlayRule) -> GeometryResult<Geometry<f64>> {
     let pa = polygons_of(a);
     let pb = polygons_of(b);
@@ -587,7 +911,10 @@ pub fn union_all(geom: &Geometry<f64>) -> GeometryResult<Geometry<f64>> {
     let max = max_abs_coord(polys.iter().copied());
     let grid = exact_grid(max);
     let contours = Contours { subject: positive_contours(&polys, grid), clip: vec![] };
-    Ok(to_polygonal(overlay(&contours, grid, max * grid.scale, OverlayRule::Subject, FillRule::NonZero, true)?))
+    let mut result = overlay(&contours, grid, max * grid.scale, OverlayRule::Subject, FillRule::NonZero, true)?;
+    let rings = polys.iter().flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors())).map(|r| r.0.as_slice());
+    InputEdges::new(rings, max).refine_intersection_vertices(&mut result);
+    Ok(to_polygonal(result))
 }
 
 /// Polygons in `a` minus polygons in `b`.

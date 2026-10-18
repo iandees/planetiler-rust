@@ -1,3 +1,6 @@
+pub mod buffer;
+pub mod cascaded_polygon_union;
+pub mod cg_algorithms;
 pub mod crs;
 pub mod douglas_peucker_simplifier;
 pub mod dual_midpoint_smoother;
