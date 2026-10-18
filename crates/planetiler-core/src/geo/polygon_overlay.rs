@@ -165,11 +165,69 @@ fn shapes_to_polygons<I: OverlayInt + Into<i64>>(shapes: IntShapes<I>, grid: Gri
         }
         LineString(coords)
     };
-    shapes
+    let polys = shapes
         .into_iter()
         .filter(|shape| !shape.is_empty())
         .map(|shape| Polygon::new(ring(&shape[0]), shape[1..].iter().map(|c| ring(c)).collect()))
-        .collect()
+        .collect();
+    rebind_misplaced_holes(polys)
+}
+
+/// `(min_x, min_y, max_x, max_y)` of a ring.
+fn ring_bounds(ring: &LineString<f64>) -> (f64, f64, f64, f64) {
+    ring.0.iter().fold((f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |(a, b, c, d), p| {
+        (a.min(p.x), b.min(p.y), c.max(p.x), d.max(p.y))
+    })
+}
+
+fn ring_area_abs(ring: &LineString<f64>) -> f64 {
+    (ring.0.windows(2).map(|w| w[0].x * w[1].y - w[1].x * w[0].y).sum::<f64>() / 2.0).abs()
+}
+
+fn bounds_cover(outer: (f64, f64, f64, f64), inner: (f64, f64, f64, f64)) -> bool {
+    outer.0 <= inner.0 && outer.1 <= inner.1 && outer.2 >= inner.2 && outer.3 >= inner.3
+}
+
+/// Works around `i_overlay` (9.1, OGC mode) occasionally attaching holes to the wrong shell of a multi-shape result
+/// (seen on complex shorelines, e.g. `mdshore.wkb` / `njshore.wkb` in `PlanetilerTests`), which makes the output an
+/// invalid multipolygon. If any hole is not within its shell's envelope, every hole is re-bound to the smallest shell
+/// that contains it.
+fn rebind_misplaced_holes(polys: Vec<Polygon<f64>>) -> Vec<Polygon<f64>> {
+    if polys.len() < 2 {
+        return polys;
+    }
+    let shell_bounds: Vec<_> = polys.iter().map(|p| ring_bounds(p.exterior())).collect();
+    let misplaced =
+        polys.iter().zip(&shell_bounds).any(|(p, &sb)| p.interiors().iter().any(|h| !bounds_cover(sb, ring_bounds(h))));
+    if !misplaced {
+        return polys;
+    }
+    let shell_areas: Vec<f64> = polys.iter().map(|p| ring_area_abs(p.exterior())).collect();
+    let mut shells = Vec::with_capacity(polys.len());
+    let mut holes = Vec::new();
+    for (i, p) in polys.into_iter().enumerate() {
+        let (exterior, interiors) = p.into_inner();
+        shells.push(exterior);
+        holes.extend(interiors.into_iter().map(|h| (i, h)));
+    }
+    let mut holes_for_shell: Vec<Vec<LineString<f64>>> = vec![Vec::new(); shells.len()];
+    for (original, hole) in holes {
+        let hb = ring_bounds(&hole);
+        let parent = (0..shells.len())
+            .filter(|&s| bounds_cover(shell_bounds[s], hb))
+            .filter(|&s| {
+                let shell = &shells[s].0;
+                hole.0
+                    .iter()
+                    .map(|c| crate::geo::is_valid::locate_in_ring(*c, shell))
+                    .find(|l| *l != crate::geo::is_valid::Location::Boundary)
+                    == Some(crate::geo::is_valid::Location::Interior)
+            })
+            .min_by(|&a, &b| shell_areas[a].total_cmp(&shell_areas[b]))
+            .unwrap_or(original);
+        holes_for_shell[parent].push(hole);
+    }
+    shells.into_iter().zip(holes_for_shell).map(|(shell, holes)| Polygon::new(shell, holes)).collect()
 }
 
 fn overlay(
@@ -408,6 +466,27 @@ mod tests {
 
     fn poly(coords: &[f64]) -> Geometry<f64> {
         new_polygon(coords).into()
+    }
+
+    #[test]
+    fn rebind_misplaced_holes_moves_hole_to_containing_shell() {
+        let big = rectangle(0.0, 10.0);
+        let small = rectangle(20.0, 21.0);
+        let hole = LineString::from(rectangle_coord_list(2.0, 3.0));
+        let island = rectangle(4.0, 6.0);
+        let island_hole = LineString::from(rectangle_coord_list(4.5, 5.0));
+        let lake = LineString::from(rectangle_coord_list(3.5, 6.5));
+        // holes attached to the wrong shells
+        let input = vec![
+            Polygon::new(big.exterior().clone(), vec![]),
+            Polygon::new(small.exterior().clone(), vec![hole.clone(), lake.clone(), island_hole.clone()]),
+            Polygon::new(island.exterior().clone(), vec![]),
+        ];
+        let result = rebind_misplaced_holes(input);
+        assert_eq!(vec![hole, lake], result[0].interiors());
+        assert!(result[1].interiors().is_empty());
+        assert_eq!(vec![island_hole], result[2].interiors());
+        assert!(is_valid(&MultiPolygon(result).into()));
     }
 
     #[test]
