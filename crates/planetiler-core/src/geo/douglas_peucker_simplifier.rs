@@ -124,3 +124,69 @@ impl GeometryPipeline for DouglasPeuckerSimplifier {
         self.simplify(input)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geo::test_utils::*;
+    use geo::{CoordsIter, Rotate};
+    use geo_types::Point;
+
+    const ROTATIONS: [f64; 5] = [0.0, 45.0, 90.0, 180.0, 270.0];
+
+    fn test_simplify(input: Geometry<f64>, expected: Geometry<f64>, amount: f64) {
+        let polygonal = matches!(input, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
+        for rotation in ROTATIONS {
+            let origin = Point::new(0.0, 0.0);
+            let exp_rot = expected.rotate_around_point(rotation, origin);
+            let in_rot = input.rotate_around_point(rotation, origin);
+            assert_same_normalized_feature(&exp_rot, &simplify(&in_rot, amount));
+
+            // ensure the coordinate list version also works...
+            let in_list: Vec<Coord<f64>> = in_rot.coords_iter().collect();
+            let exp_list: Vec<Coord<f64>> = exp_rot.coords_iter().collect();
+            assert_eq!(exp_list, simplify_coords(&in_list, amount, polygonal), "rotation={rotation}");
+        }
+    }
+
+    #[test]
+    fn dont_modify_point() {
+        test_simplify(new_point(1.0, 1.0).into(), new_point(1.0, 1.0).into(), 1.0);
+    }
+
+    #[test]
+    fn simplify_2_points() {
+        test_simplify(
+            new_line_string(&[0.0, 0.0, 10.0, 10.0]).into(),
+            new_line_string(&[0.0, 0.0, 10.0, 10.0]).into(),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn remove_a_point() {
+        test_simplify(
+            new_line_string(&[0.0, 0.0, 5.0, 0.9, 10.0, 0.0]).into(),
+            new_line_string(&[0.0, 0.0, 10.0, 0.0]).into(),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn keep_a_point() {
+        test_simplify(
+            new_line_string(&[0.0, 0.0, 5.0, 1.1, 10.0, 0.0]).into(),
+            new_line_string(&[0.0, 0.0, 5.0, 1.1, 10.0, 0.0]).into(),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn polygon_leave_a_point() {
+        test_simplify(
+            rectangle(0.0, 10.0).into(),
+            new_polygon(&[0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 0.0]).into(),
+            20.0,
+        );
+    }
+}

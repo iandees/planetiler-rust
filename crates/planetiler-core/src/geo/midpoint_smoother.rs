@@ -74,3 +74,71 @@ impl GeometryPipeline for MidpointSmoother {
         copy.transform(input)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::geo::test_utils::round;
+    use geo_types::{LineString, Point, Polygon};
+
+    /// Minimal WKT reader for `POINT`, `LINESTRING` and `POLYGON` test fixtures.
+    pub(crate) fn wkt(input: &str) -> Geometry<f64> {
+        let input = input.trim();
+        let open = input.find('(').expect("missing (");
+        let kind = input[..open].trim().to_ascii_uppercase();
+        let body = input[open..].trim();
+        let parse_coords = |s: &str| -> Vec<Coord<f64>> {
+            s.trim_matches(|c: char| c == '(' || c == ')' || c.is_whitespace())
+                .split(',')
+                .map(|pair| {
+                    let mut it = pair.split_whitespace().map(|v| v.parse::<f64>().expect("bad number"));
+                    Coord { x: it.next().unwrap(), y: it.next().unwrap() }
+                })
+                .collect()
+        };
+        match kind.as_str() {
+            "POINT" => Geometry::Point(Point(parse_coords(body)[0])),
+            "LINESTRING" => Geometry::LineString(LineString(parse_coords(body))),
+            "POLYGON" => {
+                let inner = &body[1..body.len() - 1];
+                let mut rings: Vec<LineString<f64>> =
+                    inner.split(')').filter(|s| s.contains('(')).map(|s| LineString(parse_coords(s))).collect();
+                let shell = rings.remove(0);
+                Geometry::Polygon(Polygon::new(shell, rings))
+            }
+            other => panic!("unsupported wkt type {other}"),
+        }
+    }
+
+    fn check(input: &str, expected: &str, iters: usize) {
+        let result = MidpointSmoother::new().set_iters(iters).apply(&wkt(input));
+        assert_eq!(round(&wkt(expected)), round(&result), "{input}");
+    }
+
+    #[test]
+    fn midpoint_smooth() {
+        for (input, output) in [
+            ("POINT(1 1)", "POINT(1 1)"),
+            ("LINESTRING(0 0, 10 10)", "LINESTRING(0 0, 10 10)"),
+            ("LINESTRING(0 0, 10 0, 10 10)", "LINESTRING(0 0, 5 0, 10 5, 10 10)"),
+            ("LINESTRING(0 0, 10 0, 10 10, 0 10)", "LINESTRING(0 0, 5 0, 10 5, 5 10, 0 10)"),
+            ("POLYGON((0 0, 10 0, 10 10, 0 0))", "POLYGON((5 0, 10 5, 5 5, 5 0))"),
+            ("POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))", "POLYGON((5 0, 10 5, 5 10, 0 5, 5 0))"),
+        ] {
+            check(input, output, 1);
+        }
+    }
+
+    #[test]
+    fn midpoint_smooth_twice() {
+        for (input, output) in [
+            ("POINT(1 1)", "POINT(1 1)"),
+            ("LINESTRING(0 0, 10 10)", "LINESTRING(0 0, 10 10)"),
+            ("LINESTRING(0 0, 10 0, 10 10)", "LINESTRING(0 0, 2.5 0, 7.5 2.5, 10 7.5, 10 10)"),
+            ("POLYGON((0 0, 10 0, 10 10, 0 0))", "POLYGON ((7.5 2.5, 7.5 5, 5 2.5, 7.5 2.5))"),
+            ("POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))", "POLYGON ((7.5 2.5, 7.5 7.5, 2.5 7.5, 2.5 2.5, 7.5 2.5))"),
+        ] {
+            check(input, output, 2);
+        }
+    }
+}
