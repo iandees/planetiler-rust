@@ -58,8 +58,7 @@ impl Bounds {
     }
 
     fn compute_tile_extents(&self) -> TileExtents {
-        // TODO(port): limit to tiles covered by `shape` once render::tiled_geometry::get_covered_tiles exists
-        TileExtents::compute_from_world_bounds(MAX_MAXZOOM, &self.world_bounds())
+        TileExtents::compute_from_world_bounds_with_shape(MAX_MAXZOOM, &self.world_bounds(), self.shape.as_deref())
     }
 
     pub fn add_fallback_provider(&mut self, provider: &dyn BoundsProvider) -> &mut Self {

@@ -5,11 +5,9 @@
 //! the northwest corner and `(1, 1)` is the southeast corner of the planet.
 //!
 //! Implementors provide [`WithGeometry::world_geometry`], [`WithGeometry::lat_lon_geometry`], the geometry type
-//! predicates and a [`GeometryCache`] (returned from [`WithGeometry::geometry_cache`]) that the provided methods use
+//! predicates (supertrait [`WithGeometryType`]) and a [`GeometryCache`] (returned from [`WithGeometry::geometry_cache`]) that the provided methods use
 //! to memoize results. [`WithGeometry::compute_line`] and [`WithGeometry::compute_polygon`] can be overridden (Java's
 //! protected `computeLine` / `computePolygon`).
-// TODO(port): Java's WithGeometry implements reader.WithGeometryType; the type predicates are declared here directly
-// until that trait exists (implementors can forward one to the other).
 
 use std::sync::OnceLock;
 
@@ -22,6 +20,7 @@ use crate::geo::interior_point;
 use crate::geo::line_splitter::LineSplitter;
 use crate::geo::maximum_inscribed_circle;
 use crate::geo::unit;
+pub use crate::reader::with_geometry_type::WithGeometryType;
 
 /// Memoized results for the provided methods of [`WithGeometry`].
 #[derive(Default)]
@@ -31,8 +30,8 @@ pub struct GeometryCache {
     centroid_if_convex: OnceLock<GeometryResult<Geometry<f64>>>,
     innermost_point: Mutex<Option<(f64, Geometry<f64>)>>,
     line_midpoint: OnceLock<GeometryResult<Geometry<f64>>>,
-    linear_geometry: OnceLock<GeometryResult<Geometry<f64>>>,
-    polygon_geometry: OnceLock<GeometryResult<Geometry<f64>>>,
+    linear_geometry: OnceLock<GeometryResult<Option<Geometry<f64>>>>,
+    polygon_geometry: OnceLock<GeometryResult<Option<Geometry<f64>>>>,
     valid_polygon: OnceLock<GeometryResult<Geometry<f64>>>,
     area: OnceLock<GeometryResult<f64>>,
     length: OnceLock<GeometryResult<f64>>,
@@ -69,37 +68,30 @@ fn point_or_empty(c: Option<geo_types::Coord<f64>>) -> Geometry<f64> {
     c.map_or_else(geo_utils::empty_point, |c| Geometry::Point(Point(c)))
 }
 
-pub trait WithGeometry {
+pub trait WithGeometry: WithGeometryType {
     /// This geometry in world web mercator coordinates.
     fn world_geometry(&self) -> GeometryResult<&Geometry<f64>>;
 
     /// This geometry in latitude/longitude degree coordinates.
     fn lat_lon_geometry(&self) -> GeometryResult<&Geometry<f64>>;
 
-    /// True if this can be interpreted as a point or multipoint.
-    fn is_point(&self) -> bool;
-
-    /// True if this can be interpreted as a polygon or multipolygon.
-    fn can_be_polygon(&self) -> bool;
-
-    /// True if this can be interpreted as a line string or multilinestring.
-    fn can_be_line(&self) -> bool;
-
     /// Storage for the memoized results of the provided methods.
     fn geometry_cache(&self) -> &GeometryCache;
 
-    /// Computes this feature as a line string or multilinestring in world coordinates.
-    fn compute_line(&self) -> GeometryResult<Geometry<f64>> {
+    /// Computes this feature as a line string or multilinestring in world coordinates, or `None` if
+    /// [`WithGeometry::world_geometry`] can be used as-is (avoids copying the geometry).
+    fn compute_line(&self) -> GeometryResult<Option<Geometry<f64>>> {
         let world = self.world_geometry()?;
         match world {
-            Geometry::LineString(_) | Geometry::MultiLineString(_) | Geometry::Line(_) => Ok(world.clone()),
-            other => geo_utils::polygon_to_line_string(other),
+            Geometry::LineString(_) | Geometry::MultiLineString(_) | Geometry::Line(_) => Ok(None),
+            other => geo_utils::polygon_to_line_string(other).map(Some),
         }
     }
 
-    /// Computes this feature as a polygon or multipolygon in world coordinates.
-    fn compute_polygon(&self) -> GeometryResult<Geometry<f64>> {
-        self.world_geometry().cloned()
+    /// Computes this feature as a polygon or multipolygon in world coordinates, or `None` if
+    /// [`WithGeometry::world_geometry`] can be used as-is (avoids copying the geometry).
+    fn compute_polygon(&self) -> GeometryResult<Option<Geometry<f64>>> {
+        Ok(None)
     }
 
     /// Area of this feature in world web mercator coordinates where `1` means the area of the entire planet.
@@ -278,7 +270,11 @@ pub trait WithGeometry {
         if !self.can_be_line() {
             return Err(GeometryException::non_fatal("feature_not_line", "cannot be line"));
         }
-        cached(&self.geometry_cache().linear_geometry, || self.compute_line())
+        match self.geometry_cache().linear_geometry.get_or_init(|| self.compute_line()) {
+            Ok(Some(line)) => Ok(line),
+            Ok(None) => self.world_geometry(),
+            Err(e) => Err(e.clone()),
+        }
     }
 
     /// A partial line string from `start` to `end` where 0 is the beginning of the line and 1 is the end.
@@ -304,7 +300,11 @@ pub trait WithGeometry {
         if !self.can_be_polygon() {
             return Err(GeometryException::non_fatal("feature_not_polygon", "cannot be polygon"));
         }
-        cached(&self.geometry_cache().polygon_geometry, || self.compute_polygon())
+        match self.geometry_cache().polygon_geometry.get_or_init(|| self.compute_polygon()) {
+            Ok(Some(polygon)) => Ok(polygon),
+            Ok(None) => self.world_geometry(),
+            Err(e) => Err(e.clone()),
+        }
     }
 
     /// This feature as a valid polygon or multipolygon in world coordinates. Validating and fixing invalid polygons
@@ -348,6 +348,12 @@ impl WithGeometry for FromWorld {
         Ok(self.lat_lon_geometry.get_or_init(|| geo_utils::world_to_lat_lon_coords(&self.world_geometry)))
     }
 
+    fn geometry_cache(&self) -> &GeometryCache {
+        &self.cache
+    }
+}
+
+impl WithGeometryType for FromWorld {
     fn is_point(&self) -> bool {
         matches!(self.world_geometry, Geometry::Point(_) | Geometry::MultiPoint(_))
     }
@@ -361,10 +367,6 @@ impl WithGeometry for FromWorld {
 
     fn can_be_line(&self) -> bool {
         matches!(self.world_geometry, Geometry::LineString(_) | Geometry::MultiLineString(_) | Geometry::Line(_))
-    }
-
-    fn geometry_cache(&self) -> &GeometryCache {
-        &self.cache
     }
 }
 
