@@ -124,3 +124,56 @@ fn add_interpolated(
     let ratio = (position - start_pos) / (end_pos - start_pos);
     result.add_point(p1.x + (p2.x - p1.x) * ratio, p1.y + (p2.y - p1.y) * ratio);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geo::test_utils::*;
+
+    #[test]
+    fn single_segment() {
+        for (start, end) in [(0.0, 1.0), (0.0, 0.25), (0.75, 1.0), (0.25, 0.75)] {
+            let l = LineSplitter::new(new_line_string(&[0.0, 0.0, 2.0, 1.0]));
+            assert_eq!(new_line_string(&[start * 2.0, start, end * 2.0, end]), l.get(start, end));
+        }
+    }
+
+    #[test]
+    fn length2() {
+        let l = LineSplitter::new(new_line_string(&[0.0, 0.0, 1.0, 2.0, 2.0, 4.0]));
+        assert_eq!(new_line_string(&[0.0, 0.0, 0.5, 1.0]), l.get(0.0, 0.25));
+        assert_eq!(new_line_string(&[0.2, 0.4, 0.5, 1.0]), l.get(0.1, 0.25));
+        assert_eq!(new_line_string(&[0.5, 1.0, 1.0, 2.0]), l.get(0.25, 0.5));
+        assert_eq!(new_line_string(&[0.5, 1.0, 1.0, 2.0, 1.5, 3.0]), l.get(0.25, 0.75));
+        assert_eq!(new_line_string(&[1.0, 2.0, 1.5, 3.0]), l.get(0.5, 0.75));
+        assert_eq!(new_line_string(&[1.2, 2.4, 1.5, 3.0]), l.get(0.6, 0.75));
+        assert_eq!(new_line_string(&[1.5, 3.0, 2.0, 4.0]), l.get(0.75, 1.0));
+    }
+
+    #[test]
+    fn distance_along_line() {
+        for ratio in [0.0, 0.00001, 0.1, 0.49999, 0.5, 0.50001, 0.9, 0.99999, 1.0] {
+            let l = LineSplitter::new(new_line_string(&[0.0, 0.0, 1.0, 0.5, 2.0, 1.0]));
+            assert_eq!(
+                round(&new_point(ratio * 2.0, ratio).into()),
+                round(&l.get_point(ratio).into()),
+                "ratio={ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid() {
+        let l = LineSplitter::new(new_line_string(&[0.0, 0.0, 1.0, 2.0, 2.0, 4.0]));
+        for (start, end) in [(-0.1, 0.5), (0.9, 1.1), (0.6, 0.5)] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| l.get(start, end)));
+            assert!(result.is_err(), "{start} to {end}");
+        }
+    }
+
+    #[test]
+    fn from_geometry_rejects_non_lines() {
+        assert!(LineSplitter::from_geometry(&new_point(0.0, 0.0).into()).is_err());
+        assert!(LineSplitter::from_geometry(&new_line_string(&[0.0, 0.0, 1.0, 1.0]).into()).is_ok());
+    }
+}
