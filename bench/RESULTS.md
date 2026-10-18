@@ -174,6 +174,34 @@ Previous pass: `benchmark_osm_read` 0.57s/7.7s CPU (fast) or 1.39s/19.1s CPU (sl
 
 ## History (before/after of notable optimizations)
 
+- **OSM pass 2 / pass 1 / sort / archive / RSS pass after `cb984fd` (Rust only; the tables above are still the
+  `cb984fd` numbers until the next full pass).** Interleaved A/B, `cb984fd` vs `c91867b`, 4 runs each on a shared
+  machine (load 8-15 from other builds; medians [min-max], stage wall from log timestamps, CPU = user+sys of the
+  process). Output byte-identical (`cmp` of the Switzerland and Monaco mbtiles; `planetiler compare`: 0 tile diffs).
+  - Switzerland: 15.8s [15.4-17.0] / 177s CPU -> 11.8s [11.5-12.5] / 134s CPU, peak RSS 4.0 GB both. osm_pass1
+    1.35s -> 0.91s (ways sub-phase 0.6s at 4.7 cores -> 0.2s at 12.6), osm_pass2 7.54s -> 4.57s (100-104s -> 59-63s
+    CPU; ways 5s / 69s CPU -> 3s / 38s, nodes 18s -> 10s CPU, relations 15s -> 12s CPU), sort 0.84s -> 0.62s,
+    archive 4.13s -> 3.83s (52s -> 49s CPU).
+  - Monaco: 1.70s / 11.2s CPU / 1.20 GB -> 1.65s / 11.1s / 0.84 GB peak RSS.
+  - Pass 2 hotspots found with `sample` (Switzerland, ways phase): the shared attribute-key `CommonStringEncoder`
+    (`RwLock` + SipHash, every rendered feature) was ~17% of pass 2 CPU -> per-encoder-thread caches; the
+    multipolygon-way multimap's global lock (one lock per way, ~4s CPU spinning) -> per-thread batches flushed
+    before the relations phase; the single temp-feature writer thread spent 2/3 of its time in `write()`, so
+    processing threads blocked on its queue -> a background I/O thread per chunk file; snap rounding built an
+    R-tree of hot pixels for every tile polygon -> sorted arrays; multipolygon ring nesting ran a full prepared
+    DE-9IM relate per candidate ring -> vertex location when the (valid) rings' edges do not meet; SipHash in the
+    MultiExpression indexes and `MatchAny` -> foldhash; the mountain_peak US test recomputed the Natural Earth US
+    bounding box per peak. Pass 1: ways were preprocessed by the single node-writer thread -> on the parse threads
+    (after all earlier blocks finished preprocessing nodes).
+  - Archive: building `merge_nearby_polygons` is ~86% of z13 encode time (buffer/union in `geo`/`i_overlay`, not
+    changed here); the proximity grouping skips self-distances, computes each pair once and shortcuts pairs that
+    share a vertex or contain each other's first vertex (~15% -> ~12% of z12-z14 encode samples). Command decoding and the
+    housenumber Java-HashMap-order sort were tightened.
+  - Monaco RSS: the parallel inflater's in-flight chunks were not the main cost (capping them to 4-8 chunks saves
+    0.1-0.16 GB but slows water_polygons linearly, 0.38s -> 0.62s at 8 and 0.94s at 5). Most of the 1.2 GB peak
+    was the Natural Earth sqlite file: every reader connection kept its memory map until all tables were read, so
+    the whole ~850 MB file was resident at the end; connections now unmap after each table (same speed).
+
 Older numbers, kept only to show what changed; the tables above supersede - **Previous quiet-machine pass (2026-10-17, `c116961`, system malloc, before the simple-source and allocator
   changes).** Switzerland: Rust 26.6s [26.2-27.0] / 205s CPU / 5.81 GB vs Java 37.1s / 306s / 9.63 GB (1.39x).
   Monaco: Rust 11.6s / 22.7s CPU vs Java 14.4s / 20.6s (1.24x, Rust used 10% more CPU). Rust stages (Switzerland):
