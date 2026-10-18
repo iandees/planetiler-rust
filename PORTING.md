@@ -88,6 +88,13 @@ See the table at the bottom of this file; update it as modules are completed.
   `LineString`; geo has no empty point so `EMPTY_POINT` is an empty `MultiPoint`.
 - CRS support (`geo::crs`) is limited to EPSG:4326/4269/3857 (+aliases), PROJ strings via `proj4rs`, and simple
   `GEOGCS`/web-mercator `PROJCS` WKT.
+- JTS `Polygonizer` -> `geo::polygonizer::Polygonizer` (`new()` / `with_extract_only_polygonal(bool)`,
+  `set_check_rings_valid`, `add_geometry` / `add_all` / `add_line`, then `polygons()`, `geometry()`, `dangles()`,
+  `cut_edges()`, `invalid_ring_lines()`; ports `PolygonizeGraph`, `EdgeRing`, `HoleAssigner` and the `planargraph`
+  pieces they use, with all of JTS `PolygonizerTest`). Input must be noded, as in JTS. Directed edges are visited in
+  insertion order (JTS uses a `HashSet`, so ring discovery order and start points vary between JVM runs); badly-noded
+  input stops a ring walk instead of tripping a JTS assertion. Used by OpenMapTiles `boundary` to build country
+  polygons for `adm0_l`/`adm0_r` exactly like Java (polygonize the relation's ways, union the faces).
 - `LoopLineMerger` stores both directions of an edge as one pair (`id ^ 1` is the reverse) sharing a coordinate range
   in one arena, node edge lists are inline for up to 4 edges, and node lookup uses one `hashbrown` map; output is
   identical to the straight port. `VWSimplifier` reuses thread-local scratch buffers.
@@ -565,8 +572,6 @@ point/order; scripts in the orchestrator port's final report):
 
 - Replace `planetiler-openmaptiles/src/feature_merge_shim.rs` with `planetiler_core::feature_merge` once FeatureMerge
   merges; drop the crate's `rstar`/`hashbrown`/`ahash` deps.
-- Port JTS `Polygonizer` into core and use it for OpenMapTiles boundary country polygons (currently a line-merge +
-  union stand-in that drops rings closing only through a node shared by 3+ ways).
 - Move `Verify.checkMinFeatureCount`/`getNumFeatures` from `planetiler-openmaptiles/src/util/verify_monaco.rs` to
   `planetiler_core::mbtiles::verify`.
 - Unify the two `VectorLayer` types (`archive::tile_archive_metadata` and `util::layer_attr_stats`).

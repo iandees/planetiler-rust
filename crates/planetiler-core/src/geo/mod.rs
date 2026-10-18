@@ -17,6 +17,7 @@ pub mod normalize;
 pub mod point_index;
 pub mod polygon_index;
 pub mod polygon_overlay;
+pub mod polygonizer;
 pub mod precision_model;
 pub mod simplify_method;
 pub mod test_utils;

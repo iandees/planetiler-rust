@@ -17,14 +17,13 @@
 //!    which country is on the left and right side of each way, then emit the way with ADM0_L and ADM0_R keys set.
 //! 5. Before emitting boundary lines, merge linestrings with the same tags.
 //!
-//! Differences from Java: JTS `Polygonizer` is approximated by merging each region's ways with JTS-style
-//! `LineMerger` and turning every closed ring into a polygon before unioning them (JTS also fills holes because
-//! it unions the hole faces back in). Rings that only close through a node shared by 3+ ways are dropped.
+//! Country polygons are built like Java: the region's ways go through a port of JTS `Polygonizer`
+//! ([`planetiler_core::geo::polygonizer`]) and the resulting faces are unioned.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use geo_types::{Coord, Geometry, LineString, MultiPolygon, Point, Polygon};
+use geo_types::{Coord, Geometry, LineString, Point};
 use indexmap::IndexMap;
 use parking_lot::{Mutex, RwLock};
 use planetiler_core::config::planetiler_config::PlanetilerConfig;
@@ -33,6 +32,7 @@ use planetiler_core::forwarding_profile::{FinishHandler, Handler, LayerPostProce
 use planetiler_core::geo::geo_utils;
 use planetiler_core::geo::geometry_exception::GeometryResult;
 use planetiler_core::geo::polygon_overlay;
+use planetiler_core::geo::polygonizer::Polygonizer;
 use planetiler_core::profile::FeatureConsumer;
 use planetiler_core::reader::osm::osm_element::Relation;
 use planetiler_core::reader::osm::osm_relation_info::OsmRelationInfo;
@@ -219,29 +219,17 @@ impl Boundary {
         info!("Creating polygons for {} boundaries", region_geometries.len());
         let mut country_boundaries = HashMap::new();
         for (region_id, lines) in region_geometries {
-            // TODO(port): JTS Polygonizer; approximated by merging lines into rings
-            let mut merger = LineMerger::new();
-            for line in lines {
-                merger.add(line);
-            }
-            let polygons: Vec<Polygon<f64>> = merger
-                .get_merged_line_strings()
-                .into_iter()
-                .filter(|l| l.0.len() >= 4 && l.is_closed())
-                .map(|l| Polygon::new(l, vec![]))
-                .collect();
-            let combined = if polygons.is_empty() {
-                None
-            } else {
-                match polygon_overlay::union_all(&MultiPolygon(polygons).into()) {
-                    Ok(combined) => Some(combined),
-                    Err(e) => {
-                        warn!("Unable to build boundary polygon for OSM relation {region_id}: {e:?}");
-                        continue;
-                    }
+            let mut polygonizer = Polygonizer::new();
+            polygonizer.add_all(lines);
+            let polygons = polygonizer.geometry();
+            let combined = match polygon_overlay::union_all(&polygons) {
+                Ok(combined) => combined,
+                Err(e) => {
+                    warn!("Unable to build boundary polygon for OSM relation {region_id}: {e:?}");
+                    continue;
                 }
             };
-            match combined.as_ref().and_then(PreparedPolygon::new) {
+            match PreparedPolygon::new(&combined) {
                 Some(prepared) => {
                     country_boundaries.insert(*region_id, prepared);
                 }
@@ -1134,6 +1122,30 @@ mod tests {
             &[tags! {"adm0_l" => "C1", "adm0_r" => "<null>"}, tags! {"adm0_r" => "C1", "adm0_l" => "<null>"}],
             &features.iter().map(|f| &f.z5).collect::<Vec<_>>(),
         );
+    }
+
+    /// A country ring split into 2 ways that meet at nodes shared with a third way (here, dangles), so the ring only
+    /// closes through nodes of degree 3. Java's `Polygonizer` still forms the polygon (a line merger would not).
+    #[test]
+    fn test_country_ring_through_shared_nodes() {
+        let t = LayerTest::new();
+        let country1 = country(1, "C1");
+        for coords in [
+            &[10.0, 10.0, 0.0, 10.0, 0.0, 0.0, 10.0, 0.0][..],
+            &[10.0, 0.0, 10.0, 10.0],
+            &[10.0, 10.0, 15.0, 15.0],
+            &[10.0, 0.0, 15.0, -5.0],
+        ] {
+            let line = new_line_string(coords);
+            assert_features(14, &[], &t.process(&fake_osm(line, Tags::default(), 3, infos(&t, &country1))));
+        }
+        let features = finish(&t);
+        assert_eq!(4, features.len());
+        let labeled = features
+            .iter()
+            .filter(|f| get(&f.z5, "adm0_l") == Some("C1") || get(&f.z5, "adm0_r") == Some("C1"))
+            .count();
+        assert_eq!(2, labeled);
     }
 
     #[test]
