@@ -3,8 +3,13 @@
 use std::fmt;
 use std::sync::Arc;
 
+use geo::MapCoords;
+use geo_types::{Coord, Geometry};
+
 use crate::geo::envelope::Envelope;
+use crate::geo::geo_utils;
 use crate::geo::tile_coord::TileCoord;
+use crate::render::tiled_geometry::TiledGeometry;
 
 /// Predicate over tile `(x, y)` at a fixed zoom (Java's `TilePredicate`).
 pub type TilePredicate = Arc<dyn Fn(u32, u32) -> bool + Send + Sync>;
@@ -101,6 +106,32 @@ impl TileExtents {
         Self::compute_from_world_bounds_with(maxzoom, world_bounds, None)
     }
 
+    /// Compute tile extents from a world-coordinate (0-1) bounding box, limited to tiles that intersect `shape` (in
+    /// latitude/longitude coordinates) if present (Java's `computeFromWorldBounds(maxzoom, worldBounds, shape)`).
+    ///
+    /// # Panics
+    ///
+    /// If `shape` is invalid in a way that prevents slicing it into tiles.
+    pub fn compute_from_world_bounds_with_shape(
+        maxzoom: u32,
+        world_bounds: &Envelope,
+        shape: Option<&Geometry<f64>>,
+    ) -> TileExtents {
+        let Some(shape) = shape else {
+            return Self::compute_from_world_bounds(maxzoom, world_bounds);
+        };
+        let mercator = geo_utils::lat_lon_to_world_coords(shape);
+        let mut filter = |for_zoom: &ForZoom| -> TilePredicate {
+            let scale = (1u64 << for_zoom.z) as f64;
+            let scaled = mercator.map_coords(|c| Coord { x: c.x * scale, y: c.y * scale });
+            let covered = TiledGeometry::get_covered_tiles(&scaled, for_zoom.z, for_zoom)
+                .unwrap_or_else(|e| panic!("Invalid geometry: {e:?}"));
+            tracing::info!("prepareShapeForZoom z{} {}", for_zoom.z, covered);
+            covered.into_predicate()
+        };
+        Self::compute_from_world_bounds_with(maxzoom, world_bounds, Some(&mut filter))
+    }
+
     pub fn get_for_zoom(&self, zoom: u32) -> &ForZoom {
         &self.zoom_extents[zoom as usize]
     }
@@ -134,5 +165,74 @@ mod tests {
         assert_eq!((1, 1, 2, 2), (z2.min_x, z2.min_y, z2.max_x, z2.max_y));
         assert!(e.test_xyz(1, 1, 2));
         assert!(!e.test_xyz(2, 1, 2));
+    }
+
+    const EPS: f64 = 1.0 / (1u64 << 30) as f64;
+
+    fn assert_extents(e: &TileExtents, f: impl Fn(u32) -> (u32, u32, u32, u32)) {
+        for z in 0..=14 {
+            let z_e = e.get_for_zoom(z);
+            assert_eq!(f(z), (z_e.min_x, z_e.max_x, z_e.min_y, z_e.max_y), "z{z}");
+        }
+    }
+
+    #[test]
+    fn test_full_world() {
+        let e = TileExtents::compute_from_world_bounds(14, &geo_utils::WORLD_BOUNDS);
+        assert_extents(&e, |z| (0, 1 << z, 0, 1 << z));
+    }
+
+    #[test]
+    fn top_left() {
+        let e = TileExtents::compute_from_world_bounds(14, &Envelope::new(0.0, EPS, 0.0, EPS));
+        assert_extents(&e, |_| (0, 1, 0, 1));
+    }
+
+    #[test]
+    fn top_right() {
+        let e = TileExtents::compute_from_world_bounds(14, &Envelope::new(1.0 - EPS, 1.0, 0.0, EPS));
+        assert_extents(&e, |z| ((1 << z) - 1, 1 << z, 0, 1));
+    }
+
+    #[test]
+    fn test_bottom_left() {
+        let e = TileExtents::compute_from_world_bounds(14, &Envelope::new(0.0, EPS, 1.0 - EPS, 1.0));
+        assert_extents(&e, |z| (0, 1, (1 << z) - 1, 1 << z));
+    }
+
+    #[test]
+    fn test_shape() {
+        use crate::geo::test_utils::new_polygon;
+        let size = 1.0 / (1u64 << 14) as f64;
+        let shape = geo_utils::world_to_lat_lon_coords(
+            &new_polygon(&[
+                0.5,
+                0.5 - size * 5.0,
+                0.5 + size * 5.0,
+                0.5,
+                0.5,
+                0.5 + size * 5.0,
+                0.5 - size * 5.0,
+                0.5,
+                0.5,
+                0.5 - size * 5.0,
+            ])
+            .into(),
+        );
+        let e = TileExtents::compute_from_world_bounds_with_shape(
+            14,
+            &Envelope::new(0.5 - size * 4.0, 0.5 + size * 4.0, 0.5 - size * 4.0, 0.5 + size * 4.0),
+            Some(&shape),
+        );
+        for z in 0..=14 {
+            let middle = (1 << z) / 2;
+            assert!(e.test_xyz(middle, middle, z), "z{z}");
+        }
+        // inside shape and bounds
+        assert!(e.test_xyz((1 << 13) + 3, 1 << 13, 14));
+        // inside shape but outside bounds
+        assert!(!e.test_xyz((1 << 13) + 4, 1 << 13, 14));
+        // inside bounds, outside shape
+        assert!(!e.test_xyz((1 << 13) + 3, (1 << 13) + 3, 14));
     }
 }

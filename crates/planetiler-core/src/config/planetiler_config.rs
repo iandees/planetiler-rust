@@ -139,9 +139,8 @@ impl PlanetilerConfig {
         if let Some(polygon_file) =
             arguments.file_opt("polygon", "a .poly file that limits output to tiles intersecting the shape")
         {
-            // TODO(port): parse with reader::osm::poly_file_reader once it is ported, then call bounds.set_shape(shape)
-            let _ = &mut bounds;
-            anyhow::bail!("--polygon is not supported yet: {}", polygon_file.display());
+            let shape = crate::reader::osm::poly_file_reader::parse_poly_file(&polygon_file)?;
+            bounds.set_shape(geo_types::Geometry::MultiPolygon(shape));
         }
 
         let minzoom = arguments.get_integer("minzoom", "minimum zoom level", MIN_MINZOOM as i32)?;
