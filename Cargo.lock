@@ -1661,9 +1661,11 @@ name = "planetiler-benchmarks"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam-channel",
  "geo",
  "geo-types",
  "indexmap",
+ "libc",
  "planetiler-core",
  "tracing",
 ]
@@ -1687,6 +1689,7 @@ dependencies = [
  "i_overlay 9.1.0",
  "indexmap",
  "libc",
+ "lz4_flex",
  "memmap2",
  "num_cpus",
  "once_cell",

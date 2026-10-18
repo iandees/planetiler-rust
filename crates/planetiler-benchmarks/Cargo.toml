@@ -11,3 +11,5 @@ tracing.workspace = true
 indexmap.workspace = true
 geo.workspace = true
 geo-types.workspace = true
+crossbeam-channel.workspace = true
+libc.workspace = true

@@ -28,6 +28,7 @@ prost-build = "0.14"
 protox = "0.10"
 flate2 = "1"
 zstd = "0.14"
+lz4_flex = "0.14"
 brotli = "9"
 rusqlite = { version = "0.40", features = ["bundled"] }
 rmp = "0.8"
