@@ -275,11 +275,10 @@ impl WithGeometry for SimpleFeature {
         &self.base.geometry_cache
     }
 
-    fn compute_polygon(&self) -> GeometryResult<Geometry<f64>> {
-        let world = self.world();
-        match (&self.osm, world) {
-            (Some(_), Geometry::LineString(line)) => Ok(Geometry::Polygon(Polygon::new(line.clone(), vec![]))),
-            _ => Ok(world.clone()),
+    fn compute_polygon(&self) -> GeometryResult<Option<Geometry<f64>>> {
+        match (&self.osm, self.world()) {
+            (Some(_), Geometry::LineString(line)) => Ok(Some(Geometry::Polygon(Polygon::new(line.clone(), vec![])))),
+            _ => Ok(None),
         }
     }
 }

@@ -30,8 +30,8 @@ pub struct GeometryCache {
     centroid_if_convex: OnceLock<GeometryResult<Geometry<f64>>>,
     innermost_point: Mutex<Option<(f64, Geometry<f64>)>>,
     line_midpoint: OnceLock<GeometryResult<Geometry<f64>>>,
-    linear_geometry: OnceLock<GeometryResult<Geometry<f64>>>,
-    polygon_geometry: OnceLock<GeometryResult<Geometry<f64>>>,
+    linear_geometry: OnceLock<GeometryResult<Option<Geometry<f64>>>>,
+    polygon_geometry: OnceLock<GeometryResult<Option<Geometry<f64>>>>,
     valid_polygon: OnceLock<GeometryResult<Geometry<f64>>>,
     area: OnceLock<GeometryResult<f64>>,
     length: OnceLock<GeometryResult<f64>>,
@@ -78,18 +78,20 @@ pub trait WithGeometry: WithGeometryType {
     /// Storage for the memoized results of the provided methods.
     fn geometry_cache(&self) -> &GeometryCache;
 
-    /// Computes this feature as a line string or multilinestring in world coordinates.
-    fn compute_line(&self) -> GeometryResult<Geometry<f64>> {
+    /// Computes this feature as a line string or multilinestring in world coordinates, or `None` if
+    /// [`WithGeometry::world_geometry`] can be used as-is (avoids copying the geometry).
+    fn compute_line(&self) -> GeometryResult<Option<Geometry<f64>>> {
         let world = self.world_geometry()?;
         match world {
-            Geometry::LineString(_) | Geometry::MultiLineString(_) | Geometry::Line(_) => Ok(world.clone()),
-            other => geo_utils::polygon_to_line_string(other),
+            Geometry::LineString(_) | Geometry::MultiLineString(_) | Geometry::Line(_) => Ok(None),
+            other => geo_utils::polygon_to_line_string(other).map(Some),
         }
     }
 
-    /// Computes this feature as a polygon or multipolygon in world coordinates.
-    fn compute_polygon(&self) -> GeometryResult<Geometry<f64>> {
-        self.world_geometry().cloned()
+    /// Computes this feature as a polygon or multipolygon in world coordinates, or `None` if
+    /// [`WithGeometry::world_geometry`] can be used as-is (avoids copying the geometry).
+    fn compute_polygon(&self) -> GeometryResult<Option<Geometry<f64>>> {
+        Ok(None)
     }
 
     /// Area of this feature in world web mercator coordinates where `1` means the area of the entire planet.
@@ -268,7 +270,11 @@ pub trait WithGeometry: WithGeometryType {
         if !self.can_be_line() {
             return Err(GeometryException::non_fatal("feature_not_line", "cannot be line"));
         }
-        cached(&self.geometry_cache().linear_geometry, || self.compute_line())
+        match self.geometry_cache().linear_geometry.get_or_init(|| self.compute_line()) {
+            Ok(Some(line)) => Ok(line),
+            Ok(None) => self.world_geometry(),
+            Err(e) => Err(e.clone()),
+        }
     }
 
     /// A partial line string from `start` to `end` where 0 is the beginning of the line and 1 is the end.
@@ -294,7 +300,11 @@ pub trait WithGeometry: WithGeometryType {
         if !self.can_be_polygon() {
             return Err(GeometryException::non_fatal("feature_not_polygon", "cannot be polygon"));
         }
-        cached(&self.geometry_cache().polygon_geometry, || self.compute_polygon())
+        match self.geometry_cache().polygon_geometry.get_or_init(|| self.compute_polygon()) {
+            Ok(Some(polygon)) => Ok(polygon),
+            Ok(None) => self.world_geometry(),
+            Err(e) => Err(e.clone()),
+        }
     }
 
     /// This feature as a valid polygon or multipolygon in world coordinates. Validating and fixing invalid polygons
