@@ -7,7 +7,9 @@
 //! - `tmp` (default: a temporary directory) where Natural Earth is extracted
 //! - `keep_unzipped` (default `false`) reuse the extracted Natural Earth sqlite file between runs
 //! - `iterations` (default `1`)
-//! - `only` (`water` or `natural_earth`) to run just one
+//! - `only` (`water`, `natural_earth` or `inflate`) to run just one; `inflate` only decompresses the water polygons
+//!   `.shp` entry (`util::zip_entry_reader::ZipEntryReader`, parallel above 16 MB) and reports wall and CPU time
+//! - `threads` (default: available parallelism) inflate threads for `only=inflate`
 
 // see the `mimalloc` feature in Cargo.toml
 #[cfg(feature = "mimalloc")]
@@ -62,6 +64,44 @@ fn run(name: &str, reader: &dyn SimpleReader) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// User + system CPU time of this process in seconds.
+fn cpu_seconds() -> f64 {
+    // SAFETY: getrusage only writes the zeroed out-param
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        usage
+    };
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    secs(usage.ru_utime) + secs(usage.ru_stime)
+}
+
+/// Decompresses the water polygons `.shp` entry and reports throughput.
+fn inflate(water: &std::path::Path, threads: usize) -> anyhow::Result<()> {
+    use std::io::Read;
+    let (start, cpu) = (Instant::now(), cpu_seconds());
+    let mut reader = planetiler_core::util::zip_entry_reader::ZipEntryReader::open_with_threads(
+        water,
+        "water-polygons-split-3857/water_polygons.shp",
+        threads,
+    )?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut total = 0usize;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    let (wall, cpu) = (start.elapsed().as_secs_f64(), cpu_seconds() - cpu);
+    eprintln!(
+        "inflate: {total} bytes on {threads} threads in {wall:.3}s wall, {cpu:.3}s CPU ({:.0} MB/s per CPU second)",
+        total as f64 / 1e6 / cpu
+    );
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let args = parse_args();
     let base = PathBuf::from("../planetiler-bench/data/sources");
@@ -74,6 +114,15 @@ fn main() -> anyhow::Result<()> {
     let tmp_holder = tempfile::tempdir()?;
     let tmp = args.get("tmp").map(PathBuf::from).unwrap_or_else(|| tmp_holder.path().to_path_buf());
 
+    if only.as_deref() == Some("inflate") {
+        let threads: usize = args
+            .get("threads")
+            .map_or_else(|| Ok(std::thread::available_parallelism().map_or(1, |n| n.get())), |s| s.parse())?;
+        for _ in 0..iterations {
+            inflate(&water, threads)?;
+        }
+        return Ok(());
+    }
     for _ in 0..iterations {
         if only.as_deref().is_none_or(|o| o == "water") {
             let start = Instant::now();

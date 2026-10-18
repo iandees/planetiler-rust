@@ -372,6 +372,19 @@ tiles.join()?;
   correctness). Smaller entries are inflated by zlib-rs on a read-ahead thread (`ReadAhead`).
   `open_with_read_ahead` picks one; `extract_from_zip` and the shapefile reader use it. The water polygons
   `.shp` (931 MB -> 1.27 GB) inflates in ~0.35s instead of ~2.4s.
+  Hardening for untrusted input: one deflate block can expand ~1000x, so decoding pauses mid-block (the consumer's
+  decoder resumes it; a paused position is never compared with a worker's guess) once a piece reaches the chunk's
+  output limit; a worker gives up on a chunk that goes 16 MB past it, and the block-start search stops after a total
+  decode budget (crafted input with many plausible headers made it quadratic: 2.4s for 256 KB, ~minutes per 1 MB
+  chunk). Errors are sticky in both readers (a read after a CRC-32/size mismatch used to report a clean end). The
+  module has no `unsafe`: the output buffer's pointer writes were replaced by pushes into reserved capacity, ~2%
+  more inflate CPU time (water polygons, 4 threads: 3.86s vs 3.80s CPU, wall unchanged); with the hardening it is
+  still ~20% less CPU than before (4.87s; not isolated, probably the smaller pieces of the consumer's own decodes).
+  Differential fuzzing against zlib-rs (and libdeflate) on stable: `cargo run --profile release-checked -p
+  planetiler-benchmarks --bin fuzz_parallel_inflate -- --seconds=600` (debug assertions + overflow checks; random
+  valid streams from an in-file encoder, flate2 0-9 with flushes, libdeflate 0-12, invalid/mutated/random streams,
+  up to 200 MB, chunk sizes down to 256 B, zip entries). A libFuzzer target for nightly is in `fuzz/`
+  (`cargo +nightly fuzz run parallel_inflate`). `benchmark_simple_readers --only=inflate` times just the inflate.
 - GeoJSON: `geojson::geo_json::GeoJson::{from_path, from_bytes, from_str, from_supplier}` with `iter()` (streaming
   `Iterator<Item = Result<GeoJsonFeature>>`), `features()`, `count()`. Hand-rolled pull tokenizer
   (`geo_json_feature_iterator::JsonParser`, Jackson token model + `skip_children`) so the Java state machine is

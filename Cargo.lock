@@ -2049,12 +2049,14 @@ name = "planetiler-benchmarks"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crc32fast",
  "crossbeam-channel",
  "flate2",
  "geo",
  "geo-types",
  "indexmap",
  "libc",
+ "libdeflater",
  "mimalloc",
  "planetiler-core",
  "tempfile",

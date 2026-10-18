@@ -30,7 +30,7 @@ All reviewed sites are believed sound. The table lists every remaining `unsafe` 
 | `reader/natural_earth_reader.rs` `sqlite3_config(MEMSTATUS, 0)` | Turn off sqlite memory statistics once per process | **Added after the audit.** Minor risk: `sqlite3_config` must not run concurrently with other sqlite use. It runs in a `Once` before Natural Earth opens connections; if another sqlite user were active on another thread at that moment it would be a data race inside sqlite. Today sources run sequentially and the mbtiles writer opens later |
 | `reader/osm/osm_input_file.rs` `Mmap::map` | Lazy reads of the input `.osm.pbf` | OK (standard caveat: input must not be modified during the run; Java has the same with `MappedByteBuffer`) |
 | `reader/osm/pbf_decoder.rs` `from_utf8_unchecked` | String table entries | OK: every entry is UTF-8-checked in `parse_block` first (invalid ones use a lossy cached copy). Fragile ordering; a `debug_assert!` would help |
-| `util/parallel_inflate.rs` `literal`/`copy` | Hand-written inflate writing into reserved `Vec` capacity | **Added after the audit.** Looks OK: capacity is reserved before each symbol, `dist` is validated against the output length, 16-byte strided copies only read initialized bytes when `dist >= 16`. Deserves a fuzz test against `zlib-rs` |
+| `util/parallel_inflate.rs` `literal`/`copy` | Hand-written inflate writing into reserved `Vec` capacity | **Removed** (2026-10-18). The reasoning held up (reservation before each step, `1 <= dist <= len` checked, strided copies only read initialized bytes, `set_len` after writing, pointers re-taken after any reallocation), but safe pushes cost only ~2% inflate CPU, so the module is now `#![forbid(unsafe_code)]`. Differential fuzzing against zlib-rs and libdeflate (`fuzz_parallel_inflate`, debug assertions + overflow checks: ~496K cases in 30 min on the unsafe version, then ~346K cases in 20 min on the safe one) found no wrong output or panic. It did find resource problems on crafted input, now fixed: huge blocks were decoded whole (GBs per worker), the block-start search was quadratic, and errors were not sticky. Miri and ASan need nightly and were not run; a cargo-fuzz target is in `fuzz/` |
 | `util/zip_entry_reader.rs` `MmapOptions::map` | Map a zip entry's byte range | **Added after the audit.** OK (same caveat as other input mmaps) |
 | `util/byte_buffer_util.rs` (madvise on a live `Mmap`, segment maps, test) | | OK; the public segment-mapping fn should document that callers must not modify the file while mapped |
 | `util/madvise.rs` (`sysconf`, `posix_madvise` wrapper) | | OK: page-rounded range stays inside the mapping |
@@ -39,6 +39,7 @@ All reviewed sites are believed sound. The table lists every remaining `unsafe` 
 
 Outside the library crates: `planetiler-benchmarks/src/bin/benchmark_line_merge.rs` uses `static mut NUM_LINES`
 (single-threaded, so fine, but an `AtomicUsize` would avoid the edition-2024 `static mut` lint).
+`benchmark_simple_readers.rs` calls `getrusage` with a zeroed out-param (OK).
 
 ## Remaining `TODO(port)` markers (13)
 
