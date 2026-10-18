@@ -389,41 +389,132 @@ impl SortableChunk {
     }
 }
 
-/// Output sink for a chunk file.
-enum Sink {
-    Plain(File),
-    Gzip(Box<GzEncoder<File>>),
+/// Output for a chunk file.
+enum ChunkOut {
+    Plain(AsyncFileWriter),
+    Gzip(BufWriter<GzEncoder<File>>),
 }
 
-impl Write for Sink {
+impl Write for ChunkOut {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            Sink::Plain(f) => f.write(buf),
-            Sink::Gzip(g) => g.write(buf),
+            ChunkOut::Plain(w) => w.write(buf),
+            ChunkOut::Gzip(g) => g.write(buf),
+        }
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            ChunkOut::Plain(w) => w.write_all(buf),
+            ChunkOut::Gzip(g) => g.write_all(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Sink::Plain(f) => f.flush(),
-            Sink::Gzip(g) => g.flush(),
+            ChunkOut::Plain(w) => w.flush(),
+            ChunkOut::Gzip(g) => g.flush(),
         }
     }
 }
 
-fn open_writer(path: &Path, compress: bool) -> anyhow::Result<BufWriter<Sink>> {
-    let file = File::create(path).with_context(|| format!("Unable to create {path:?}"))?;
-    let sink =
-        if compress { Sink::Gzip(Box::new(GzEncoder::new(file, Compression::fast()))) } else { Sink::Plain(file) };
-    Ok(BufWriter::with_capacity(WRITE_BUFFER_BYTES, sink))
+/// Buffers writes and hands each full buffer to a background thread that writes it to the file, so the writing
+/// thread does not stall in `write` syscalls (copying into the page cache, which can block when the system is
+/// writing back a lot of dirty data). In OSM pass 2 the single feature writer thread spent ~2/3 of its time there,
+/// and processing threads blocked on its full queue.
+struct AsyncFileWriter {
+    buf: Vec<u8>,
+    tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
+    recycle: crossbeam_channel::Receiver<Vec<u8>>,
+    handle: Option<std::thread::JoinHandle<io::Result<()>>>,
 }
 
-fn finish_writer(out: BufWriter<Sink>) -> anyhow::Result<()> {
-    match out.into_inner().map_err(|e| e.into_error())? {
-        Sink::Plain(_) => {}
-        Sink::Gzip(g) => {
-            g.finish()?;
+impl AsyncFileWriter {
+    /// Buffers kept in flight between the writer and its I/O thread.
+    const IN_FLIGHT: usize = 4;
+
+    fn new(mut file: File) -> io::Result<AsyncFileWriter> {
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(Self::IN_FLIGHT);
+        let (recycle_tx, recycle) = crossbeam_channel::bounded::<Vec<u8>>(Self::IN_FLIGHT + 1);
+        let handle = std::thread::Builder::new().name("chunk-io".to_string()).spawn(move || -> io::Result<()> {
+            for mut buf in rx {
+                file.write_all(&buf)?;
+                buf.clear();
+                let _ = recycle_tx.try_send(buf);
+            }
+            file.flush()
+        })?;
+        Ok(AsyncFileWriter { buf: Vec::with_capacity(WRITE_BUFFER_BYTES), tx: Some(tx), recycle, handle: Some(handle) })
+    }
+
+    fn send_buffer(&mut self) -> io::Result<()> {
+        let next = self.recycle.try_recv().unwrap_or_else(|_| Vec::with_capacity(WRITE_BUFFER_BYTES));
+        let full = std::mem::replace(&mut self.buf, next);
+        let sent = self.tx.as_ref().is_some_and(|tx| tx.send(full).is_ok());
+        if sent { Ok(()) } else { Err(self.join().err().unwrap_or_else(|| io::Error::other("chunk writer stopped"))) }
+    }
+
+    /// Stops the I/O thread and returns its result.
+    fn join(&mut self) -> io::Result<()> {
+        self.tx = None;
+        match self.handle.take() {
+            Some(handle) => handle.join().map_err(|_| io::Error::other("chunk writer panicked"))?,
+            None => Ok(()),
+        }
+    }
+
+    /// Writes the remaining buffered bytes and waits for everything to be written.
+    fn finish(mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            self.send_buffer()?;
+        }
+        self.join()
+    }
+}
+
+impl Write for AsyncFileWriter {
+    #[inline]
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.write_all(data)?;
+        Ok(data.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        if self.buf.len() + data.len() > WRITE_BUFFER_BYTES && !self.buf.is_empty() {
+            self.send_buffer()?;
+        }
+        self.buf.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for AsyncFileWriter {
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
+}
+
+fn open_writer(path: &Path, compress: bool) -> anyhow::Result<ChunkOut> {
+    let file = File::create(path).with_context(|| format!("Unable to create {path:?}"))?;
+    Ok(if compress {
+        ChunkOut::Gzip(BufWriter::with_capacity(WRITE_BUFFER_BYTES, GzEncoder::new(file, Compression::fast())))
+    } else {
+        ChunkOut::Plain(AsyncFileWriter::new(file)?)
+    })
+}
+
+fn finish_writer(out: ChunkOut) -> anyhow::Result<()> {
+    match out {
+        ChunkOut::Plain(w) => w.finish()?,
+        ChunkOut::Gzip(g) => {
+            g.into_inner().map_err(|e| e.into_error())?.finish()?;
         }
     }
     Ok(())
@@ -442,7 +533,7 @@ fn write_feature(out: &mut impl Write, key: i64, value: &[u8]) -> io::Result<()>
 /// The chunk a thread-local writer is currently writing to.
 struct ChunkWriter {
     path: PathBuf,
-    out: BufWriter<Sink>,
+    out: ChunkOut,
     item_count: u64,
     bytes_in_memory: u64,
 }
