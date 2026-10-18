@@ -304,8 +304,8 @@ impl<O: Send + 'static> Builder<O> {
         })
     }
 
-    // TODO(port): Java's `processAndWrite(inlineWrites, processThreads, writeThreads, FeatureGroup, handler)` belongs
-    // with `collection::feature_group`; build it from `add_worker` + `sink_to` there.
+    // Java's `processAndWrite(inlineWrites, processThreads, writeThreads, FeatureGroup, handler)` is
+    // `crate::collection::feature_group::process_and_write`.
 }
 
 #[cfg(test)]
