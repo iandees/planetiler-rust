@@ -123,10 +123,16 @@ pub trait Stats: Send + Sync {
 
     /// Record that an invalid input feature was discarded, with extra details about the input geometry for debugging.
     ///
-    /// TODO(port): Java logs the current tile being processed (`FeatureGroup.getCurrentTileForDebugging`) and WKB of
-    /// `input` when available.
-    fn data_error_with_details(&self, error_code: &str, _other: &str, _input: &geo_types::Geometry<f64>) {
+    /// When a tile is being processed on this thread, also logs the tile and the WKB of `input`. Difference from Java:
+    /// the WKB is hex- rather than base64-encoded (no base64 dependency).
+    fn data_error_with_details(&self, error_code: &str, other: &str, input: &geo_types::Geometry<f64>) {
         self.data_error(error_code);
+        if let Some(tile) = crate::collection::feature_group::get_current_tile_for_debugging() {
+            let wkb = crate::geo::geo_utils::write_wkb(input)
+                .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                .unwrap_or_else(|e| format!("<{e}>"));
+            tracing::info!("{error_code} on {tile} {other} for wkb: {wkb}");
+        }
     }
 
     /// Record the number of features emitted to a layer at a zoom.
