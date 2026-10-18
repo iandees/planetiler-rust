@@ -165,7 +165,8 @@ pub fn create_parent_directories<P: AsRef<Path>>(paths: &[P]) -> anyhow::Result<
 pub fn safe_copy(mut input: impl Read, dest_path: &Path) -> anyhow::Result<()> {
     let mut output = std::fs::File::create(dest_path)?;
     let mut total_size = 0u64;
-    let mut buffer = [0u8; 2048];
+    // Java uses a 2 KB buffer; large writes are much cheaper for multi-GB entries
+    let mut buffer = vec![0u8; 1 << 20];
     loop {
         let n = input.read(&mut buffer)?;
         if n == 0 {

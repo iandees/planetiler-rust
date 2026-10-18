@@ -249,6 +249,14 @@ tiles.join()?;
   Readers may decode in parallel internally but always call the sink from the calling thread.
   `ReaderFeature::into_simple_feature(&Arc<str> source)` moves geometry/tags/layer into a `SimpleFeature` (Java
   `SimpleFeature.create(geometry, tags, sourceName, sourceLayer, id)`).
+  `read_features_within(bounds, skipped, next)` (default: `read_features`) lets a reader drop features whose lat/lon
+  envelope cannot intersect `config.bounds` before decoding them, reporting the count to `skipped` so progress
+  still reaches 100%; the processor filters again, so it is purely an optimization (`NaturalEarthReader` uses
+  `geo_utils::wkb_envelope`, a no-allocation envelope of the WKB that contains the parsed geometry's envelope).
+- Unlike Java (which opens one reader per path to count features and another one to read them),
+  `SourceFeatureProcessor` keeps the readers it opened to count and reads from those, so expensive setup happens
+  once per run: Natural Earth is unzipped once (Java unzips it twice), and a bounds-filtered shapefile keeps the raw
+  records that passed the filter during `feature_count` (up to 512 MB) so the `.shp` is inflated once.
 - **Profile wiring** (`reader::source_feature_processor`): `process_files(name, paths, reader_factory, &writer,
   &config, &profile, stats)` is Java's static `SourceFeatureProcessor.processFiles`: `read` threads ->
   `process_queue` -> `feature_group::process_and_write` (inline when `config.parallel_temp_io`, else via write
@@ -282,7 +290,8 @@ tiles.join()?;
   with large row groups; here a thread processes a whole block.
 - `ShapefileReader::new(projection, source, path)` / `with_bounds(.., &Bounds)`: self-contained `.shp`/`.dbf`/`.prj`/
   `.cpg` parser (no GeoTools). Inputs: `.shp` on disk, a path inside a zip (`zip/dir/x.shp`, from
-  `file_utils::walk_path_with_pattern`) or a zip containing one shapefile; zip entries are streamed (not extracted).
+  `file_utils::walk_path_with_pattern`) or a zip containing one shapefile; zip entries are streamed (not extracted)
+  through `util::zip_entry_reader` (see below).
   One thread reads records, `available_parallelism` threads decode + reproject, output stays in file order; IDs
   start at 1 and skip null shapes like Java. Geometries match GeoTools: points, `MultiPoint`, `MultiLineString`,
   `MultiPolygon` (CW shells, CCW holes assigned to the smallest containing shell). DBF dates become `YYYY-MM-DD`
@@ -298,6 +307,19 @@ tiles.join()?;
   (`simple_reader::extract_from_zip`, Java's URL-encoded name when `keep_unzipped`, otherwise a temp file deleted on
   drop). Tables matching `ne_[a-z0-9_]+` are read **in parallel** (one read-only connection per thread); IDs are
   precomputed per table so they match Java's sequential IDs, but features from different tables interleave.
+  Connections (also GeoPackage's) are opened by `natural_earth_reader::open_sqlite_for_parallel_reads`: `PRAGMA
+  mmap_size` plus `SQLITE_CONFIG_MEMSTATUS=0`, because the bundled sqlite is built with
+  `SQLITE_ENABLE_MEMORY_MANAGEMENT` (one page cache shared by all connections behind a global mutex) and the table
+  threads otherwise spend most of their time contending on it and on the memstatus malloc mutex.
+- Zip entries (Rust-only, no Java equivalent): `util::zip_entry_reader::ZipEntryReader` reads a stored/deflated entry
+  straight from the zip file (memory-mapped) and checks its CRC-32 and size at the end. Deflated entries of at least
+  16 MB compressed are inflated by `util::parallel_inflate::ParallelInflater` on `available_parallelism` threads
+  (rapidgzip/pugz approach: 1 MB chunks, each worker finds the first dynamic-Huffman block header in its chunk and
+  decodes with 16-bit markers for the unknown 32 KB window; the consumer checks that chunks line up, resolves the
+  markers, and decodes a chunk sequentially itself when a guess was wrong, so a false positive costs time, not
+  correctness). Smaller entries are inflated by zlib-rs on a read-ahead thread (`ReadAhead`).
+  `open_with_read_ahead` picks one; `extract_from_zip` and the shapefile reader use it. The water polygons
+  `.shp` (931 MB -> 1.27 GB) inflates in ~0.35s instead of ~2.4s.
 - GeoJSON: `geojson::geo_json::GeoJson::{from_path, from_bytes, from_str, from_supplier}` with `iter()` (streaming
   `Iterator<Item = Result<GeoJsonFeature>>`), `features()`, `count()`. Hand-rolled pull tokenizer
   (`geo_json_feature_iterator::JsonParser`, Jackson token model + `skip_children`) so the Java state machine is

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 use tracing::warn;
 
 use crate::config::bounds::Bounds;
@@ -131,10 +131,7 @@ impl GeoPackageReader {
     }
 
     fn open(&self) -> Result<Connection> {
-        Ok(Connection::open_with_flags(
-            &self.db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
-        )?)
+        crate::reader::natural_earth_reader::open_sqlite_for_parallel_reads(&self.db_path)
     }
 
     /// Names of all feature tables in this geopackage.

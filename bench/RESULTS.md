@@ -154,6 +154,21 @@ median looks bad.
 
 Older numbers from the provisional (loaded-machine) pass, kept only to show what changed; the tables above supersede
 them.
+- Simple sources (after the tables above were measured; Rust only, interleaved A/B on a busy machine, load 7-15,
+  3 runs each, medians [min-max] from log timestamps). Changes: readers opened for counting are reused for reading
+  (Natural Earth unzipped once; bounds-filtered shapefile records kept from the count pass so the `.shp` is inflated
+  once), parallel inflate of large zip entries (`util::parallel_inflate`), Natural Earth rows outside the bounds
+  skipped from their WKB envelope before decoding, sqlite read through mmap with memstatus off (the shared page cache
+  mutex was the bottleneck), and the `ne_lakes` stage timer is now stopped (it used to run until the end of the run
+  and report `6s cpu:1m8s`).
+  - Switzerland: total 26.7s [26.3-27.2] -> 18.1s [17.2-18.1]; lake_centerlines 0.48s -> 0.09s, water_polygons
+    5.48s [5.45-5.50] -> 0.37s [0.36-0.37], natural_earth 5.24s (16s CPU) -> 0.86s (6s CPU); ne_lakes now ~0s/0s CPU.
+    Peak RSS 5.78 -> 5.56 GB. osm_pass1/2 were 1.57/7.84s vs 1.76/8.32s in these runs (code unchanged, see the
+    bimodal-IPC note). Output byte-identical.
+  - Monaco: total 11.6s [11.55-11.62] -> 1.74s [1.74-1.84]; peak RSS 0.97 -> 1.09 GB (the parallel inflater keeps
+    ~16 1 MB chunks in flight). Output byte-identical.
+  - `benchmark_simple_readers`: water polygons read 2.80s -> 0.46s; Natural Earth unzip 2.07s -> 0.57s, read 0.68s
+    -> 0.25s, total 2.81s -> 0.91s.
 - TileCoord: the straight port ran at 604M/s (0.72x Java); closed-form zoom start `(4^z - 1) / 3`, `leading_zeros`,
   shifts/masks instead of `/` and `%` gave 1.3-1.4B/s.
 - VectorTile: the straight port ran at 11.6-12.0M features/s and ~1.5k tiles/s (0.86-0.9x Java). Writing protobuf

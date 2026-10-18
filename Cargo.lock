@@ -2055,6 +2055,7 @@ dependencies = [
  "arrow",
  "brotli",
  "chrono",
+ "crc32fast",
  "crossbeam-channel",
  "csv",
  "flate2",

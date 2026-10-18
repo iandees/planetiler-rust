@@ -14,6 +14,7 @@
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{error, info};
 
@@ -190,23 +191,43 @@ where
 
     /// Returns the total number of features in all `source_paths`.
     pub fn get_feature_count(&self, source_paths: &[PathBuf]) -> anyhow::Result<u64> {
-        let mut count = 0;
-        for path in source_paths {
-            count += (self.reader_factory)(path)?.feature_count()?;
-        }
-        Ok(count)
+        Ok(self.open_readers(source_paths)?.1)
     }
 
-    /// Starts a pipeline that reads every feature from `source_paths` on `feature_read_threads` threads into a
-    /// `process_queue`.
-    fn read_pipeline(&self, source_paths: Vec<PathBuf>, config: &PlanetilerConfig) -> Builder<ReaderFeature> {
-        let factory = self.reader_factory.clone();
+    /// Opens a reader for every path and returns them with the total number of features.
+    ///
+    /// Java opens one reader per path to count features and another one to read them. Here the readers used to count
+    /// are kept and handed to the read pipeline, so expensive setup (extracting a zipped sqlite file, inflating a
+    /// zipped shapefile to filter its records by bounds) happens once per run instead of twice.
+    fn open_readers(&self, source_paths: &[PathBuf]) -> anyhow::Result<(Vec<R>, u64)> {
+        let mut count = 0;
+        let mut readers = Vec::with_capacity(source_paths.len());
+        for path in source_paths {
+            let reader = (self.reader_factory)(path)?;
+            count += reader.feature_count()?;
+            readers.push(reader);
+        }
+        Ok((readers, count))
+    }
+
+    /// Starts a pipeline that reads every feature from `readers` on `feature_read_threads` threads into a
+    /// `process_queue`. Readers may skip features outside `config.bounds` without decoding them
+    /// ([`SimpleReader::read_features_within`]); those are added to `skipped`.
+    fn read_pipeline(
+        &self,
+        readers: Vec<R>,
+        config: &PlanetilerConfig,
+        skipped: Arc<AtomicU64>,
+    ) -> Builder<ReaderFeature> {
+        let bounds = config.bounds.lat_lon();
         WorkerPipeline::start(&self.source_name, self.stats.clone())
-            .read_from_tiny("source_paths", source_paths)
-            .add_worker("read", config.feature_read_threads.max(1), move |paths, next| {
-                for path in paths {
-                    let reader = factory(&path)?;
-                    reader.read_features(&mut |feature| {
+            .read_from_tiny("source_paths", readers)
+            .add_worker("read", config.feature_read_threads.max(1), move |readers, next| {
+                let skipped = |n: u64| {
+                    skipped.fetch_add(n, Ordering::Relaxed);
+                };
+                for reader in readers {
+                    reader.read_features_within(&bounds, &skipped, &mut |feature| {
                         next.accept(feature);
                         Ok(())
                     })?;
@@ -235,12 +256,13 @@ where
             return Ok(());
         }
         let timer = self.stats.start_stage(&self.source_name);
-        let feature_count = self.get_feature_count(&source_paths)?;
+        let (readers, feature_count) = self.open_readers(&source_paths)?;
         let lat_lon_bounds: Envelope = config.bounds.lat_lon();
         let features_read = Counter::new_multi_thread_counter();
 
+        let skipped = Arc::new(AtomicU64::new(0));
         let (counter, source) = (features_read.clone(), self.source_name.clone());
-        let builder = self.read_pipeline(source_paths, config);
+        let builder = self.read_pipeline(readers, config, skipped.clone());
         let pipeline =
             process_and_write_with_profile(builder, writer, config, profile, &self.stats, move |prev, process| {
                 let counter = counter.counter_for_thread();
@@ -255,7 +277,12 @@ where
 
         let (counter, written, file) = (features_read.clone(), writer.clone(), writer.clone());
         let loggers = ProgressLoggers::create()
-            .add_rate_percent_counter("read", feature_count as i64, move || counter.get(), true)
+            .add_rate_percent_counter(
+                "read",
+                feature_count as i64,
+                move || counter.get() + skipped.load(Ordering::Relaxed) as i64,
+                true,
+            )
             .add_rate_counter("write", move || written.num_features_written() as i64)
             .add_file_size(file as Arc<dyn DiskBacked + Send + Sync>)
             .new_line()
@@ -286,31 +313,38 @@ where
         P: Fn() -> ProcessFn + Send + Sync + 'static,
     {
         let timer = self.stats.start_stage(&self.source_name);
-        let feature_count = self.get_feature_count(&source_paths)?;
+        let (readers, feature_count) = self.open_readers(&source_paths)?;
         let process_threads = config.feature_process_threads.max(1);
         let lat_lon_bounds: Envelope = config.bounds.lat_lon();
         let features_read = Counter::new_multi_thread_counter();
 
+        let skipped = Arc::new(AtomicU64::new(0));
         let counter = features_read.clone();
-        let pipeline = self.read_pipeline(source_paths, config).sink_to("process", process_threads, move |prev| {
-            let counter = counter.counter_for_thread();
-            let mut process = processor_factory();
-            for feature in prev {
-                counter.inc();
-                if Envelope::of_geometry(&feature.geometry).intersects(&lat_lon_bounds) {
-                    let id = feature.id;
-                    let layer = feature.source_layer.clone();
-                    if let Err(e) = process(feature) {
-                        error!("Error processing feature {id} (layer {layer:?}): {e:#}");
+        let pipeline =
+            self.read_pipeline(readers, config, skipped.clone()).sink_to("process", process_threads, move |prev| {
+                let counter = counter.counter_for_thread();
+                let mut process = processor_factory();
+                for feature in prev {
+                    counter.inc();
+                    if Envelope::of_geometry(&feature.geometry).intersects(&lat_lon_bounds) {
+                        let id = feature.id;
+                        let layer = feature.source_layer.clone();
+                        if let Err(e) = process(feature) {
+                            error!("Error processing feature {id} (layer {layer:?}): {e:#}");
+                        }
                     }
                 }
-            }
-            Ok(())
-        });
+                Ok(())
+            });
 
         let counter = features_read.clone();
         let loggers = ProgressLoggers::create()
-            .add_rate_percent_counter("read", feature_count as i64, move || counter.get(), true)
+            .add_rate_percent_counter(
+                "read",
+                feature_count as i64,
+                move || counter.get() + skipped.load(Ordering::Relaxed) as i64,
+                true,
+            )
             .new_line()
             .add_process_stats()
             .new_line()

@@ -18,6 +18,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use tracing::{trace, warn};
 
+use crate::geo::envelope::Envelope;
 use crate::geo::geo_utils;
 use crate::reader::simple_reader::{
     FeatureSink, ReaderFeature, SimpleReader, default_decode_threads, extract_from_zip,
@@ -42,6 +43,31 @@ fn is_valid_table_name(name: &str) -> bool {
     lower.len() > 3
         && lower.starts_with("ne_")
         && lower[3..].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Opens a read-only connection to the sqlite file at `path`, set up so that many threads with their own connection can
+/// read concurrently without contending on sqlite's global locks.
+///
+/// The bundled sqlite is built with `SQLITE_ENABLE_MEMORY_MANAGEMENT`, so every connection shares one page cache
+/// guarded by a global mutex, and allocations take another global mutex to track memory statistics. Reading through
+/// memory-mapped I/O bypasses the page cache for read-only transactions, and memory statistics are switched off
+/// (this only works before sqlite is first initialized in the process; otherwise it is a no-op).
+pub(crate) fn open_sqlite_for_parallel_reads(path: &Path) -> Result<Connection> {
+    static DISABLE_MEMSTATUS: std::sync::Once = std::sync::Once::new();
+    DISABLE_MEMSTATUS.call_once(|| {
+        // SAFETY: sqlite3_config is documented as safe to call before sqlite3_initialize (it returns SQLITE_MISUSE
+        // otherwise); no connection is being opened concurrently from this call
+        unsafe {
+            rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0 as std::ffi::c_int);
+        }
+    });
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    // capped by SQLITE_MAX_MMAP_SIZE (2 GB); larger files fall back to regular reads past that offset
+    conn.pragma_update(None, "mmap_size", 1i64 << 40)?;
+    Ok(conn)
 }
 
 /// Convert a sqlite column value to a tag value (like the sqlite JDBC driver's `getObject`).
@@ -91,11 +117,7 @@ impl NaturalEarthReader {
     }
 
     fn open(&self) -> Result<Connection> {
-        let conn = Connection::open_with_flags(
-            &self.db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
-        )?;
-        Ok(conn)
+        open_sqlite_for_parallel_reads(&self.db_path)
     }
 
     /// Returns the names of all tables matching `ne_[a-z0-9_]+`, sorted like JDBC `getTables` (by type, then name).
@@ -128,11 +150,16 @@ impl NaturalEarthReader {
     }
 
     /// Reads one table, emitting batches of features to `emit`. Returns `false` from `emit` to stop.
+    /// Rows whose geometry certainly does not intersect `bounds` are skipped without decoding them and reported to
+    /// `skipped`.
+    #[allow(clippy::too_many_arguments)]
     fn read_table(
         &self,
         conn: &Connection,
         table: &str,
         first_id: i64,
+        bounds: Option<&Envelope>,
+        skipped: &dyn Fn(u64),
         emit: &mut dyn FnMut(Vec<ReaderFeature>) -> bool,
     ) -> Result<bool> {
         const BATCH: usize = 512;
@@ -145,6 +172,7 @@ impl NaturalEarthReader {
         let mut rows = stmt.query([])?;
         let mut id = first_id;
         let mut batch = Vec::with_capacity(BATCH);
+        let mut num_skipped = 0;
         while let Some(row) = rows.next()? {
             let geometry = match row.get_ref(geometry_column)? {
                 ValueRef::Blob(b) => b,
@@ -155,6 +183,12 @@ impl NaturalEarthReader {
                 }
             };
             id += 1;
+            if let Some(bounds) = bounds
+                && geo_utils::wkb_envelope(geometry).is_some_and(|env| !env.intersects(bounds))
+            {
+                num_skipped += 1;
+                continue;
+            }
             let geometry = geo_utils::read_wkb(geometry).map_err(|e| anyhow!("{e} in {table} (row {id})"))?;
             let mut tags = Tags::with_capacity(columns.len() - 1);
             for (c, name) in columns.iter().enumerate() {
@@ -163,10 +197,14 @@ impl NaturalEarthReader {
                 }
             }
             batch.push(ReaderFeature { geometry, tags, source_layer: layer.clone(), id });
-            if batch.len() >= BATCH && !emit(std::mem::replace(&mut batch, Vec::with_capacity(BATCH))) {
-                return Ok(false);
+            if batch.len() >= BATCH {
+                skipped(std::mem::take(&mut num_skipped));
+                if !emit(std::mem::replace(&mut batch, Vec::with_capacity(BATCH))) {
+                    return Ok(false);
+                }
             }
         }
+        skipped(num_skipped);
         if !batch.is_empty() {
             return Ok(emit(batch));
         }
@@ -184,6 +222,26 @@ impl SimpleReader for NaturalEarthReader {
     }
 
     fn read_features(&self, next: &mut FeatureSink<'_>) -> Result<()> {
+        self.read(None, &|_| {}, next)
+    }
+
+    fn read_features_within(
+        &self,
+        bounds: &Envelope,
+        skipped: &(dyn Fn(u64) + Sync),
+        next: &mut FeatureSink<'_>,
+    ) -> Result<()> {
+        self.read(Some(bounds), skipped, next)
+    }
+}
+
+impl NaturalEarthReader {
+    fn read(
+        &self,
+        bounds: Option<&Envelope>,
+        skipped: &(dyn Fn(u64) + Sync),
+        next: &mut FeatureSink<'_>,
+    ) -> Result<()> {
         let counts = self.table_counts()?;
         // ID offsets so that IDs match Java's sequential assignment while reading tables in parallel
         let mut tables = Vec::with_capacity(counts.len());
@@ -207,7 +265,9 @@ impl SimpleReader for NaturalEarthReader {
                             let i = next_table.fetch_add(1, Ordering::Relaxed);
                             let Some((table, first_id)) = tables.get(i) else { return Ok(()) };
                             trace!("Naturalearth loading {i}/{}: {table}", tables.len());
-                            if !self.read_table(&conn, table, *first_id, &mut |batch| tx.send(Ok(batch)).is_ok())? {
+                            if !self.read_table(&conn, table, *first_id, bounds, skipped, &mut |batch| {
+                                tx.send(Ok(batch)).is_ok()
+                            })? {
                                 return Ok(());
                             }
                         }
@@ -344,6 +404,39 @@ mod tests {
         assert_eq!(1, first[0].0);
         drop(reader);
         assert!(path.exists());
+    }
+
+    #[test]
+    fn read_natural_earth_within_bounds_skips_the_same_features_the_processor_would() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reader =
+            NaturalEarthReader::new("test", &resource("natural_earth_vector.sqlite.zip"), tmp.path(), false).unwrap();
+        let bounds = Envelope::new(0.0, 20.0, 0.0, 30.0);
+        let mut expected = vec![];
+        reader
+            .read_features(&mut |f| {
+                if Envelope::of_geometry(&f.geometry).intersects(&bounds) {
+                    expected.push((f.id, f.geometry));
+                }
+                Ok(())
+            })
+            .unwrap();
+        let skipped = std::sync::atomic::AtomicU64::new(0);
+        let mut actual = vec![];
+        reader
+            .read_features_within(&bounds, &|n| _ = skipped.fetch_add(n, Ordering::Relaxed), &mut |f| {
+                if Envelope::of_geometry(&f.geometry).intersects(&bounds) {
+                    actual.push((f.id, f.geometry));
+                }
+                Ok(())
+            })
+            .unwrap();
+        expected.sort_by_key(|(id, _)| *id);
+        actual.sort_by_key(|(id, _)| *id);
+        assert!(!expected.is_empty() && expected.len() < 7_679, "{}", expected.len());
+        assert_eq!(expected, actual);
+        let skipped = skipped.load(Ordering::Relaxed);
+        assert!(skipped > 0 && skipped <= 7_679 - expected.len() as u64, "{skipped}");
     }
 
     #[test]

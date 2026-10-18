@@ -75,6 +75,19 @@ pub trait SimpleReader: Send + Sync {
     /// Reads all features in this data provider, submitting each to `next` for further processing.
     fn read_features(&self, next: &mut FeatureSink<'_>) -> anyhow::Result<()>;
 
+    /// Like [`SimpleReader::read_features`], but the reader may skip features whose lat/lon envelope certainly does
+    /// not intersect `bounds` without decoding them, reporting how many it skipped to `skipped` (possibly from other
+    /// threads). Callers still filter the features they receive. The default reads everything.
+    fn read_features_within(
+        &self,
+        bounds: &Envelope,
+        skipped: &(dyn Fn(u64) + Sync),
+        next: &mut FeatureSink<'_>,
+    ) -> anyhow::Result<()> {
+        let _ = (bounds, skipped);
+        self.read_features(next)
+    }
+
     /// Reads all features into a vector (convenience for tests and small inputs).
     fn read_all(&self) -> anyhow::Result<Vec<ReaderFeature>> {
         let mut result = Vec::new();
@@ -227,10 +240,10 @@ pub(crate) fn extract_from_zip(
     }
     if !keep_unzipped || file_utils::is_newer(&zip_path, &extracted) {
         tracing::info!("unzipping {} to {}", zip_path.display(), extracted.display());
-        let file = std::fs::File::open(&zip_path).with_context(|| format!("opening {}", zip_path.display()))?;
-        let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))?;
-        let entry = zip.by_name(entry.trim_start_matches('/'))?;
-        file_utils::safe_copy(std::io::BufReader::with_capacity(1 << 20, entry), &extracted)?;
+        // inflate on a background thread while this one writes
+        let entry = crate::util::zip_entry_reader::open_with_read_ahead(&zip_path, &entry)
+            .with_context(|| format!("opening {entry} in {}", zip_path.display()))?;
+        file_utils::safe_copy(entry, &extracted)?;
     }
     Ok(Some(extracted))
 }

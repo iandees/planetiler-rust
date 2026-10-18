@@ -303,7 +303,7 @@ impl FinishHandler for Water {
             }
             self.ne_lake_name_maps.lock().clear();
             *self.ne_lake_index.write() = None;
-            drop(timer);
+            timer.stop();
         }
     }
 }
