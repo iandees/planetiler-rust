@@ -278,7 +278,12 @@ impl FeatureGroup {
 
     /// Returns a new encoder for a single thread to use to serialize rendered features.
     pub fn new_rendered_feature_encoder(&self) -> RenderedFeatureEncoder {
-        RenderedFeatureEncoder { shared: self.shared.clone(), buf: Vec::with_capacity(256), last_fill: None }
+        RenderedFeatureEncoder {
+            shared: self.shared.clone(),
+            buf: Vec::with_capacity(256),
+            last_fill: None,
+            strings: StringCache::default(),
+        }
     }
 
     /// Returns a new sort writer for a single thread.
@@ -336,13 +341,46 @@ pub struct RenderedFeatureEncoder {
     shared: Arc<Shared>,
     buf: Vec<u8>,
     last_fill: Option<Arc<vector_tile::Feature>>,
+    strings: StringCache,
+}
+
+/// Per-thread cache in front of the shared layer and attribute-key string encoders, so that encoding a feature does
+/// not touch the shared `RwLock` (every writer thread hammering its reader count was ~17% of OSM pass 2 CPU).
+#[derive(Default)]
+struct StringCache {
+    last_layer: Option<(String, u8)>,
+    keys: HashMap<Box<str>, u32, foldhash::fast::FixedState>,
+}
+
+impl StringCache {
+    #[inline]
+    fn layer(&mut self, shared: &Shared, layer: &str) -> anyhow::Result<u8> {
+        if let Some((name, id)) = &self.last_layer
+            && name == layer
+        {
+            return Ok(*id);
+        }
+        let id = shared.common_layer_strings.encode(layer)?;
+        self.last_layer = Some((layer.to_string(), id));
+        Ok(id)
+    }
+
+    #[inline]
+    fn key(&mut self, shared: &Shared, key: &str) -> anyhow::Result<u32> {
+        if let Some(&id) = self.keys.get(key) {
+            return Ok(id);
+        }
+        let id = shared.common_value_strings.encode(key)?;
+        self.keys.insert(key.into(), id);
+        Ok(id)
+    }
 }
 
 impl RenderedFeatureEncoder {
     /// Encodes `feature` into its sort key and value bytes (valid until the next call).
     pub fn encode(&mut self, feature: &RenderedFeature) -> anyhow::Result<(i64, &[u8])> {
         let vt = &feature.vector_tile_feature;
-        let layer = self.shared.common_layer_strings.encode(&vt.layer)?;
+        let layer = self.strings.layer(&self.shared, &vt.layer)?;
         let key = encode_key(
             self.shared.tile_order.encode(&feature.tile) as i64,
             layer,
@@ -353,12 +391,12 @@ impl RenderedFeatureEncoder {
             Some(group) => {
                 // don't bother memoizing if group is present
                 self.last_fill = None;
-                encode_value(&self.shared, vt, Some(group), &mut self.buf)?;
+                encode_value(&self.shared, &mut self.strings, vt, Some(group), &mut self.buf)?;
             }
             None => {
                 let same = self.last_fill.as_ref().is_some_and(|last| Arc::ptr_eq(last, vt));
                 if !same {
-                    encode_value(&self.shared, vt, None, &mut self.buf)?;
+                    encode_value(&self.shared, &mut self.strings, vt, None, &mut self.buf)?;
                     self.last_fill = Some(vt.clone());
                 }
             }
@@ -375,6 +413,7 @@ impl RenderedFeatureEncoder {
 
 fn encode_value(
     shared: &Shared,
+    strings: &mut StringCache,
     feature: &vector_tile::Feature,
     group: Option<&Group>,
     buf: &mut Vec<u8>,
@@ -383,11 +422,11 @@ fn encode_value(
     buf.clear();
     // hasGroup bit in key will tell consumers whether they need to decode group info from value
     if let Some(group) = group {
-        write_sint(buf, group.group)?;
-        write_sint(buf, group.limit as i64)?;
+        put_sint(buf, group.group);
+        put_sint(buf, group.limit as i64);
     }
-    write_sint(buf, feature.id)?;
-    write_sint(buf, encode_geom_type_and_scale(&feature.geometry) as i8 as i64)?;
+    put_sint(buf, feature.id);
+    put_sint(buf, encode_geom_type_and_scale(&feature.geometry) as i8 as i64);
     let attrs = &feature.tags;
     let count = attrs.values().filter(|v| !v.is_null()).count();
     write_map_len(buf, count as u32)?;
@@ -395,12 +434,10 @@ fn encode_value(
         if value.is_null() {
             continue;
         }
-        write_sint(buf, shared.common_value_strings.encode(key)? as i64)?;
+        put_sint(buf, strings.key(shared, key)? as i64);
         match value {
             Value::String(s) => write_str(buf, s)?,
-            Value::Int(i) => {
-                write_sint(buf, *i)?;
-            }
+            Value::Int(i) => put_sint(buf, *i),
             Value::Float(f) => write_f64(buf, *f as f64)?,
             Value::Double(d) => write_f64(buf, *d)?,
             Value::Bool(b) => write_bool(buf, *b)?,
@@ -411,10 +448,45 @@ fn encode_value(
     // and smaller for encoding/decoding intermediate geometries than alternatives like WKB.
     let commands = feature.geometry.commands();
     write_array_len(buf, commands.len() as u32)?;
+    buf.reserve(commands.len() * 3);
     for &command in commands {
-        write_sint(buf, command as i64)?;
+        put_sint(buf, command as i64);
     }
     Ok(())
+}
+
+/// Appends `val` to `buf` in the smallest msgpack integer encoding (byte-identical to `rmp::encode::write_sint`).
+#[inline]
+fn put_sint(buf: &mut Vec<u8>, val: i64) {
+    if (0..128).contains(&val) {
+        buf.push(val as u8);
+    } else if (-32..0).contains(&val) {
+        buf.push(val as i8 as u8);
+    } else if val < 0 {
+        if val >= -128 {
+            buf.extend_from_slice(&[0xd0, val as i8 as u8]);
+        } else if val >= -32768 {
+            buf.push(0xd1);
+            buf.extend_from_slice(&(val as i16).to_be_bytes());
+        } else if val >= -2147483648 {
+            buf.push(0xd2);
+            buf.extend_from_slice(&(val as i32).to_be_bytes());
+        } else {
+            buf.push(0xd3);
+            buf.extend_from_slice(&val.to_be_bytes());
+        }
+    } else if val < 256 {
+        buf.extend_from_slice(&[0xcc, val as u8]);
+    } else if val < 65536 {
+        buf.push(0xcd);
+        buf.extend_from_slice(&(val as u16).to_be_bytes());
+    } else if val < 4294967296 {
+        buf.push(0xce);
+        buf.extend_from_slice(&(val as u32).to_be_bytes());
+    } else {
+        buf.push(0xcf);
+        buf.extend_from_slice(&(val as u64).to_be_bytes());
+    }
 }
 
 /// Minimal zero-copy msgpack reader for the values written by [`encode_value`].
@@ -926,6 +998,23 @@ mod tests {
     use crate::profile::NullProfile;
     use crate::reader::source_feature::SourceFeature;
     use crate::stats::stats::in_memory;
+
+    #[test]
+    fn test_put_sint_matches_rmp() {
+        let mut values = vec![0i64, 1, -1, i64::MIN, i64::MAX];
+        for b in [7u32, 8, 15, 16, 31, 32, 63] {
+            let p = 1i64 << b;
+            values.extend([p - 1, p, p + 1, -p - 1, -p, -p + 1]);
+        }
+        values.extend([-32, -33, 127, 128, 255, 256, -128, -129]);
+        for v in values {
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            put_sint(&mut a, v);
+            rmp::encode::write_sint(&mut b, v).unwrap();
+            assert_eq!(a, b, "{v}");
+        }
+    }
     use crate::tags;
 
     trait OwnedTags {

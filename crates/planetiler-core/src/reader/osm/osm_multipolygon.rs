@@ -265,8 +265,14 @@ fn add_polygon_rings(polygons: &mut Vec<Ring>, geom: Geometry<f64>) {
     }
 }
 
-/// Port of JTS `PreparedPolygon.contains` with cheap envelope/point rejections first.
-fn contains<'a>(outer: &Ring, prepared: &PreparedGeometry<'a, &'a Polygon<f64>>, inner: &Ring) -> bool {
+/// Port of JTS `PreparedPolygon.contains` with cheap envelope/point rejections first. The prepared geometry (an
+/// R-tree over the outer ring's edges) is only built once a candidate passes the cheap checks.
+fn contains<'a>(
+    outer: &Ring,
+    outer_geom: &'a Polygon<f64>,
+    prepared: &mut Option<PreparedGeometry<'a, &'a Polygon<f64>>>,
+    inner: &Ring,
+) -> bool {
     if !outer.envelope.contains(&inner.envelope) {
         return false;
     }
@@ -278,7 +284,7 @@ fn contains<'a>(outer: &Ring, prepared: &PreparedGeometry<'a, &'a Polygon<f64>>,
     {
         return false;
     }
-    prepared.relate(&inner.geom).is_contains()
+    prepared.get_or_insert_with(|| PreparedGeometry::from(outer_geom)).relate(&inner.geom).is_contains()
 }
 
 fn group_parent_child_shells(polygons: &mut [Ring]) -> IndexSet<usize> {
@@ -295,10 +301,10 @@ fn group_parent_child_shells(polygons: &mut [Ring]) -> IndexSet<usize> {
     for i in 0..num_polygons {
         if i < num_polygons - 1 {
             let outer_geom = polygons[i].geom.clone();
-            let prepared = PreparedGeometry::from(&outer_geom);
+            let mut prepared = None;
             // since the rings are sorted by area descending, the inner loop is only smaller rings
             for j in i + 1..num_polygons {
-                if contains(&polygons[i], &prepared, &polygons[j]) {
+                if contains(&polygons[i], &outer_geom, &mut prepared, &polygons[j]) {
                     // keep searching until we find the smallest ring that contains this one
                     // that one is the direct parent
                     if let Some(parent) = polygons[j].contained_by {
