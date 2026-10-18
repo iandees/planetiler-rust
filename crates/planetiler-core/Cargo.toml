@@ -47,6 +47,10 @@ once_cell.workspace = true
 chrono.workspace = true
 ureq.workspace = true
 tempfile.workspace = true
+roaring.workspace = true
+icu_experimental.workspace = true
+icu_properties.workspace = true
+any_ascii.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
