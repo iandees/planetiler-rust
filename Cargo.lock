@@ -2024,6 +2024,7 @@ dependencies = [
  "planetiler-examples",
  "planetiler-openmaptiles",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2128,6 +2129,7 @@ dependencies = [
  "geo-types",
  "indexmap",
  "planetiler-core",
+ "tempfile",
  "tracing",
 ]
 
@@ -2148,6 +2150,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "tracing",
 ]
 

@@ -174,13 +174,71 @@ pub fn assert_point_on_surface(surface: &Geometry<f64>, actual: &Geometry<f64>) 
 
 /// Java's `validateGeometry`: points non-empty, lines have at least 2 points, polygon shells are CCW and holes CW
 /// (in planetiler's y-down tile coordinates JTS `isCCW` means what geo calls counter-clockwise), and polygons are
-/// valid.
+/// simple (JTS `isSimple()`: no ring self-intersects; rings of different polygons may overlap, e.g. after merging).
 #[track_caller]
 pub fn validate_geometry(g: &Geometry<f64>) {
     if matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_)) {
-        assert!(crate::geo::is_valid::is_valid(g), "invalid: {g:?}");
+        assert!(is_simple_polygonal(g), "JTS isSimple(): {g:?}");
     }
     validate_geometry_recursive(g);
+}
+
+/// JTS `IsSimpleOp` for polygonal geometries: every ring (checked on its own) only touches itself at its endpoints.
+pub fn is_simple_polygonal(g: &Geometry<f64>) -> bool {
+    let rings: Vec<&LineString<f64>> = match g {
+        Geometry::Polygon(p) => std::iter::once(p.exterior()).chain(p.interiors()).collect(),
+        Geometry::MultiPolygon(mp) => {
+            mp.0.iter().flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors())).collect()
+        }
+        _ => return true,
+    };
+    rings.into_iter().all(is_simple_ring)
+}
+
+fn is_simple_ring(ring: &LineString<f64>) -> bool {
+    use geo::line_intersection::{LineIntersection, line_intersection};
+    use rstar::primitives::{GeomWithData, Rectangle};
+
+    let mut pts: Vec<Coord<f64>> = ring.0.clone();
+    pts.dedup();
+    if pts.len() < 4 {
+        return true;
+    }
+    let segments: Vec<geo_types::Line<f64>> = pts.windows(2).map(|w| geo_types::Line::new(w[0], w[1])).collect();
+    let n = segments.len();
+    let closed = pts.first() == pts.last();
+    let tree = rstar::RTree::bulk_load(
+        segments
+            .iter()
+            .enumerate()
+            .map(|(i, s)| GeomWithData::new(Rectangle::from_corners([s.start.x, s.start.y], [s.end.x, s.end.y]), i))
+            .collect(),
+    );
+    for (i, a) in segments.iter().enumerate() {
+        let envelope = rstar::AABB::from_corners([a.start.x, a.start.y], [a.end.x, a.end.y]);
+        for other in tree.locate_in_envelope_intersecting(envelope) {
+            let j = other.data;
+            if j <= i {
+                continue;
+            }
+            let Some(intersection) = line_intersection(*a, segments[j]) else { continue };
+            let adjacent = j == i + 1 || (closed && i == 0 && j == n - 1);
+            match intersection {
+                LineIntersection::Collinear { .. } => return false,
+                LineIntersection::SinglePoint { intersection, .. } => {
+                    if !adjacent {
+                        return false;
+                    }
+                    // adjacent segments may only share their common vertex
+                    let shared = if j == i + 1 { a.end } else { a.start };
+                    if intersection != shared {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 #[track_caller]

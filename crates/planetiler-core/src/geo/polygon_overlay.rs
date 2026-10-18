@@ -290,6 +290,154 @@ fn positive_contours(polys: &[&Polygon<f64>], grid: Grid) -> Vec<Contour> {
     out
 }
 
+/// A JTS snap-rounding hot pixel: the unit square (in grid units) centered on a rounded vertex, with open top and
+/// right sides.
+#[derive(Clone, Copy)]
+struct HotPixel {
+    x: i64,
+    y: i64,
+}
+
+impl rstar::RTreeObject for HotPixel {
+    type Envelope = rstar::AABB<[f64; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        rstar::AABB::from_point([self.x as f64, self.y as f64])
+    }
+}
+
+/// JTS `CGAlgorithmsDD.orientationIndex` sign (1 = left/counter-clockwise, -1 = right, 0 = collinear) using robust
+/// predicates.
+fn orientation_index(p: (f64, f64), q: (f64, f64), r: (f64, f64)) -> i8 {
+    use geo::kernels::{Kernel, Orientation, RobustKernel};
+    match RobustKernel::orient2d(Coord { x: p.0, y: p.1 }, Coord { x: q.0, y: q.1 }, Coord { x: r.0, y: r.1 }) {
+        Orientation::CounterClockwise => 1,
+        Orientation::Clockwise => -1,
+        Orientation::Collinear => 0,
+    }
+}
+
+impl HotPixel {
+    const TOLERANCE: f64 = 0.5;
+
+    /// JTS `HotPixel.intersectsScaled`: whether the segment `p0`-`p1` (in scaled grid coordinates) intersects this
+    /// pixel.
+    fn intersects(&self, p0: (f64, f64), p1: (f64, f64)) -> bool {
+        // determine oriented segment pointing in positive X direction
+        let (p, q) = if p0.0 > p1.0 { (p1, p0) } else { (p0, p1) };
+        let (hx, hy) = (self.x as f64, self.y as f64);
+        let maxx = hx + Self::TOLERANCE;
+        if p.0.min(q.0) >= maxx {
+            return false;
+        }
+        let minx = hx - Self::TOLERANCE;
+        if p.0.max(q.0) < minx {
+            return false;
+        }
+        let maxy = hy + Self::TOLERANCE;
+        if p.1.min(q.1) >= maxy {
+            return false;
+        }
+        let miny = hy - Self::TOLERANCE;
+        if p.1.max(q.1) < miny {
+            return false;
+        }
+        // vertical or horizontal segments must now intersect the segment interior or Left or Bottom sides
+        if p.0 == q.0 || p.1 == q.1 {
+            return true;
+        }
+        let orient_ul = orientation_index(p, q, (minx, maxy));
+        if orient_ul == 0 {
+            // upward segment does not intersect pixel interior
+            return p.1 >= q.1;
+        }
+        let orient_ur = orientation_index(p, q, (maxx, maxy));
+        if orient_ur == 0 {
+            // downward segment does not intersect pixel interior
+            return p.1 <= q.1;
+        }
+        // check crossing Top side
+        if orient_ul != orient_ur {
+            return true;
+        }
+        let orient_ll = orientation_index(p, q, (minx, miny));
+        if orient_ll == 0 {
+            // segment crossed LL corner, which is the only one in pixel interior
+            return true;
+        }
+        // check crossing Left side
+        if orient_ll != orient_ul {
+            return true;
+        }
+        let orient_lr = orientation_index(p, q, (maxx, miny));
+        if orient_lr == 0 {
+            // upward segment does not intersect pixel interior
+            return p.1 >= q.1;
+        }
+        // check crossing Bottom side or Right side
+        orient_ll != orient_lr || orient_lr != orient_ur
+    }
+}
+
+/// Rounds polygon rings to `grid` like JTS's `SnapRoundingNoder`: every vertex becomes a hot pixel and each original
+/// segment is noded at every hot pixel it passes through (other than the pixels of its own endpoints). This lets
+/// slivers thinner than a grid cell collapse (and be removed by the overlay) the way they do in JTS instead of
+/// surviving as tiny triangles.
+///
+/// TODO(port): JTS also adds hot pixels for segment intersections (and vertices within a tiny tolerance of other
+/// segments); here those are only rounded by the integer overlay.
+fn snap_rounded_contours(polys: &[&Polygon<f64>], grid: Grid) -> Vec<Contour> {
+    let rings: Vec<(&LineString<f64>, bool)> = polys
+        .iter()
+        .filter(|p| !p.exterior().0.is_empty())
+        .flat_map(|p| std::iter::once((p.exterior(), true)).chain(p.interiors().iter().map(|h| (h, false))))
+        .collect();
+    let mut pixels: Vec<(i64, i64)> = rings.iter().flat_map(|(r, _)| r.0.iter().map(|c| grid.to_int(*c))).collect();
+    pixels.sort_unstable();
+    pixels.dedup();
+    let index = rstar::RTree::bulk_load(pixels.iter().map(|&(x, y)| HotPixel { x, y }).collect());
+    let scaled = |c: &Coord<f64>| (c.x * grid.scale, c.y * grid.scale);
+    let mut out = Vec::with_capacity(rings.len());
+    let mut nodes: Vec<(f64, (i64, i64))> = Vec::new();
+    for (ring, shell) in rings {
+        let mut contour: Contour = Vec::with_capacity(ring.0.len());
+        for w in ring.0.windows(2) {
+            let (a, b) = (grid.to_int(w[0]), grid.to_int(w[1]));
+            if contour.last() != Some(&a) {
+                contour.push(a);
+            }
+            if a == b {
+                continue;
+            }
+            let (p0, p1) = (scaled(&w[0]), scaled(&w[1]));
+            let envelope = rstar::AABB::from_corners(
+                [p0.0.min(p1.0) - HotPixel::TOLERANCE, p0.1.min(p1.1) - HotPixel::TOLERANCE],
+                [p0.0.max(p1.0) + HotPixel::TOLERANCE, p0.1.max(p1.1) + HotPixel::TOLERANCE],
+            );
+            nodes.clear();
+            let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+            for hp in index.locate_in_envelope_intersecting(envelope) {
+                let key = (hp.x, hp.y);
+                if key != a && key != b && hp.intersects(p0, p1) {
+                    let t = (hp.x as f64 - p0.0) * dx + (hp.y as f64 - p0.1) * dy;
+                    nodes.push((t, key));
+                }
+            }
+            nodes.sort_by(|x, y| x.0.total_cmp(&y.0));
+            for &(_, key) in &nodes {
+                if contour.last() != Some(&key) {
+                    contour.push(key);
+                }
+            }
+        }
+        if contour.len() > 1 && contour.first() == contour.last() {
+            contour.pop();
+        }
+        out.push(oriented(contour, shell));
+    }
+    out
+}
+
 /// Equivalent of JTS `geom.buffer(0)` for polygonal geometries: resolves self-intersections and overlaps. Points and
 /// lines produce an empty polygon.
 pub fn buffer_zero(geom: &Geometry<f64>) -> GeometryResult<Geometry<f64>> {
@@ -316,7 +464,7 @@ pub fn reduce_precision(geom: &Geometry<f64>, pm: &PrecisionModel) -> GeometryRe
     let reduced_polys = if polys.is_empty() {
         vec![]
     } else {
-        let contours = Contours { subject: positive_contours(&polys, grid), clip: vec![] };
+        let contours = Contours { subject: snap_rounded_contours(&polys, grid), clip: vec![] };
         let max_int = max_abs_coord(polys.iter().copied()) * scale + 1.0;
         overlay(&contours, grid, max_int, OverlayRule::Subject, FillRule::Positive, true)?
     };

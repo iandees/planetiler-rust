@@ -135,11 +135,7 @@ mod tests {
         .unwrap();
         let mbtiles = Mbtiles::new_read_only_database(&db_path).unwrap();
         assert_metadata(&mbtiles, "Parks Overlay");
-        // TODO(port): Java finds 53. The only difference is way 878847084 in tile 14/8529/5973: Java emits
-        // POLYGON((236.375 260,236.5625 259.5,237.875 260,236.375 260)) while Rust also keeps a second ~0.004px²
-        // sliver ((240 259.9375,240.125 260,240 260,240 259.9375)) at the tile buffer edge (polygon clipping /
-        // precision reduction difference in core's renderer), counted as an extra polygon.
-        assert_num_features(&mbtiles, "parks", 14, &Tags::new(), 54, GeometryType::Polygon);
+        assert_num_features(&mbtiles, "parks", 14, &Tags::new(), 53, GeometryType::Polygon);
         assert_tile_duplicates(&mbtiles, 0);
     }
 }

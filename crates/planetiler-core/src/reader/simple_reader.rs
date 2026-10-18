@@ -205,6 +205,9 @@ pub(crate) fn extract_from_zip(
         return Ok(None);
     };
     std::fs::create_dir_all(tmp_dir)?;
+    // tempfile returns absolute paths, so compare against an absolute tmp dir
+    let tmp_dir_abs = std::path::absolute(tmp_dir)?;
+    let tmp_dir = tmp_dir_abs.as_path();
     let extracted = if keep_unzipped {
         // like Java's URLEncoder.encode(zipEntryPath, UTF_8)
         let encoded: String = format!("/{}", entry.trim_start_matches('/'))
