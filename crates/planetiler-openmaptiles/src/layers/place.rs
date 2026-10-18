@@ -857,7 +857,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs the boundary and park layers, which are ported separately; un-ignore once they are merged"]
     fn test_indigenous_land() {
         let t = LayerTest::new();
         let land = || {

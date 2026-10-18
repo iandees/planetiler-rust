@@ -545,7 +545,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO(port): enable once the poi layer is ported (expects poi features)"]
     fn test_water() {
         let t = LayerTest::new();
         assert_features(
@@ -625,7 +624,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO(port): enable once the poi layer is ported (expects a poi feature)"]
     fn test_dock() {
         let t = LayerTest::new();
         assert_features(

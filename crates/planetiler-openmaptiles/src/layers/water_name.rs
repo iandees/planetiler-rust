@@ -477,7 +477,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO(port): enable once the poi layer is ported (expects a poi feature)"]
     fn test_swimming_pool_with_name() {
         let t = LayerTest::new();
         assert_features(

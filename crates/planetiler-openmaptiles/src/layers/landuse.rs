@@ -178,7 +178,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expects a poi feature: un-ignore once the poi layer is ported"]
     fn test_osm_landuse() {
         let t = LayerTest::new();
         assert_features(
@@ -227,7 +226,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expects a poi feature: un-ignore once the poi layer is ported"]
     fn test_grave_yard_becomes_cemetery() {
         let t = LayerTest::new();
         assert_features(
