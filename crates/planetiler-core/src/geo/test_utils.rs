@@ -2,7 +2,7 @@
 //!
 //! These are not `#[cfg(test)]`-gated so that integration tests and other crates can use them.
 
-use geo::{MapCoords, Relate, Validation, Winding};
+use geo::{MapCoords, Relate, Winding};
 use geo_types::{
     Coord, Geometry, GeometryCollection, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
 };
@@ -14,7 +14,7 @@ use crate::geo::precision_model::java_round;
 /// Coordinates from a flat list of `x, y, x, y, ...` values.
 pub fn new_coordinate_list(coords: &[f64]) -> Vec<Coord<f64>> {
     assert!(coords.len().is_multiple_of(2), "odd number of ordinates");
-    coords.chunks_exact(2).map(|c| Coord { x: c[0], y: c[1] }).collect()
+    coords.as_chunks::<2>().0.iter().map(|c| Coord { x: c[0], y: c[1] }).collect()
 }
 
 /// A polygon with no holes from a flat list of `x, y, ...` ordinates for the outer ring.
@@ -178,7 +178,7 @@ pub fn assert_point_on_surface(surface: &Geometry<f64>, actual: &Geometry<f64>) 
 #[track_caller]
 pub fn validate_geometry(g: &Geometry<f64>) {
     if matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_)) {
-        assert!(g.is_valid(), "invalid: {g:?}");
+        assert!(crate::geo::is_valid::is_valid(g), "invalid: {g:?}");
     }
     validate_geometry_recursive(g);
 }

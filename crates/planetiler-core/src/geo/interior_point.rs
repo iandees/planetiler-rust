@@ -245,7 +245,7 @@ fn for_each_polygon(geom: &Geometry<f64>, f: &mut impl FnMut(&Polygon<f64>)) {
         Geometry::Polygon(p) => f(p),
         Geometry::Rect(r) => f(&r.to_polygon()),
         Geometry::Triangle(t) => f(&t.to_polygon()),
-        Geometry::MultiPolygon(mp) => mp.0.iter().for_each(|p| f(p)),
+        Geometry::MultiPolygon(mp) => mp.0.iter().for_each(&mut *f),
         Geometry::GeometryCollection(gc) => gc.0.iter().for_each(|g| for_each_polygon(g, f)),
         _ => {}
     }
@@ -327,7 +327,7 @@ fn interior_point_polygon(poly: &Polygon<f64>) -> (Coord<f64>, f64) {
         "Interior Point robustness failure: odd number of scanline crossings"
     );
     crossings.sort_by(f64::total_cmp);
-    for pair in crossings.chunks_exact(2) {
+    for pair in crossings.as_chunks::<2>().0 {
         let (x1, x2) = (pair[0], pair[1]);
         if x2 - x1 > width {
             width = x2 - x1;

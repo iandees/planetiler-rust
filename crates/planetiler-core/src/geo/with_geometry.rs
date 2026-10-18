@@ -54,10 +54,10 @@ impl GeometryCache {
 }
 
 /// Get or compute a memoized fallible geometry.
-pub fn cached<'a>(
-    cell: &'a OnceLock<GeometryResult<Geometry<f64>>>,
+pub fn cached(
+    cell: &OnceLock<GeometryResult<Geometry<f64>>>,
     f: impl FnOnce() -> GeometryResult<Geometry<f64>>,
-) -> GeometryResult<&'a Geometry<f64>> {
+) -> GeometryResult<&Geometry<f64>> {
     cell.get_or_init(f).as_ref().map_err(Clone::clone)
 }
 

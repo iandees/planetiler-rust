@@ -10,10 +10,11 @@ use rstar::primitives::GeomWithData;
 use rstar::{AABB, RTree};
 
 type Entry = GeomWithData<[f64; 2], usize>;
+type Built<T> = (RTree<Entry>, Vec<(Coord<f64>, T)>);
 
 pub struct PointIndex<T> {
     items: Mutex<Vec<(Coord<f64>, T)>>,
-    built: OnceLock<(RTree<Entry>, Vec<(Coord<f64>, T)>)>,
+    built: OnceLock<Built<T>>,
 }
 
 impl<T: Clone> Default for PointIndex<T> {
@@ -27,7 +28,7 @@ impl<T: Clone> PointIndex<T> {
         PointIndex { items: Mutex::new(Vec::new()), built: OnceLock::new() }
     }
 
-    fn index(&self) -> &(RTree<Entry>, Vec<(Coord<f64>, T)>) {
+    fn index(&self) -> &Built<T> {
         self.built.get_or_init(|| {
             let items = std::mem::take(&mut *self.items.lock());
             let entries = items.iter().enumerate().map(|(i, (c, _))| GeomWithData::new([c.x, c.y], i)).collect();

@@ -235,7 +235,6 @@ impl GeometryPipeline for VWSimplifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geo::geometry_transformer::is_empty;
     use crate::geo::test_utils::*;
     use geo::Rotate;
     use geo_types::{LineString, Point, Polygon};
@@ -303,10 +302,7 @@ mod tests {
     fn polygon_leave_a_point_when_area_less_than_tolerance() {
         let input: Geometry<f64> = new_polygon(&[0.0, 0.0, 10.0, 10.0, 9.0, 10.0, 0.0, 8.0, 0.0, 0.0]).into();
         let collapsed = VWSimplifier::new().set_tolerance(200.0).set_weight(0.0).transform(&input);
-        // TODO(port): Java returns an empty GeometryCollection here (JTS GeometryTransformer.transformPolygon builds
-        // a collection from the remaining rings when the shell transforms to null); geometry_transformer currently
-        // returns an empty polygon, so only check emptiness until that is fixed.
-        assert!(is_empty(&collapsed), "{collapsed:?}");
+        assert_same_normalized_feature(&empty_geometry(), &collapsed);
         assert_same_normalized_feature(
             &new_polygon(&[0.0, 0.0, 0.0, 8.0, 10.0, 10.0, 0.0, 0.0]).into(),
             &VWSimplifier::new().set_tolerance(200.0).set_keep_collapsed(true).set_weight(0.0).transform(&input),

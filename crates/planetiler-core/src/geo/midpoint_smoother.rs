@@ -79,35 +79,10 @@ impl GeometryPipeline for MidpointSmoother {
 pub(crate) mod tests {
     use super::*;
     use crate::geo::test_utils::round;
-    use geo_types::{LineString, Point, Polygon};
 
-    /// Minimal WKT reader for `POINT`, `LINESTRING` and `POLYGON` test fixtures.
+    /// Parse a WKT test fixture.
     pub(crate) fn wkt(input: &str) -> Geometry<f64> {
-        let input = input.trim();
-        let open = input.find('(').expect("missing (");
-        let kind = input[..open].trim().to_ascii_uppercase();
-        let body = input[open..].trim();
-        let parse_coords = |s: &str| -> Vec<Coord<f64>> {
-            s.trim_matches(|c: char| c == '(' || c == ')' || c.is_whitespace())
-                .split(',')
-                .map(|pair| {
-                    let mut it = pair.split_whitespace().map(|v| v.parse::<f64>().expect("bad number"));
-                    Coord { x: it.next().unwrap(), y: it.next().unwrap() }
-                })
-                .collect()
-        };
-        match kind.as_str() {
-            "POINT" => Geometry::Point(Point(parse_coords(body)[0])),
-            "LINESTRING" => Geometry::LineString(LineString(parse_coords(body))),
-            "POLYGON" => {
-                let inner = &body[1..body.len() - 1];
-                let mut rings: Vec<LineString<f64>> =
-                    inner.split(')').filter(|s| s.contains('(')).map(|s| LineString(parse_coords(s))).collect();
-                let shell = rings.remove(0);
-                Geometry::Polygon(Polygon::new(shell, rings))
-            }
-            other => panic!("unsupported wkt type {other}"),
-        }
+        crate::geo::wkt::read_wkt(input).expect("invalid wkt")
     }
 
     fn check(input: &str, expected: &str, iters: usize) {

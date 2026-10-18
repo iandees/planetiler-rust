@@ -151,7 +151,7 @@ impl<'a> Parser<'a> {
     fn geometry(&mut self) -> GeometryResult<Geometry<f64>> {
         let kind = self.word();
         let save_dims = self.dims;
-        let empty = self.dims_and_empty().or_else(|_| Ok::<bool, GeometryException>(false))?;
+        let empty = self.dims_and_empty().unwrap_or(false);
         let result = match kind.as_str() {
             "POINT" => {
                 if empty {

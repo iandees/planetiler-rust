@@ -234,7 +234,7 @@ pub fn combine(geometries: Vec<Geometry<f64>>) -> Geometry<f64> {
 
 /// Coordinates from a list of `x, y, x, y, ...` values.
 pub fn coordinate_sequence(coords: &[f64]) -> Vec<Coord<f64>> {
-    coords.chunks_exact(2).map(|c| Coord { x: c[0], y: c[1] }).collect()
+    coords.as_chunks::<2>().0.iter().map(|c| Coord { x: c[0], y: c[1] }).collect()
 }
 
 /// Returns true if `geom` is valid according to JTS rules.

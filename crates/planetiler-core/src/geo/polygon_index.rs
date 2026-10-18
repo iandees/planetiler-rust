@@ -13,10 +13,11 @@ use rstar::{AABB, RTree};
 use crate::geo::envelope::Envelope;
 
 type Entry = GeomWithData<Rectangle<[f64; 2]>, usize>;
+type Built<T> = (RTree<Entry>, Vec<(Polygon<f64>, T)>);
 
 pub struct PolygonIndex<T> {
     items: Mutex<Vec<(Polygon<f64>, T)>>,
-    built: OnceLock<(RTree<Entry>, Vec<(Polygon<f64>, T)>)>,
+    built: OnceLock<Built<T>>,
 }
 
 impl<T: Clone> Default for PolygonIndex<T> {
@@ -30,7 +31,7 @@ impl<T: Clone> PolygonIndex<T> {
         PolygonIndex { items: Mutex::new(Vec::new()), built: OnceLock::new() }
     }
 
-    fn index(&self) -> &(RTree<Entry>, Vec<(Polygon<f64>, T)>) {
+    fn index(&self) -> &Built<T> {
         self.built.get_or_init(|| {
             let items = std::mem::take(&mut *self.items.lock());
             let entries = items

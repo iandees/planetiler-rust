@@ -112,10 +112,11 @@ pub fn get_center(polygonal: &Geometry<f64>, tolerance: f64) -> Option<Coord<f64
         if ring.len() == 4 {
             return Some(triangle_in_centre(ring[0], ring[1], ring[2]));
         }
-        if ring.len() == 5 && is_convex(ring) {
-            if let Some(c) = convex_quadrilateral_center(ring) {
-                return Some(c);
-            }
+        if ring.len() == 5
+            && is_convex(ring)
+            && let Some(c) = convex_quadrilateral_center(ring)
+        {
+            return Some(c);
         }
     }
     let segments: Vec<RLine<[f64; 2]>> = polys

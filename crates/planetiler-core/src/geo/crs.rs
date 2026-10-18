@@ -143,7 +143,7 @@ impl Crs {
     }
 
     /// Convert WGS84 lon/lat degrees to this CRS (in east/north order).
-    fn from_lon_lat(&self, c: Coord<f64>) -> Result<Coord<f64>> {
+    fn lon_lat_to_crs(&self, c: Coord<f64>) -> Result<Coord<f64>> {
         match &self.kind {
             Kind::Geographic => Ok(c),
             Kind::WebMercator => Ok(Coord {
@@ -197,7 +197,7 @@ impl MathTransform {
             c = Coord { x: c.y, y: c.x };
         }
         if !self.source.same_kind(&self.dest) {
-            c = self.dest.from_lon_lat(self.source.to_lon_lat(c)?)?;
+            c = self.dest.lon_lat_to_crs(self.source.to_lon_lat(c)?)?;
         }
         if !self.dest.longitude_first {
             c = Coord { x: c.y, y: c.x };
