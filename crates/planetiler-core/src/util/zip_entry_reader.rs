@@ -70,6 +70,8 @@ pub struct ZipEntryReader {
     expected_size: u64,
     size: u64,
     done: bool,
+    /// The first error, returned again by every later `read`.
+    failed: Option<(io::ErrorKind, String)>,
 }
 
 impl ZipEntryReader {
@@ -84,7 +86,14 @@ impl ZipEntryReader {
         Self::open_with(zip_path, entry, threads, MIN_PARALLEL_SIZE)
     }
 
-    fn open_with(zip_path: &Path, entry: &str, threads: usize, min_parallel: usize) -> anyhow::Result<ZipEntryReader> {
+    /// Opens entry `entry` of the zip file at `zip_path`; deflated entries of at least `min_parallel` compressed bytes
+    /// are inflated by `threads` background threads when `threads > 1`.
+    pub fn open_with(
+        zip_path: &Path,
+        entry: &str,
+        threads: usize,
+        min_parallel: usize,
+    ) -> anyhow::Result<ZipEntryReader> {
         let file = std::fs::File::open(zip_path).with_context(|| format!("opening {}", zip_path.display()))?;
         let file_len = file.metadata()?.len();
         let (start, compressed, size, crc, method) = {
@@ -119,6 +128,7 @@ impl ZipEntryReader {
             expected_size: size,
             size: 0,
             done: false,
+            failed: None,
         })
     }
 
@@ -145,6 +155,20 @@ impl ZipEntryReader {
 
 impl Read for ZipEntryReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some((kind, message)) = &self.failed {
+            return Err(io::Error::new(*kind, message.clone()));
+        }
+        let result = self.read_inner(buf);
+        if let Err(e) = &result {
+            // keep failing: after a size or CRC-32 mismatch the next read would otherwise report a clean end
+            self.failed = Some((e.kind(), e.to_string()));
+        }
+        result
+    }
+}
+
+impl ZipEntryReader {
+    fn read_inner(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.done || buf.is_empty() {
             return Ok(0);
         }

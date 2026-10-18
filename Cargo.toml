@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["vendor"]
+exclude = ["vendor", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -93,3 +93,10 @@ codegen-units = 16
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Release speed with debug assertions and overflow checks, for fuzzing (`fuzz_parallel_inflate`)
+[profile.release-checked]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+lto = false

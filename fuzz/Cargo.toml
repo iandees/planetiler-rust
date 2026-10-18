@@ -1,0 +1,31 @@
+# cargo-fuzz (libFuzzer) targets; needs nightly Rust and `cargo install cargo-fuzz`:
+#
+#     cargo +nightly fuzz run parallel_inflate -- -max_len=65536
+#
+# Kept out of the main workspace (its own `[workspace]` below) so the stable build never sees libfuzzer-sys. The
+# stable-Rust differential fuzzer is `crates/planetiler-benchmarks/src/bin/fuzz_parallel_inflate.rs`.
+[package]
+name = "planetiler-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+planetiler-core = { path = "../crates/planetiler-core" }
+flate2 = { version = "1", features = ["zlib-rs"] }
+
+[[bin]]
+name = "parallel_inflate"
+path = "fuzz_targets/parallel_inflate.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+
+[patch.crates-io]
+i_float = { path = "../vendor/i_float" }

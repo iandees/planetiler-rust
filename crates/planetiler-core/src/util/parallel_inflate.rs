@@ -17,6 +17,11 @@
 //!
 //! So a wrong guess only costs time, never correctness. [`ParallelInflater`] implements [`Read`] and keeps a bounded
 //! number of chunks in flight. Callers should still verify a checksum of the output (zip entries have a CRC-32).
+//!
+//! The input is untrusted, so memory per worker and the block-start search are bounded (see
+//! `SPECULATIVE_BLOCK_SLACK`), and decoding pauses inside huge blocks instead of materializing them. Differential
+//! fuzzing against zlib-rs: `planetiler-benchmarks/src/bin/fuzz_parallel_inflate.rs` (stable) and `fuzz/` (cargo-fuzz).
+#![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -295,39 +300,47 @@ fn read_dynamic_tables(bits: &mut Bits, litlen: &mut Huffman, dist: &mut Huffman
 }
 
 /// Where decoded symbols go.
+///
+/// [`decode_huffman_block`] calls [`Sink::reserve_symbols`] before every step, and each step then makes at most two
+/// [`Sink::literal`] calls, or one `literal` and one [`Sink::copy`] call, or one `copy` call. Nothing else calls
+/// `literal` or `copy`. [`ByteSink`] uses this to grow its buffer (and to pause) only in `reserve_symbols`, so the
+/// pushes in a step never reallocate.
 trait Sink {
-    /// Called before each pair of decoded symbols (at most 2 literals or 1 match).
-    fn reserve_symbols(&mut self) {}
+    /// Called before each step of at most 2 literals or 1 literal + 1 match (up to 259 bytes). Returns `true` to
+    /// pause decoding here (at a symbol boundary) because the sink is full.
+    fn reserve_symbols(&mut self) -> bool;
     fn literal(&mut self, b: u8);
     fn copy(&mut self, dist: usize, len: usize) -> Res<()>;
     fn stored(&mut self, bytes: &[u8]);
 }
 
-/// Plain byte output after `base` bytes of known window.
+/// Plain byte output (after a known window prefix, if any).
 struct ByteSink {
     out: Vec<u8>,
+    /// Pause once `out` holds at least this many bytes and needs to grow.
+    limit: usize,
 }
 
-/// Spare capacity [`ByteSink`] keeps so a match (up to 258 bytes) can be copied in 16-byte steps without checks.
+/// Spare capacity [`ByteSink`] keeps so a literal plus a match (up to 258 bytes, copied in 16-byte steps: up to 272
+/// bytes pushed before the overshoot is truncated) fit without reallocating. This code used to write into the spare
+/// capacity with `unsafe` pointer copies; the safe pushes below cost ~2% more inflate CPU time (see PORTING.md).
 const SLACK: usize = 258 + 32;
 
 impl Sink for ByteSink {
     #[inline(always)]
-    fn reserve_symbols(&mut self) {
+    fn reserve_symbols(&mut self) -> bool {
         if self.out.capacity() - self.out.len() < SLACK {
+            if self.out.len() >= self.limit {
+                return true;
+            }
             self.out.reserve(SLACK.max(self.out.len() / 4));
         }
+        false
     }
 
     #[inline(always)]
     fn literal(&mut self, b: u8) {
-        let n = self.out.len();
-        debug_assert!(n < self.out.capacity());
-        // SAFETY: reserve_symbols left room for at least 2 literals
-        unsafe {
-            self.out.as_mut_ptr().add(n).write(b);
-            self.out.set_len(n + 1);
-        }
+        self.out.push(b);
     }
 
     #[inline(always)]
@@ -336,28 +349,24 @@ impl Sink for ByteSink {
         if dist > n || dist == 0 {
             return Err(Invalid);
         }
-        debug_assert!(len <= 258 && self.out.capacity() - n >= SLACK - 1);
-        // SAFETY: reserve_symbols left SLACK bytes of capacity, enough for len rounded up to 16; source bytes are
-        // initialized: with dist >= 16 each 16-byte step reads at least 16 bytes behind where it writes, and the
-        // other cases copy byte by byte
-        unsafe {
-            let base = self.out.as_mut_ptr();
-            let dst = base.add(n);
-            let src = base.add(n - dist);
-            if dist >= 16 {
-                let mut i = 0;
-                while i < len {
-                    std::ptr::copy_nonoverlapping(src.add(i), dst.add(i), 16);
-                    i += 16;
-                }
-            } else if dist == 1 {
-                std::ptr::write_bytes(dst, *src, len);
-            } else {
-                for i in 0..len {
-                    *dst.add(i) = *src.add(i);
-                }
+        if dist >= 16 {
+            // 16 bytes at a time, each step reading only bytes that are already there; the overshoot is cut off
+            let mut i = 0;
+            while i < len {
+                let s = n - dist + i;
+                let step: [u8; 16] = self.out[s..s + 16].try_into().unwrap();
+                self.out.extend_from_slice(&step);
+                i += 16;
             }
-            self.out.set_len(n + len);
+            self.out.truncate(n + len);
+        } else if dist == 1 {
+            let b = self.out[n - 1];
+            self.out.resize(n + len, b);
+        } else {
+            for i in 0..len {
+                let b = self.out[n - dist + i];
+                self.out.push(b);
+            }
         }
         Ok(())
     }
@@ -372,9 +381,16 @@ struct MarkerSink {
     out: Vec<u16>,
     /// Index after the last marker written (0 = none).
     last_marker_end: usize,
+    /// Pause once `out` holds at least this many values.
+    limit: usize,
 }
 
 impl Sink for MarkerSink {
+    #[inline(always)]
+    fn reserve_symbols(&mut self) -> bool {
+        self.out.len() >= self.limit
+    }
+
     #[inline(always)]
     fn literal(&mut self, b: u8) {
         self.out.push(b as u16);
@@ -402,15 +418,18 @@ impl Sink for MarkerSink {
     }
 }
 
-/// Decodes the symbols of one Huffman-coded block into `sink`.
+/// Decodes the symbols of one Huffman-coded block into `sink`. Returns `true` at the end of the block, or `false` if
+/// the sink asked to pause (decoding can resume from `bits` with the same tables).
 #[inline(always)]
-fn decode_huffman_block<S: Sink>(bits: &mut Bits, litlen: &Huffman, dist: &Huffman, sink: &mut S) -> Res<()> {
+fn decode_huffman_block<S: Sink>(bits: &mut Bits, litlen: &Huffman, dist: &Huffman, sink: &mut S) -> Res<bool> {
     loop {
         bits.refill();
         if bits.pos > bits.data.len() + 8 {
             return Err(Invalid); // ran past the end of the input
         }
-        sink.reserve_symbols();
+        if sink.reserve_symbols() {
+            return Ok(false);
+        }
         let sym = litlen.decode(bits)?;
         if sym < 256 {
             sink.literal(sym as u8);
@@ -421,14 +440,14 @@ fn decode_huffman_block<S: Sink>(bits: &mut Bits, litlen: &Huffman, dist: &Huffm
                 continue;
             }
             if sym == 256 {
-                return Ok(());
+                return Ok(true);
             }
             bits.refill();
             copy_match(bits, sym, dist, sink)?;
             continue;
         }
         if sym == 256 {
-            return Ok(());
+            return Ok(true);
         }
         copy_match(bits, sym, dist, sink)?;
     }
@@ -460,17 +479,28 @@ struct Buffers {
     values: Vec<Vec<u16>>,
 }
 
+/// A Huffman block that [`Decoder::block`] stopped in the middle of.
+#[derive(Clone, Copy, Debug)]
+struct Paused {
+    /// Fixed tables (otherwise the decoder's dynamic tables, which stay untouched until it resumes).
+    fixed: bool,
+    /// BFINAL of the block.
+    last: bool,
+}
+
 /// Reusable decoding state.
 struct Decoder {
     litlen: Huffman,
     dist: Huffman,
     scratch: Huffman,
     pool: Pool,
+    /// Set when the last [`Decoder::block`] call paused: the next call continues that block.
+    paused: Option<Paused>,
 }
 
 impl Decoder {
     fn new(pool: Pool) -> Decoder {
-        Decoder { litlen: Huffman::new(10), dist: Huffman::new(8), scratch: Huffman::new(7), pool }
+        Decoder { litlen: Huffman::new(10), dist: Huffman::new(8), scratch: Huffman::new(7), pool, paused: None }
     }
 
     fn buffer(&self) -> Vec<u8> {
@@ -485,36 +515,55 @@ impl Decoder {
         buf
     }
 
-    /// Decodes one block (header included) into `sink`. Returns whether it was the final block.
-    fn block<S: Sink>(&mut self, bits: &mut Bits, sink: &mut S) -> Res<bool> {
-        bits.refill();
-        let last = bits.take(1) == 1;
-        match bits.take(2) {
-            0 => {
-                bits.align_to_byte();
+    /// Decodes one block (header included, unless resuming a paused block) into `sink`. Returns `Some(BFINAL)` at
+    /// the end of the block, or `None` if the sink asked to pause (the next call continues from `bits`).
+    fn block<S: Sink>(&mut self, bits: &mut Bits, sink: &mut S) -> Res<Option<bool>> {
+        let Paused { fixed, last } = match self.paused.take() {
+            Some(paused) => paused,
+            None => {
                 bits.refill();
-                let len = bits.take(16) as usize;
-                let nlen = bits.take(16) as usize;
-                if len != !nlen & 0xffff {
-                    return Err(Invalid);
+                let last = bits.take(1) == 1;
+                match bits.take(2) {
+                    0 => {
+                        bits.align_to_byte();
+                        bits.refill();
+                        let len = bits.take(16) as usize;
+                        let nlen = bits.take(16) as usize;
+                        if len != !nlen & 0xffff {
+                            return Err(Invalid);
+                        }
+                        // the reader buffers whole bytes ahead: after aligning, the next byte is at bit_pos / 8
+                        let start = bits.bit_pos() / 8;
+                        let bytes = bits.data.get(start..start + len).ok_or(Invalid)?;
+                        sink.stored(bytes);
+                        *bits = Bits::new(bits.data, (start + len) * 8);
+                        return Ok(Some(last));
+                    }
+                    1 => Paused { fixed: true, last },
+                    2 => {
+                        read_dynamic_tables(bits, &mut self.litlen, &mut self.dist, &mut self.scratch)?;
+                        Paused { fixed: false, last }
+                    }
+                    _ => return Err(Invalid),
                 }
-                // the reader buffers whole bytes ahead: after aligning, the next byte is at bit_pos / 8
-                let start = bits.bit_pos() / 8;
-                let bytes = bits.data.get(start..start + len).ok_or(Invalid)?;
-                sink.stored(bytes);
-                *bits = Bits::new(bits.data, (start + len) * 8);
             }
-            1 => {
-                let (litlen, dist) = fixed_tables();
-                decode_huffman_block(bits, litlen, dist, sink)?;
-            }
-            2 => {
-                read_dynamic_tables(bits, &mut self.litlen, &mut self.dist, &mut self.scratch)?;
-                decode_huffman_block(bits, &self.litlen, &self.dist, sink)?;
-            }
-            _ => return Err(Invalid),
+        };
+        let (litlen, dist) = if fixed {
+            let (litlen, dist) = fixed_tables();
+            (litlen, dist)
+        } else {
+            (&self.litlen, &self.dist)
+        };
+        let ended = decode_huffman_block(bits, litlen, dist, sink)?;
+        if bits.overrun() {
+            return Err(Invalid);
         }
-        if bits.overrun() { Err(Invalid) } else { Ok(last) }
+        if ended {
+            Ok(Some(last))
+        } else {
+            self.paused = Some(Paused { fixed, last });
+            Ok(None)
+        }
     }
 }
 
@@ -526,6 +575,8 @@ struct Chunk {
     end: usize,
     /// True if the last block was the final block of the stream.
     last: bool,
+    /// True if decoding paused in the middle of a block at `end` (the decoder can resume it).
+    paused: bool,
     /// Leading output that may contain window markers.
     markers: Vec<u16>,
     /// Remaining output, after `skip` bytes of window copied from the end of `markers`.
@@ -534,21 +585,25 @@ struct Chunk {
 }
 
 /// Decodes blocks starting at bit `start` until reaching one that starts at or after bit `stop`, the final block, or
-/// (to bound memory on highly compressible data) the first block boundary after producing `max_out` bytes. With
-/// `window = None`, references before `start` become markers; otherwise they read from `window`.
+/// (to bound memory on highly compressible data) the first block boundary after producing `max_out` bytes. A single
+/// block can expand ~1000x, so decoding also pauses in the middle of a block once it has produced about `pause_at`
+/// bytes (`Chunk::paused`; the next call with the same `decoder` continues that block). With `window = None`,
+/// references before `start` become markers; otherwise they read from `window`.
 fn decode_range(
     decoder: &mut Decoder,
     data: &[u8],
     start: usize,
     stop: usize,
     max_out: usize,
+    pause_at: usize,
     window: Option<&[u8]>,
 ) -> Res<Chunk> {
     let expected_out = (4 * (stop.min(data.len() * 8).saturating_sub(start) / 8)).min(max_out) + (1 << 16);
     let mut bits = Bits::new(data, start);
-    let mut chunk = Chunk { start, end: start, last: false, markers: vec![], bytes: vec![], skip: 0 };
-    let mut markers = window.is_none().then(|| MarkerSink { out: decoder.value_buffer(), last_marker_end: 0 });
-    let mut bytes = ByteSink { out: decoder.buffer() };
+    let mut chunk = Chunk { start, end: start, last: false, paused: false, markers: vec![], bytes: vec![], skip: 0 };
+    let mut markers =
+        window.is_none().then(|| MarkerSink { out: decoder.value_buffer(), last_marker_end: 0, limit: usize::MAX });
+    let mut bytes = ByteSink { out: decoder.buffer(), limit: usize::MAX };
     if let Some(window) = window {
         bytes.out.reserve(window.len() + expected_out);
         bytes.out.extend_from_slice(window);
@@ -559,8 +614,10 @@ fn decode_range(
         if bits.bit_pos() > start && (bits.bit_pos() >= stop || produced >= max_out) {
             break;
         }
+        let room = pause_at.saturating_sub(produced);
         let last = match &mut markers {
             Some(sink) => {
+                sink.limit = sink.out.len().saturating_add(room);
                 let last = decoder.block(&mut bits, sink)?;
                 // switch to plain bytes once no marker can be referenced any more
                 if sink.out.len() >= WINDOW && sink.out.len() - WINDOW >= sink.last_marker_end {
@@ -572,11 +629,21 @@ fn decode_range(
                 }
                 last
             }
-            None => decoder.block(&mut bits, &mut bytes)?,
+            None => {
+                bytes.limit = bytes.out.len().saturating_add(room);
+                decoder.block(&mut bits, &mut bytes)?
+            }
         };
-        if last {
-            chunk.last = true;
-            break;
+        match last {
+            Some(true) => {
+                chunk.last = true;
+                break;
+            }
+            Some(false) => {}
+            None => {
+                chunk.paused = true;
+                break;
+            }
         }
     }
     if let Some(sink) = markers {
@@ -587,10 +654,13 @@ fn decode_range(
     Ok(chunk)
 }
 
-/// Finds the first bit offset in `[from, to)` where a non-final dynamic block starts that decodes cleanly.
-fn find_block_start(decoder: &mut Decoder, data: &[u8], from: usize, to: usize) -> Option<usize> {
+/// Finds the first bit offset in `[from, to)` where a non-final dynamic block starts that decodes cleanly. Gives up
+/// once the trial decodes have produced `budget` values in total, so that crafted input (many plausible headers whose
+/// blocks decode for a long time before failing) cannot make the search quadratic.
+fn find_block_start(decoder: &mut Decoder, data: &[u8], from: usize, to: usize, budget: usize) -> Option<usize> {
     let to = to.min(data.len() * 8);
-    let mut sink = MarkerSink { out: Vec::with_capacity(1 << 16), last_marker_end: 0 };
+    let mut budget = budget;
+    let mut sink = MarkerSink { out: Vec::with_capacity(1 << 16), last_marker_end: 0, limit: budget };
     for bit in from..to {
         // quick checks: BFINAL = 0, BTYPE = 2, HLIT <= 29, HDIST <= 29
         let byte = bit / 8;
@@ -604,8 +674,11 @@ fn find_block_start(decoder: &mut Decoder, data: &[u8], from: usize, to: usize) 
             continue;
         }
         sink.out.clear();
-        if decode_huffman_block(&mut bits, &decoder.litlen, &decoder.dist, &mut sink).is_ok() && !bits.overrun() {
-            return Some(bit);
+        sink.limit = budget;
+        match decode_huffman_block(&mut bits, &decoder.litlen, &decoder.dist, &mut sink) {
+            Ok(true) if !bits.overrun() => return Some(bit),
+            Ok(false) => return None, // out of budget
+            _ => budget = budget.saturating_sub(sink.out.len()),
         }
     }
     None
@@ -692,6 +765,11 @@ impl InflateInput for Vec<u8> {
 /// Speculative chunk decodes may read this many bytes past the end of their chunk to finish their last block.
 const MARGIN: usize = 1 << 20;
 
+/// A speculative chunk decode gives up (leaving the chunk to the consumer) once it has produced this much more than
+/// its output limit, and so does the block-start search. zlib's blocks hold at most 16-32k symbols (< 8.5 MB), but a
+/// crafted block can expand ~1000x, which would otherwise cost each worker GBs of memory.
+const SPECULATIVE_BLOCK_SLACK: usize = 16 << 20;
+
 /// Decodes chunk `j` speculatively (absolute bit offsets in the result), or `None` if it did not work out.
 fn decode_chunk<D: InflateInput>(
     decoder: &mut Decoder,
@@ -700,15 +778,22 @@ fn decode_chunk<D: InflateInput>(
     chunk_bytes: usize,
     max_out: usize,
 ) -> Option<Chunk> {
+    decoder.paused = None;
     let base = j * chunk_bytes;
     let view = data.view(base..(base + chunk_bytes + MARGIN).min(data.byte_len())).ok()?;
     let stop = chunk_bytes * 8;
+    let pause_at = max_out + SPECULATIVE_BLOCK_SLACK;
     let mut chunk = if j == 0 {
-        decode_range(decoder, &view, 0, stop, max_out, Some(&[])).ok()?
+        decode_range(decoder, &view, 0, stop, max_out, pause_at, Some(&[])).ok()?
     } else {
-        let start = find_block_start(decoder, &view, 0, stop)?;
-        decode_range(decoder, &view, start, stop, max_out, None).ok()?
+        let start = find_block_start(decoder, &view, 0, stop, pause_at)?;
+        decode_range(decoder, &view, start, stop, max_out, pause_at, None).ok()?
     };
+    if chunk.paused {
+        // a huge block: leave it to the consumer, which can pause and resume
+        decoder.paused = None;
+        return None;
+    }
     chunk.start += base * 8;
     chunk.end += base * 8;
     Some(chunk)
@@ -739,12 +824,21 @@ pub struct ParallelInflater<D: InflateInput> {
     max_out: usize,
     /// Set while the consumer decodes the rest of a chunk's range (up to this bit offset) itself.
     partial_stop: Option<usize>,
+    /// The first error, returned again by every later `read` (the state after an error is not resumable).
+    failed: Option<(io::ErrorKind, String)>,
 }
 
 impl<D: InflateInput> ParallelInflater<D> {
     /// Starts decoding `data` (a raw deflate stream) in chunks of `chunk_size` compressed bytes on `threads` threads.
     pub fn new(data: Arc<D>, threads: usize, chunk_size: usize) -> ParallelInflater<D> {
-        let chunk_bits = chunk_size.max(1 << 16) * 8;
+        Self::with_any_chunk_size(data, threads, chunk_size.max(1 << 16))
+    }
+
+    /// Like [`ParallelInflater::new`] but without the 64 KB minimum chunk size, so that fuzzing and tests can make
+    /// small inputs cross many chunk boundaries (slow: chunks smaller than the 32 KB window mostly fall back).
+    #[doc(hidden)]
+    pub fn with_any_chunk_size(data: Arc<D>, threads: usize, chunk_size: usize) -> ParallelInflater<D> {
+        let chunk_bits = chunk_size.max(1) * 8;
         let num_chunks = (data.byte_len() * 8).div_ceil(chunk_bits).max(1);
         let threads = threads.max(1);
         let (jobs, job_rx) = crossbeam_channel::unbounded::<usize>();
@@ -791,6 +885,7 @@ impl<D: InflateInput> ParallelInflater<D> {
             max_pooled: threads + 4,
             max_out,
             partial_stop: None,
+            failed: None,
         };
         // keep a bounded number of chunks in flight
         for _ in 0..threads + 2 {
@@ -833,7 +928,9 @@ impl<D: InflateInput> ParallelInflater<D> {
             let base = self.pos / 8;
             let view = self.data.view(base..self.data.byte_len())?;
             let start = self.pos - base * 8;
-            let result = decode_range(&mut self.decoder, &view, start, stop - base * 8, self.max_out, Some(&window));
+            // pauses mid-block at max_out too, so one huge block is handed out in bounded pieces
+            let (stop_bit, max_out) = (stop.saturating_sub(base * 8), self.max_out); // < start when resuming past stop
+            let result = decode_range(&mut self.decoder, &view, start, stop_bit, max_out, max_out, Some(&window));
             self.window.buf = window;
             let mut chunk = result.map_err(invalid)?;
             chunk.start += base * 8;
@@ -892,7 +989,9 @@ impl<D: InflateInput> ParallelInflater<D> {
     fn finish(&mut self, chunk: Chunk, stop: usize) {
         self.pos = chunk.end;
         self.done = chunk.last;
-        self.partial_stop = (!chunk.last && chunk.end < stop).then_some(stop);
+        // a paused chunk ends inside a block: the consumer continues it (`self.decoder` holds the block's state), so
+        // a mid-block position is never compared with a worker's guess
+        self.partial_stop = (!chunk.last && (chunk.end < stop || chunk.paused)).then_some(stop);
         self.queue.push_back(Piece { bytes: chunk.bytes, skip: chunk.skip });
         if self.done {
             self.jobs = None;
@@ -923,7 +1022,13 @@ impl<D: InflateInput> Read for ParallelInflater<D> {
             if self.done {
                 return Ok(0);
             }
-            self.advance()?;
+            if let Some((kind, message)) = &self.failed {
+                return Err(io::Error::new(*kind, message.clone()));
+            }
+            if let Err(e) = self.advance() {
+                self.failed = Some((e.kind(), e.to_string()));
+                return Err(e);
+            }
         }
     }
 }
@@ -938,7 +1043,8 @@ impl<D: InflateInput> Drop for ParallelInflater<D> {
 /// Sequentially decodes a raw deflate stream with this module's decoder (for tests).
 #[cfg(test)]
 fn inflate_sequential(data: &[u8]) -> Res<Vec<u8>> {
-    let chunk = decode_range(&mut Decoder::new(Pool::default()), data, 0, usize::MAX, usize::MAX, Some(&[]))?;
+    let max = usize::MAX;
+    let chunk = decode_range(&mut Decoder::new(Pool::default()), data, 0, max, max, max, Some(&[]))?;
     if !chunk.last {
         return Err(Invalid);
     }
@@ -1062,5 +1168,294 @@ mod tests {
         let len = compressed.len();
         compressed.truncate(len / 2);
         assert!(parallel(compressed, 4, 1 << 16).is_err());
+    }
+
+    // Hand-made edge cases (from the differential fuzzer in `planetiler-benchmarks/src/bin/fuzz_parallel_inflate.rs`).
+    // Each one is checked against zlib-rs, sequentially and in parallel with chunks down to 1 byte.
+
+    /// LSB-first bit writer for hand-made streams.
+    #[derive(Default)]
+    struct BitWriter {
+        out: Vec<u8>,
+        buf: u64,
+        n: u32,
+    }
+
+    impl BitWriter {
+        fn put(&mut self, v: u32, bits: u32) -> &mut Self {
+            self.buf |= ((v as u64) & ((1 << bits) - 1)) << self.n;
+            self.n += bits;
+            while self.n >= 8 {
+                self.out.push(self.buf as u8);
+                self.buf >>= 8;
+                self.n -= 8;
+            }
+            self
+        }
+
+        /// A Huffman code (most significant bit first).
+        fn code(&mut self, code: u32, len: u32) -> &mut Self {
+            self.put(code.reverse_bits() >> (32 - len), len)
+        }
+
+        /// A fixed-Huffman literal/length symbol.
+        fn fixed(&mut self, sym: u32) -> &mut Self {
+            match sym {
+                0..=143 => self.code(0x30 + sym, 8),
+                144..=255 => self.code(0x190 + sym - 144, 9),
+                256..=279 => self.code(sym - 256, 7),
+                _ => self.code(0xc0 + sym - 280, 8),
+            }
+        }
+
+        fn stored(&mut self, last: bool, bytes: &[u8]) -> &mut Self {
+            self.put(last as u32, 1).put(0, 2);
+            if self.n > 0 {
+                self.put(0, 8 - self.n);
+            }
+            self.put(bytes.len() as u32, 16).put(!bytes.len() as u32, 16);
+            for &b in bytes {
+                self.put(b as u32, 8);
+            }
+            self
+        }
+
+        fn finish(&mut self) -> Vec<u8> {
+            if self.n > 0 {
+                self.put(0, 8 - self.n);
+            }
+            std::mem::take(&mut self.out)
+        }
+    }
+
+    /// zlib-rs's output, or `None` if it rejects the stream (including a missing final block).
+    fn zlib(data: &[u8]) -> Option<Vec<u8>> {
+        let mut d = flate2::Decompress::new(false);
+        let mut out = Vec::with_capacity(1 << 20);
+        loop {
+            out.reserve(1 << 20);
+            let (i, o) = (d.total_in(), d.total_out());
+            match d.decompress_vec(&data[i as usize..], &mut out, flate2::FlushDecompress::None) {
+                Ok(flate2::Status::StreamEnd) => return Some(out),
+                Ok(_) if d.total_in() == i && d.total_out() == o => return None,
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Decodes `data` like zlib-rs does, sequentially and in parallel (also with tiny chunks), and returns that.
+    fn check_against_zlib(data: &[u8]) -> Option<Vec<u8>> {
+        let expected = zlib(data);
+        assert_eq!(expected, inflate_sequential(data).ok(), "sequential");
+        for (threads, chunk) in [(1, 1 << 16), (4, 1), (3, 7), (4, 300)] {
+            let mut inflater = ParallelInflater::with_any_chunk_size(Arc::new(data.to_vec()), threads, chunk);
+            let mut out = vec![];
+            let result = inflater.read_to_end(&mut out).map(|_| out);
+            assert_eq!(expected, result.ok(), "{threads} threads, {chunk} byte chunks");
+        }
+        expected
+    }
+
+    #[test]
+    fn edge_case_huffman_codes() {
+        // empty fixed block
+        assert_eq!(Some(vec![]), check_against_zlib(&BitWriter::default().put(1, 1).put(1, 2).fixed(256).finish()));
+
+        // dynamic block whose literal/length code is a single 1-bit code (end of block) and whose distance code is
+        // empty: both allowed. Code length code: 18 -> 0, 0 -> 10, 1 -> 11.
+        let mut w = BitWriter::default();
+        w.put(1, 1).put(2, 2).put(0, 5).put(0, 5).put(18 - 4, 4);
+        for &sym in &CL_ORDER[..18] {
+            w.put(
+                match sym {
+                    18 => 1,
+                    0 | 1 => 2,
+                    _ => 0,
+                },
+                3,
+            );
+        }
+        // 256 zeros (138 + 118), a 1 for end-of-block, a 0 for the only distance code
+        w.code(0, 1).put(127, 7).code(0, 1).put(107, 7).code(0b11, 2).code(0b10, 2);
+        let single_code = w.code(0, 1).finish();
+        assert_eq!(Some(vec![]), check_against_zlib(&single_code));
+
+        // an incomplete code with more than one symbol is not allowed: same, but end-of-block gets a 2-bit code
+        let mut w = BitWriter::default();
+        w.put(1, 1).put(2, 2).put(0, 5).put(0, 5).put(18 - 4, 4);
+        for &sym in &CL_ORDER[..18] {
+            w.put(
+                match sym {
+                    18 => 1,
+                    0 | 2 => 2,
+                    _ => 0,
+                },
+                3,
+            );
+        }
+        w.code(0, 1).put(127, 7).code(0, 1).put(107, 7).code(0b11, 2).code(0b10, 2);
+        assert_eq!(None, check_against_zlib(&w.code(0, 2).finish()));
+
+        // a code length repeat (16) that runs from the literal/length lengths into the distance lengths is allowed.
+        // Lengths: 97 -> 1, 256 -> 2, 257 -> 2, distances 0-3 -> 2 (HLIT = 1, HDIST = 3). Code length code: all
+        // 2 bits (1 -> 00, 2 -> 01, 16 -> 10, 18 -> 11).
+        let mut w = BitWriter::default();
+        w.put(1, 1).put(2, 2).put(1, 5).put(3, 5).put(18 - 4, 4);
+        for &sym in &CL_ORDER[..18] {
+            w.put(if matches!(sym, 1 | 2 | 16 | 18) { 2 } else { 0 }, 3);
+        }
+        w.code(0b11, 2).put(97 - 11, 7); // 0-96: 0
+        w.code(0b00, 2); // 97: 1
+        w.code(0b11, 2).put(138 - 11, 7).code(0b11, 2).put(20 - 11, 7); // 98-255: 0
+        w.code(0b01, 2); // 256: 2
+        w.code(0b10, 2).put(5 - 3, 2); // 257 and distances 0-3: 2
+        // literal 'a' (0), length 3 (257 -> 11) at distance 1 (00), end of block (10)
+        w.code(0, 1).code(0b11, 2).code(0b00, 2).code(0b10, 2);
+        assert_eq!(Some(b"aaaa".to_vec()), check_against_zlib(&w.finish()));
+
+        // a repeat (16) as the first code length has nothing to repeat
+        let mut w = BitWriter::default();
+        w.put(1, 1).put(2, 2).put(1, 5).put(3, 5).put(18 - 4, 4);
+        for &sym in &CL_ORDER[..18] {
+            w.put(if matches!(sym, 1 | 2 | 16 | 18) { 2 } else { 0 }, 3);
+        }
+        w.code(0b10, 2).put(0, 2);
+        assert_eq!(None, check_against_zlib(&w.finish()));
+
+        // HLIT = 30 (287 literal/length codes) is too many
+        let mut w = BitWriter::default();
+        w.put(1, 1).put(2, 2).put(30, 5).put(0, 5).put(0, 4).put(0, 32);
+        assert_eq!(None, check_against_zlib(&w.finish()));
+    }
+
+    #[test]
+    fn edge_case_matches_and_blocks() {
+        // "ab" + (length 3, distance 2): fine; distance 3 reaches before the start of the stream
+        let stream = |dist_sym: u32| {
+            let mut w = BitWriter::default();
+            w.put(1, 1).put(1, 2).fixed(b'a' as u32).fixed(b'b' as u32).fixed(257).code(dist_sym, 5);
+            w.fixed(256).finish()
+        };
+        assert_eq!(Some(b"ababa".to_vec()), check_against_zlib(&stream(1)));
+        assert_eq!(None, check_against_zlib(&stream(2)));
+
+        // length 258 written as symbol 284 + 31 (zlib accepts it), distance 1
+        let mut w = BitWriter::default();
+        w.put(1, 1).put(1, 2).fixed(b'x' as u32).fixed(284).put(31, 5).code(0, 5).fixed(256);
+        assert_eq!(Some(vec![b'x'; 259]), check_against_zlib(&w.finish()));
+
+        // distance 32768 after exactly 32768 bytes of history (stored block); one byte less is too far
+        let history: Vec<u8> = (0..32768u32).map(|i| (i * 7 % 251) as u8).collect();
+        for n in [32768, 32767] {
+            let mut w = BitWriter::default();
+            w.stored(false, &history[..n]);
+            w.put(1, 1).put(1, 2).fixed(285).code(29, 5).put(32768 - 24577, 13).fixed(256);
+            let mut expected = history[..n].to_vec();
+            expected.extend_from_slice(&history[..258]);
+            assert_eq!((n == 32768).then_some(expected), check_against_zlib(&w.finish()), "{n}");
+        }
+
+        // reserved symbols in fixed blocks: literal/length 286 and 287, distance 30 and 31
+        for sym in [286, 287] {
+            assert_eq!(None, check_against_zlib(&BitWriter::default().put(1, 1).put(1, 2).fixed(sym).finish()));
+        }
+        for dist_sym in [30, 31] {
+            let mut w = BitWriter::default();
+            w.put(1, 1).put(1, 2).fixed(b'a' as u32).fixed(257).code(dist_sym, 5).fixed(256);
+            assert_eq!(None, check_against_zlib(&w.finish()));
+        }
+
+        // stored block with LEN != ~NLEN, block type 3, no final block, empty input
+        let mut bad_len = BitWriter::default().stored(true, b"abc").finish();
+        bad_len[3] ^= 1;
+        assert_eq!(None, check_against_zlib(&bad_len));
+        assert_eq!(None, check_against_zlib(&BitWriter::default().put(1, 1).put(3, 2).put(0, 16).finish()));
+        assert_eq!(None, check_against_zlib(&BitWriter::default().stored(false, b"abc").finish()));
+        assert_eq!(None, check_against_zlib(&[]));
+
+        // many empty stored blocks (5 bytes each, no output) around some data, crossing many chunks
+        let mut w = BitWriter::default();
+        for i in 0..2000 {
+            w.stored(false, if i == 1000 { b"hello" } else { b"" });
+        }
+        assert_eq!(Some(b"hello world".to_vec()), check_against_zlib(&w.stored(true, b" world").finish()));
+    }
+
+    #[test]
+    fn errors_are_sticky() {
+        let data = test_data(500_000, 11);
+        let mut compressed = deflate(&data, 6);
+        let len = compressed.len();
+        compressed[len / 2] ^= 0x10;
+        compressed.truncate(len * 3 / 4);
+        let mut inflater = ParallelInflater::with_any_chunk_size(Arc::new(compressed), 4, 10_000);
+        let mut out = vec![];
+        assert!(inflater.read_to_end(&mut out).is_err());
+        let mut buf = [0u8; 100];
+        assert!(inflater.read(&mut buf).is_err(), "a read after an error must fail again, not report the end");
+    }
+
+    #[test]
+    fn huge_single_block_is_handed_out_in_bounded_pieces() {
+        // one fixed block of 258-byte matches at distance 1 (13 bits each): 24 MB of output from ~150 KB. A worker
+        // used to decode the whole block into one piece (a crafted block can expand ~1000x, so GBs per worker)
+        let mut w = BitWriter::default();
+        w.put(1, 1).put(1, 2).fixed(b'z' as u32);
+        for _ in 0..(24 << 20) / 258 {
+            w.fixed(285).code(0, 5);
+        }
+        let compressed = w.fixed(256).finish();
+        let expected_len = 1 + (24 << 20) / 258 * 258;
+        let mut inflater = ParallelInflater::new(Arc::new(compressed), 4, 1 << 16);
+        let mut buf = vec![0u8; 1 << 16];
+        let (mut total, mut max_piece) = (0, 0);
+        loop {
+            let n = inflater.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            assert!(buf[..n].iter().all(|&b| b == b'z'));
+            total += n;
+            max_piece = max_piece.max(inflater.queue.iter().map(|p| p.bytes.len()).max().unwrap_or(0));
+        }
+        assert_eq!(expected_len, total);
+        assert!(max_piece < 4 * inflater.max_out, "{max_piece}");
+    }
+
+    #[test]
+    fn block_start_search_is_bounded_on_crafted_input() {
+        // copies of a dynamic block header whose literal code decodes zeros (and every other bit pattern in it) as
+        // literals and has no reachable end-of-block code, so every copy is a plausible block start whose block runs
+        // to the end of the input and fails there. Without a budget the search decodes ~n^2 / 2 symbols.
+        // Lengths: 0-254 -> 8, 255 and 256 -> 9 (end of block is 9 one bits), distance 0 -> 0. Code length code:
+        // 8 -> 0, 0 -> 10, 9 -> 11.
+        let mut w = BitWriter::default();
+        w.put(0, 1).put(2, 2).put(0, 5).put(0, 5).put(7 - 4, 4);
+        for &sym in &CL_ORDER[..7] {
+            w.put(
+                match sym {
+                    8 => 1,
+                    0 | 9 => 2,
+                    _ => 0,
+                },
+                3,
+            );
+        }
+        for _ in 0..255 {
+            w.code(0, 1);
+        }
+        w.code(0b11, 2).code(0b11, 2).code(0b10, 2);
+        let header = w.finish();
+        assert!(header.len() <= 40);
+        let mut data = vec![];
+        while data.len() < 256 << 10 {
+            data.extend_from_slice(&header);
+            data.resize(data.len().next_multiple_of(64), 0);
+        }
+        let mut decoder = Decoder::new(Pool::default());
+        assert_eq!(None, find_block_start(&mut decoder, &data, 0, data.len() * 8, 1 << 20));
+        // the whole stream is invalid too
+        assert_eq!(None, check_against_zlib(&data[..20_000]));
     }
 }
