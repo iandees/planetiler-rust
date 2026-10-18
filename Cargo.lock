@@ -1661,6 +1661,7 @@ name = "planetiler-benchmarks"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "geo",
  "geo-types",
  "indexmap",
