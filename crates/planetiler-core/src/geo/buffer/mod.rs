@@ -14,7 +14,7 @@
 //! JTS's floating point noding is not robust: when the rounded intersection points leave the curves not fully noded,
 //! building the result throws and `BufferOp` retries with snap-rounding at 12 significant digits. The port predicts
 //! that case by emulating JTS's noding and validity check ([`noding`]) and then uses snap-rounding at the same
-//! precision ([`polygon_overlay::positive_winding_region_snap_rounded`]).
+//! precision ([`polygon_overlay::positive_winding_region_scaled_snap_rounded`]).
 //!
 //! Differences from JTS:
 //! - Where curves cross within a few ulps of each other (e.g. several curves through nearly the same point), JTS's
@@ -71,8 +71,7 @@ pub fn buffer(geom: &Geometry<f64>, distance: f64, params: &BufferParameters) ->
         if curves.is_empty() {
             return Ok(polygon_overlay::to_polygonal(vec![]));
         }
-        let intersections = noding::intersection_points(&curves);
-        polygon_overlay::positive_winding_region_snap_rounded(&curves, &intersections, scale)?
+        polygon_overlay::positive_winding_region_scaled_snap_rounded(&curves, scale)?
     };
     if distance > 0.0 && num_geometries(geom) == 1 && result.len() > 1 {
         // Check to ensure that the buffer of a single geometry (with positive distance) is a single polygon (the

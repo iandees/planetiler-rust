@@ -3,8 +3,8 @@
 Read-only review of `main` @ `c116961` (2026-10-17). Nothing was compiled or run. Line numbers are as of that commit.
 
 **Status (2026-10-18):** all 2 unsound and 3 risky items in Part 1 are fixed (each section below has a **Fixed** note).
-In Part 2, all 13 (a1) items, 12 of the 16 (a2) markers, #32 and all 8 (c) items are done; see
-[Part 2 status](#part-2-status-2026-10-18). 20 `TODO(port)` markers remain.
+In Part 2, all 13 (a1) items, 12 of the 16 (a2) markers, #29, #30, #32 and all 8 (c) items are done; see
+[Part 2 status](#part-2-status-2026-10-18). 11 `TODO(port)` markers remain.
 
 ## Part 1: `unsafe` audit
 
@@ -221,9 +221,10 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 | #23 `Verify` feature counts | **Done.** `Verify::{get_num_features, check_min_feature_count, check_min_feature_count_range}`; `verify_monaco` uses them. |
 | #24, #25 `Verify` validity | **Done.** `check_validity` decodes every feature and requires polygons to be simple; `is_simple_polygonal` moved to `geo::is_valid`; `test_invalid_geometry` added. |
 | #26 `Stats` debug log | **Done** (WKB logged as hex, no base64 dependency). |
+| #29, #30 snap rounding | **Done.** `geo::snap_rounding` ports JTS `SnapRoundingNoder` (hot pixels at vertices, intersections and near vertices; `MCIndexNoder` chains; `SegmentNodeList` order) and `reduce_precision` follows `GeometryPrecisionReducer` / OverlayNG; the buffer's fixed precision fallback uses it too. #30 was a misreading: `GeometryPrecisionReducer` rounds lines pointwise in JTS as well. Tests compare with Java on 5,456 cases (`tests/resources/snapround`); see PORTING.md. |
 | #32 free-after-read disk estimate | **Done.** `ResourceUsage::free_disk` (usage amounts are now signed internally). |
 | #38-#45 (c) | **Done.** Relabeled as "Difference from Java" notes, plain `TODO`s where Java has the same TODO, or a short comment (#38, #42/#43). PORTING.md no longer lists "unify VectorLayer" as a follow-up. |
-| #27-#31, #33-#37 (b) | Unchanged (real missing features). |
+| #27, #28, #31, #33-#37 (b) | Unchanged (real missing features). |
 
 ### (a1) Stale, mechanical (13)
 
@@ -267,8 +268,6 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 |---|---|---|---|---|
 | 27 | `core/src/vector_tile.rs:781`, `core/src/archive/tile_archive_writer.rs:109`, `core/src/util/tile_size_stats.rs:20`, `core/tests/planetiler_tests.rs:137`, `core/tests/planetiler_tests_a.rs:52` (5 TODOs) | **Done**: MLT (MapLibre Tile) output is a port of the Java MLT 0.0.10 encoder (`planetiler_core::mlt`) with a decoder for `computeMltTileStats`, tests and `compare`; output is byte-identical to Java (PORTING.md "MLT output notes"). | - | - |
 | 28 | `openmaptiles/src/layers/boundary.rs:222` | **Done**: JTS `Polygonizer` is ported (`geo::polygonizer`) and `boundary` builds country polygons with it like Java (polygonize, then union). | - | - |
-| 29 | `core/src/geo/polygon_overlay.rs:387` | JTS snap rounding: **hot pixels at segment intersections** (and near-vertex tolerance). Today only vertices are hot pixels and the integer overlay rounds the rest. | M | Medium-high: rare differences from Java in `reduce_precision` output for polygons. Could add slivers or validity differences after tile clipping. |
-| 30 | `core/src/geo/polygon_overlay.rs:455` | **Snap-rounding for lines** (noding at intersections). Lines are only rounded point by point. | M | Low-medium: JTS nodes self-intersecting lines during `GeometryPrecisionReducer`, which changes vertex counts and output bytes for merged or simplified lines. |
 | 31 | `core/src/geo/crs.rs:15` | Arbitrary EPSG codes and general WKT CRS. Only 4326/4269/3857, PROJ strings and simple WKT work. | M (`proj4rs` + `crs-definitions` feature + a WKT -> PROJ converter for `.prj` files) | Medium: shapefiles or geopackages in other projections fail where Java (GeoTools) succeeds. |
 | 32 | `core/src/planetiler.rs:1136` | The write-phase disk estimate doesn't subtract inputs marked `free_<name>_after_read`. | XS (~10 LOC: for each `input_paths` entry with `free_after_reading`, `write_phase.add_disk(Some(&p.path), -(size))`. Needs a signed amount, or compute it as `saturating_sub`.) | Low-medium: can make `check_disk_space` fail falsely on tight disks unless `--force` is used. |
 | 33 | `planetiler/src/main.rs:102`, `core/src/util/top_osm_tiles.rs:50` (2 TODOs) | xz decompression for openstreetmap.org tile logs (`top-osm-tiles` CLI). | S (add `xz2` or the pure-Rust `lzma-rs`; the default fetcher becomes `XzDecoder::new(http_get(url))`) | Low |
@@ -295,8 +294,8 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 ### Top 5 real gaps (parity and performance)
 
 1. ~~**JTS `Polygonizer` for OMT boundary `adm0_l`/`adm0_r`** (#28).~~ Done (`geo::polygonizer`).
-2. **Snap rounding at segment intersections in `reduce_precision`** (#29, plus #30 for lines). M. It is a source of
-   geometry and validity differences from Java in tile output, so it makes Java-vs-Rust archive comparisons noisy.
+2. ~~**Snap rounding at segment intersections in `reduce_precision`** (#29, plus #30 for lines).~~ Done
+   (`geo::snap_rounding`).
 3. ~~**MLT encoder** (#27, five markers).~~ Done (`planetiler_core::mlt`, byte-identical to Java).
 4. **Parquet `Distributor` load balancing** (#16). S-M, and the dependency is already ported. It is the best
    performance gain per line of code for Overture builds, where uneven row-group sizes leave threads idle at the

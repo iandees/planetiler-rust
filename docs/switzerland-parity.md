@@ -7,6 +7,12 @@ run includes the JTS offset-curve / `CascadedPolygonUnion` port used by `merge_n
 [`analysis-merge-vertices.md`](analysis-merge-vertices.md)) and the JTS `Polygonizer` used for OpenMapTiles boundary
 country polygons.
 
+**Update (snap-rounding port):** the "Now" column of the differing-features table below is the same Java archive
+compared with a Rust run that also has the JTS snap-rounding port (`geo::snap_rounding`, used by
+`reduce_precision` / `snap_and_fix_polygon` and by the buffer's fixed precision fallback) and the `buffer_zero`
+collinear-node fix; the `627d901` numbers were reproduced with that commit's binary in the same session. Monaco is
+still identical to Java.
+
 ## How
 
 - `target/release/planetiler compare java.mbtiles rust.mbtiles` is the check (`util::compare_archives`, port of Java
@@ -61,20 +67,25 @@ gone with the JTS buffer port.
 **Differing features** (`planetiler compare`; a feature differs if no feature with the same layer, type, tags and
 normalized geometry exists in the other side's tile; counts are Java-only / Rust-only):
 
-| Layer | Now (`627d901`) | Previous pass (`cb984fd`) | Where | Cause |
-|-------|-----------------|---------------------------|-------|-------|
-| building | 578 / 578 | 2,387 / 2,388 | all z13 | merged buildings (`merge_nearby_polygons` buffer/unbuffer): remaining vertex-level differences vs JTS |
-| landuse | 35 / 35 | 404 / 404 | z6-z12 (+1 at z14) | same buffer-merge vertex difference |
-| landcover | 17 / 17 | 21 / 21 | z11-z14 | same buffer-merge vertex difference |
-| transportation | 10 / 10 | 10 / 10 | z9-z14 | line merging picks a different continuation at a junction / 1-unit vertex shifts |
-| housenumber | 1,730 / 1,730 (IDs only) | 1,730 | | merged multipoints keep a different feature's ID (multi-threaded input order); geometry and tags identical |
-| boundary | 0 | 0 | | identical, now via the `Polygonizer` port for `adm0_l`/`adm0_r` |
-| all other layers | 0 | 0 | | identical, including feature IDs |
+| Layer | Now (snap-rounding port) | `627d901` | Previous pass (`cb984fd`) | Where | Cause |
+|-------|--------------------------|-----------|---------------------------|-------|-------|
+| building | 563 / 563 | 578 / 578 | 2,387 / 2,388 | all z13 | merged buildings (`merge_nearby_polygons` buffer/unbuffer): remaining vertex-level differences vs JTS |
+| landuse | 31 / 31 | 35 / 35 | 404 / 404 | z6-z12 | same buffer-merge vertex difference |
+| landcover | 0 | 17 / 17 | 21 / 21 | | identical: the remaining ones were vertices JTS's `buffer(0)` keeps on the tile buffer edge and snap-rounding differences |
+| transportation | 10 / 10 | 10 / 10 | 10 / 10 | z9-z14 | line merging picks a different continuation at a junction / 1-unit vertex shifts |
+| housenumber | 1,730 / 1,730 (IDs only) | 1,730 (IDs only) | 1,730 | | merged multipoints keep a different feature's ID (multi-threaded input order); geometry and tags identical |
+| boundary | 0 | 0 | 0 | | identical, now via the `Polygonizer` port for `adm0_l`/`adm0_r` |
+| all other layers | 0 | 0 | 0 | | identical, including feature IDs |
 
-These numbers are the same as the one-off check made right after the Fix B port, so the later commits changed
-nothing in the output.
+With the snap-rounding port 1,662 tiles differ (600 with `--ignore-ids`), down from 1,697 (635). On the 109,910
+polygons that took `snap_and_fix_polygon`'s snap-rounding path in that run, the Rust output now equals Java's
+`GeoUtils.snapAndFixPolygon` exactly for every one (20 differed before; see PORTING.md "`geo` notes"), so the
+remaining building / landuse differences all come from the merge buffer.
 
-**`planetiler compare`** output on these files (the differing-feature numbers above): 1,697 of 23,922 tiles differ
+The `627d901` numbers are the same as the one-off check made right after the Fix B port, so the commits in between
+changed nothing in the output.
+
+**`planetiler compare`** output on the `627d901` files (the differing-feature numbers above): 1,697 of 23,922 tiles differ
 (635 with `--ignore-ids`); the other 22,032 have different bytes but equivalent normalized contents (key/value table
 order, ring start point, ring / feature order). Per layer it reports `building` 578 / 578 (z13), `landuse` 35 / 35,
 `landcover` 17 / 17, `transportation` 10 / 10 and `housenumber` 1,730 / 1,730, all 1,730 in its "id only" column (gone

@@ -230,11 +230,11 @@ fn buffer_matches_jts_synthetic_cases() {
 /// buffered nearby buildings (the `FeatureMerge.bufferUnionUnbuffer` inputs).
 #[test]
 fn buffer_matches_jts_boston_tile() {
-    check_cases("tile_boston_13_2477_3028.txt.gz", 0, 5);
+    check_cases("tile_boston_13_2477_3028.txt.gz", 0, 1);
 }
 
 /// Same as [`buffer_matches_jts_boston_tile`] for a Jakarta z13 tile.
 #[test]
 fn buffer_matches_jts_jakarta_tile() {
-    check_cases("tile_jakarta_13_6527_4240.txt.gz", 5, 20);
+    check_cases("tile_jakarta_13_6527_4240.txt.gz", 5, 2);
 }

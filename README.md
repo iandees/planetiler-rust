@@ -144,10 +144,9 @@ From [PORTING.md](PORTING.md) and the `TODO(port)` triage in
 
 - **OpenMapTiles country boundaries.** `adm0_l`/`adm0_r` are computed from merged boundary lines rather than a JTS
   `Polygonizer`, so rings that only close through a node shared by 3 or more ways are dropped.
-- **Snap rounding.** `reduce_precision` adds hot pixels for vertices but not for segment intersections, and lines are
-  rounded point by point, so a small number of output geometries differ from JTS.
-- **Merged polygon buffering** uses a different offset-curve implementation from JTS, so merged buildings and landuse
-  can differ by sub-pixel vertices.
+- **Merged polygons.** The JTS buffer used by `merge_nearby_polygons` is ported, but its noding of nearly coincident
+  offset curves still differs from JTS's in rare cases, so about 1-2% of merged buildings and landuse polygons differ
+  from Java by a vertex (on Switzerland: 563 of 39,652 `building` and 31 of 118,588 `landuse` features).
 - **Coordinate reference systems.** Only EPSG:4326, 4269 and 3857, PROJ strings and simple WKT are supported. Inputs
   in other projections fail where Java (GeoTools) succeeds.
 - **CLI tasks not ported:** `top-osm-tiles` (needs xz decompression) and `benchmark-mapping`.

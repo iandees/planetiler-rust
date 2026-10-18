@@ -285,29 +285,6 @@ pub fn is_simple_closed_curve(curve: &[Coord<f64>]) -> bool {
     true
 }
 
-/// All pairwise intersection points between the segments of `curves` that are not the shared vertex of adjacent
-/// segments (used for the hot pixels of snap-rounding).
-pub fn intersection_points(curves: &[Vec<Coord<f64>>]) -> Vec<Coord<f64>> {
-    let (segments, ids) = segments_of(curves);
-    let mut li = LineIntersector::new();
-    let mut out = Vec::new();
-    for_each_candidate_pair(&segments, |i, j| {
-        let ((c0, s0), (c1, s1)) = (ids[i], ids[j]);
-        let ((p00, p01), (p10, p11)) = (segments[i], segments[j]);
-        if c0 == c1 && s1 == s0 + 1 && adjacent_meet_at_vertex_only(p00, p01, p10, p11) {
-            return;
-        }
-        li.compute_intersection(p00, p01, p10, p11);
-        if !li.has_intersection() || (c0 == c1 && li.intersection_num() == 1 && s0.abs_diff(s1) == 1) {
-            return;
-        }
-        for k in 0..li.intersection_num() as usize {
-            out.push(li.intersection(k));
-        }
-    });
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

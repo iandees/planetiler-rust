@@ -1656,7 +1656,7 @@ mod tests {
             "merge_jakarta_6527_4240.txt.gz",
             ("jakartabuildings.mbtiles", 6527, 4240, 13),
             (4.0, 0.0, 0.5, 0.5),
-            15,
+            8,
         );
     }
 
