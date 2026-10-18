@@ -1,13 +1,14 @@
 //! Port of `ConfiguredMapMain.java`: main driver to create maps configured by a YAML file.
 //!
-//! Parses the config file into a [`ConfiguredProfile`] and resolves the sources it reads from. The `Planetiler`
-//! orchestrator isn't ported yet, so [`configure`] returns the profile and sources for the caller to run.
+//! Parses the config file into a [`ConfiguredProfile`] and resolves the sources it reads from ([`configure`]), then
+//! runs them through a [`Planetiler`] runner ([`create_planetiler`], [`main`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
 use planetiler_core::config::arguments::Arguments;
+use planetiler_core::planetiler::Planetiler;
 
 use crate::configschema::{DataSourceType, SchemaConfig};
 use crate::configured_profile::ConfiguredProfile;
@@ -84,20 +85,39 @@ pub fn configure(arguments: &Arguments) -> anyhow::Result<ConfiguredMap> {
     Ok(ConfiguredMap { root, profile: Arc::new(profile), sources })
 }
 
+/// Adds `source` to `planetiler` (Java `configureSource`).
+pub fn add_source(planetiler: &mut Planetiler, source: &ConfiguredSource) -> anyhow::Result<()> {
+    let url = source.url.as_deref();
+    let projection = source.projection.as_deref();
+    match source.source_type {
+        DataSourceType::Osm => planetiler.add_osm_source_with_url(&source.id, &source.local_path, url)?,
+        DataSourceType::Shapefile => {
+            planetiler.add_shapefile_source_with_projection(projection, &source.id, &source.local_path, url)?
+        }
+        DataSourceType::Geopackage => {
+            planetiler.add_geopackage_source(projection, &source.id, &source.local_path, url)?
+        }
+        DataSourceType::Geojson => planetiler.add_geojson_source(&source.id, &source.local_path, url)?,
+    };
+    Ok(())
+}
+
+/// Builds a [`Planetiler`] runner for a configured map (everything `ConfiguredMapMain.main` does before `run()`).
+pub fn create_planetiler(map: &ConfiguredMap) -> anyhow::Result<Planetiler> {
+    let mut planetiler = Planetiler::create(map.root.arguments().clone())?;
+    planetiler.set_profile_arc(map.profile.clone());
+    for source in &map.sources {
+        add_source(&mut planetiler, source)?;
+    }
+    planetiler.overwrite_output(Path::new("data").join("output.mbtiles"))?;
+    Ok(planetiler)
+}
+
 /// Main entrypoint (Java `ConfiguredMapMain.main`).
 pub fn main<S: AsRef<str>>(args: &[S]) -> anyhow::Result<()> {
     let arguments = Arguments::from_env_or_args(args);
     let map = configure(&arguments)?;
-    // TODO(port): run planetiler once the orchestrator is ported:
-    //   let planetiler = Planetiler::create(map.root.arguments()).set_profile(map.profile);
-    //   for source in map.sources: add_osm_source / add_shapefile_source(projection) / add_geopackage_source(projection)
-    //   / add_geojson_source(id, local_path, url)
-    //   planetiler.overwrite_output("data/output.mbtiles").run()
-    anyhow::bail!(
-        "planetiler orchestrator is not ported yet: configured profile '{}' with {} sources",
-        planetiler_core::profile::Profile::name(&*map.profile),
-        map.sources.len()
-    )
+    create_planetiler(&map)?.run()
 }
 
 #[cfg(test)]

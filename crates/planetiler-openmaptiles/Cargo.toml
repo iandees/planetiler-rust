@@ -25,3 +25,6 @@ icu_normalizer = "2.3"
 [[bin]]
 name = "generate_openmaptiles"
 path = "src/bin/generate_openmaptiles.rs"
+
+[dev-dependencies]
+tempfile.workspace = true

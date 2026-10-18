@@ -1,14 +1,16 @@
 //! Port of `OpenMapTilesMain.java`: main entrypoint for generating a map using the OpenMapTiles schema.
 //!
-//! The `Planetiler` orchestrator is not ported yet, so [`setup`] returns everything `OpenMapTilesMain.run` configures
-//! on the runner (default languages, wikidata translations file, input sources with their default paths/URLs, output)
-//! and [`create_profile`] builds the profile once the runner has created translations/config/stats.
+//! [`setup`] returns everything `OpenMapTilesMain.run` configures on the runner (default languages, wikidata
+//! translations file, input sources with their default paths/URLs, output), [`configure`] applies it to a
+//! [`Planetiler`] runner and [`run`] runs it; [`create_profile`] builds the profile once the runner has created
+//! translations/config/stats.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use planetiler_core::config::arguments::Arguments;
 use planetiler_core::config::planetiler_config::PlanetilerConfig;
+use planetiler_core::planetiler::Planetiler;
 use planetiler_core::stats::stats::StatsRef;
 use planetiler_core::util::translations::Translations;
 
@@ -139,14 +141,55 @@ pub fn create_profile(
     OpenMapTilesProfile::new(translations, config, stats)
 }
 
-/// `OpenMapTilesMain.run`.
-pub fn run(arguments: &Arguments) -> anyhow::Result<OpenMapTilesSetup> {
+/// Configures a [`Planetiler`] runner like `OpenMapTilesMain.run` without running it (useful for tests and the CLI).
+pub fn configure(arguments: &Arguments) -> anyhow::Result<Planetiler> {
     let setup = setup(arguments);
-    // TODO(port): pass `setup` to the Planetiler runner once it is ported:
-    // Planetiler::create(arguments).set_default_languages(..).fetch_wikidata_name_translations(..)
-    //   .set_profile(create_profile).add_*_source(..).set_output(..).run()
+    let mut planetiler = Planetiler::create(arguments.clone())?;
+    planetiler
+        .set_default_languages(&setup.default_languages)
+        .fetch_wikidata_name_translations(&setup.wikidata_names_path)?
+        // defer creation of the profile because it depends on data from the runner
+        .set_profile_provider(|p| {
+            let translations = p.translations();
+            Ok(Arc::new(create_profile(translations, p.config().clone(), p.stats().clone())))
+        });
+    // override any of these with arguments: --osm_path=... or --osm_url=...
+    // or OSM_PATH=... OSM_URL=... environmental argument
+    // or osm_path=... osm_url=... in a config file
+    for source in &setup.sources {
+        let url = Some(source.default_url.as_str());
+        match &source.kind {
+            SourceKind::Shapefile { projection } => {
+                planetiler.add_shapefile_source_with_projection(
+                    projection.as_deref(),
+                    source.name,
+                    &source.default_path,
+                    url,
+                )?;
+            }
+            SourceKind::NaturalEarth => {
+                planetiler.add_natural_earth_source(source.name, &source.default_path, url)?;
+            }
+            SourceKind::Osm => {
+                planetiler.add_osm_source_with_url(source.name, &source.default_path, url)?;
+            }
+        }
+    }
+    // override with --mbtiles=... argument or MBTILES=... env var or mbtiles=... in a config file
+    planetiler.set_output_with_argument(setup.output_argument, &setup.default_output)?;
+    Ok(planetiler)
+}
+
+/// `OpenMapTilesMain.run`.
+pub fn run(arguments: &Arguments) -> anyhow::Result<()> {
+    configure(arguments)?.run()?;
     tracing::info!("{ACKNOWLEDGMENTS}");
-    Ok(setup)
+    Ok(())
+}
+
+/// `OpenMapTilesMain.main`.
+pub fn main<S: AsRef<str>>(args: &[S]) -> anyhow::Result<()> {
+    run(&Arguments::from_args_or_config_file(args)?)
 }
 
 #[cfg(test)]

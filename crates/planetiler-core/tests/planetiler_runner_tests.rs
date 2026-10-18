@@ -164,6 +164,16 @@ fn run_osm(args: &str) {
             assert_eq!(hilbert, TileCoord::of_xyz(x, y, z).hilbert_encoded() as i64);
             assert!(z <= 14);
         }
+
+        // ensure tilestats standalone executable produces same output
+        let standalone = temp_dir.join("layerstats2.tsv.gz");
+        planetiler_core::util::tile_size_stats::main(&[
+            format!("--input={}", output_path.display()),
+            format!("--output={}", standalone.display()),
+        ])
+        .unwrap();
+        let standalone = String::from_utf8(gunzip(&std::fs::read(&standalone).unwrap()).unwrap()).unwrap();
+        assert_eq!(text, standalone);
     } else {
         assert!(!layerstats.exists());
     }

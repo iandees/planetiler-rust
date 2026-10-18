@@ -95,6 +95,29 @@ pub fn log_result(result: &CompareResult, strict: bool) -> i32 {
     if result.tile_diffs > 0 || (strict && !result.archive_diffs.is_empty()) { 1 } else { 0 }
 }
 
+/// `CompareArchives.main`: `compare [options] {path/to/archive1} {path/to/archive2}`. Returns the process exit code.
+pub fn main<S: AsRef<str>>(args: &[S]) -> anyhow::Result<i32> {
+    if args.len() < 2 {
+        eprintln!("Usage: compare [options] {{path/to/archive1}} {{path/to/archive2}}");
+        return Ok(1);
+    }
+    // last 2 args are paths to the archives
+    let input1 = TileArchiveConfig::from(args[args.len() - 2].as_ref())?;
+    let input2 = TileArchiveConfig::from(args[args.len() - 1].as_ref())?;
+    let arguments = crate::config::arguments::Arguments::from_args_or_config_file(&args[..args.len() - 2])?;
+    let verbose = arguments.get_boolean("verbose", "log each tile diff", false);
+    let strict = arguments.get_boolean("strict", "set to false to only fail on tile diffs", true);
+    let config = PlanetilerConfig::from(&arguments)?;
+    match compare(&input1, &input2, &config, verbose) {
+        Ok(result) => Ok(log_result(&result, strict)),
+        Err(e) if e.is::<FatalComparisonFailure>() => {
+            tracing::error!("Error comparing archives {e}");
+            Ok(1)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 struct Diff {
     a: Option<Tile>,
     b: Option<Tile>,

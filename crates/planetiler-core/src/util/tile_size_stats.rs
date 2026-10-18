@@ -17,8 +17,6 @@ use crate::geo::tile_coord::TileCoord;
 use crate::proto::vector_tile as pb;
 use crate::vector_tile;
 
-// TODO(port): `TileSizeStats.main` (the `stats` CLI command that reads an existing archive and writes a layerstats
-// file) depends on TileArchives/WorkerPipeline/ProgressLoggers and is not ported yet.
 // TODO(port): `computeMltTileStats` depends on the MLT decoder (org.maplibre.mlt) which is not ported yet.
 
 const COLUMNS: [&str; 12] = [
@@ -35,6 +33,72 @@ const COLUMNS: [&str; 12] = [
     "layer_attr_keys",
     "layer_attr_values",
 ];
+
+const BATCH_SIZE: usize = 1_000;
+
+/// `TileSizeStats.main`: the `stats` CLI command that reads every tile in `--input` and writes a layerstats file to
+/// `--output` (default `<input>.layerstats.tsv.gz`), then prints a size summary.
+///
+/// Batches of tiles are decoded in parallel with rayon; rows are written in archive order like Java.
+pub fn main<S: AsRef<str>>(args: &[S]) -> anyhow::Result<()> {
+    use rayon::prelude::*;
+
+    use crate::archive::tile_archive_config::TileArchiveConfig;
+    use crate::archive::tile_archives;
+    use crate::config::arguments::Arguments;
+    use crate::config::planetiler_config::PlanetilerConfig;
+    use crate::util::tile_weights::TileWeights;
+    use crate::util::tileset_summary_statistics::TilesetSummaryStatistics;
+
+    let arguments = Arguments::from_args_or_config_file(args)?;
+    let config = PlanetilerConfig::from(&arguments)?;
+    let stats = crate::stats::stats::in_memory();
+    let download = arguments.get_boolean("download_osm_tile_weights|download", "download OSM tile weights file", false);
+    if download && !config.tile_weights.exists() {
+        crate::util::top_osm_tiles::download_precomputed(&config);
+    }
+    let tile_stats =
+        TilesetSummaryStatistics::with_weights(std::sync::Arc::new(TileWeights::read_from_file(&config.tile_weights)));
+    let input_string = arguments.get_required_string("input", "input file")?;
+    let input = TileArchiveConfig::from(&input_string)?;
+    let output = match input.get_local_path() {
+        Some(local) => arguments.file("output", "output file", get_default_layerstats_path(&local)),
+        None => arguments.required_file("output", "output file")?,
+    };
+    let timer = stats.start_stage("tilestats");
+    let reader = tile_archives::new_reader(&input, &config)?;
+    let updater = tile_stats.thread_local_updater();
+    let serializer = new_thread_local_serializer();
+    let mut writer = new_writer(&output)?;
+    writer.write_all(header_row().as_bytes())?;
+    let mut tiles = reader.get_all_tiles()?;
+    let mut count = 0u64;
+    loop {
+        let batch: Vec<_> = tiles.by_ref().take(BATCH_SIZE).collect::<anyhow::Result<Vec<_>>>()?;
+        if batch.is_empty() {
+            break;
+        }
+        count += batch.len() as u64;
+        let results: Vec<(TileCoord, i64, Vec<LayerStats>)> = batch
+            .par_iter()
+            .map(|tile| -> anyhow::Result<_> {
+                let unzipped = crate::util::gzip::gunzip(&tile.bytes)?;
+                let decoded = pb::Tile::decode(unzipped.as_slice())?;
+                Ok((tile.coord, tile.bytes.len() as i64, compute_tile_stats(&decoded)))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        for (coord, archived, layer_stats) in results {
+            updater.record_tile(coord, archived, &layer_stats);
+            serializer.write_output_rows(&mut writer, coord, archived, &layer_stats)?;
+        }
+    }
+    writer.finish()?.flush()?;
+    tracing::info!("processed {count} tiles");
+    timer.stop();
+    tile_stats.print_stats(&config.debug_url_pattern);
+    stats.print_summary();
+    Ok(())
+}
 
 /// Returns the default path that a layerstats file should go relative to an existing archive.
 pub fn get_default_layerstats_path(archive: &Path) -> PathBuf {
