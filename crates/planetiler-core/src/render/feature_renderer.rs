@@ -828,6 +828,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)] // checks a debug_assert!, like Java's `assert` (only enabled with -ea)
     fn test_label_grid_requires_buffer_pixels_greater_than_grid_size() {
         let result = std::panic::catch_unwind(|| {
             render_features(pt(0.75, 0.75), Kind::Point, |f| {
