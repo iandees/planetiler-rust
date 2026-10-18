@@ -131,6 +131,9 @@ fn get_scalar_type(value: &Value) -> anyhow::Result<ScalarType> {
     })
 }
 
+/// Columns by property name, in insertion order.
+type ColumnSchemas = IndexMap<String, Column, crate::value::TagsHasher>;
+
 /// `MltConverter.createTilesetMetadata`: infers the column schema of each layer. `column_mappings` apply to every
 /// layer (Java `ColumnMappingConfig.of(Pattern.compile(".*"), columnMappings)`).
 pub fn create_tileset_metadata(
@@ -141,7 +144,7 @@ pub fn create_tileset_metadata(
 ) -> anyhow::Result<TileSetMetadata> {
     let mut tileset = TileSetMetadata::default();
     for layer in &tile.layers {
-        let mut column_schemas: IndexMap<String, Column> = IndexMap::new();
+        let mut column_schemas: ColumnSchemas = IndexMap::with_hasher(crate::value::TagsHasher);
         // insertion ordered by the first time each mapping matched
         let mut complex_schemas: Vec<(usize, Vec<Column>)> = Vec::new();
         let mut has_id = false;
@@ -215,7 +218,7 @@ fn resolve_column_type(
     layer_name: &str,
     feature_index: usize,
     column_mappings: &[ColumnMapping],
-    column_schemas: &mut IndexMap<String, Column>,
+    column_schemas: &mut ColumnSchemas,
     complex_schemas: &mut Vec<(usize, Vec<Column>)>,
     policy: TypeMismatchPolicy,
 ) -> anyhow::Result<()> {
@@ -224,8 +227,12 @@ fn resolve_column_type(
     // If this property already has a column, make sure the types match
     if let Some(previous) = column_schemas.get_mut(name)
         && let ColumnType::Scalar(prev) = previous.column_type
-        && prev != scalar_type
     {
+        if prev == scalar_type {
+            // Java puts an equal column again (columns are only created for properties without a mapping, and
+            // always nullable)
+            return Ok(());
+        }
         use ScalarType::*;
         match (prev, scalar_type) {
             // Allow implicit upgrade from INT_32 to INT_64 and FLOAT to DOUBLE

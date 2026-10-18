@@ -142,7 +142,16 @@ fn materialize(kind: Kind, values: &[i32], signed: bool, buf: &mut Vec<u32>) {
 /// `IntegerEncoder.encodeInt` with `IntegerEncodingOption.AUTO`: picks the smallest of plain, delta, RLE and
 /// delta-RLE (forcing RLE for constant streams).
 fn choose(values: &[i32], fast_pfor: bool, signed: bool) -> Choice {
+    choose_below(values, fast_pfor, signed, usize::MAX).expect("no budget")
+}
+
+/// [`choose`], but gives up (`None`) as soon as every candidate is known to need at least `budget` bytes.
+fn choose_below(values: &[i32], fast_pfor: bool, signed: bool, budget: usize) -> Option<Choice> {
     let n = values.len();
+    // The partial varint sums only grow, and they bound the final sizes from below: exactly for varints, and for
+    // FastPFOR when every candidate is shorter than a block (`4 + 4 * ceil(sum / 4)` bytes), i.e. fewer than 128
+    // values (the RLE candidates have up to `2 * n`).
+    let can_give_up = budget != usize::MAX && (!fast_pfor || n < FAST_PFOR_BLOCK / 2);
     let (mut plain, mut delta, mut rle, mut delta_rle) = (0usize, 0usize, 0usize, 0usize);
     let mut runs = 1usize;
     let mut delta_runs = 1usize;
@@ -168,6 +177,9 @@ fn choose(values: &[i32], fast_pfor: bool, signed: bool) -> Choice {
         delta_run += 1;
         previous_value = value;
         previous_delta = d;
+        if can_give_up && i & 31 == 31 && plain.min(delta).min(rle).min(delta_rle) >= budget {
+            return None;
+        }
     }
     if n > 0 {
         rle += varint_size(run) + varint_size(transform(previous_value, signed));
@@ -203,7 +215,7 @@ fn choose(values: &[i32], fast_pfor: bool, signed: bool) -> Choice {
         sizes.iter().position(|&s| s == min).expect("min exists")
     };
     let kind = [Kind::Plain, Kind::Delta, Kind::Rle, Kind::DeltaRle][index];
-    Choice { kind, runs: runs as u32, delta_runs: delta_runs as u32, size: sizes[index] }
+    Some(Choice { kind, runs: runs as u32, delta_runs: delta_runs as u32, size: sizes[index] })
 }
 
 /// Appends the chosen encoding of `values`.
@@ -268,6 +280,11 @@ pub fn encode_int(values: &[i32], fast_pfor: bool, signed: bool) -> IntegerEncod
 /// Size of `encode_int(values, fast_pfor, signed).encoded_values` (without encoding anything).
 pub fn encoded_int_size(values: &[i32], fast_pfor: bool, signed: bool) -> usize {
     choose(values, fast_pfor, signed).size
+}
+
+/// [`encoded_int_size`] if it is below `budget`, otherwise `None` (often without looking at all values).
+pub fn encoded_int_size_below(values: &[i32], fast_pfor: bool, signed: bool, budget: usize) -> Option<usize> {
+    choose_below(values, fast_pfor, signed, budget).map(|c| c.size).filter(|&size| size < budget)
 }
 
 /// `IntegerEncoder.encodeLong` with `IntegerEncodingOption.AUTO` (always varint: FastPFOR only supports 32 bits),
@@ -575,10 +592,12 @@ mod tests {
                     let mut actual = Vec::new();
                     encode_int_stream(&mut actual, &ints, fast_pfor, signed, PhysicalStreamType::Length, None);
                     assert_eq!(expected, actual, "{} values, fast_pfor {fast_pfor} signed {signed}", ints.len());
-                    assert_eq!(
-                        reference::encoded_int_size(&ints, fast_pfor, signed),
-                        encoded_int_size(&ints, fast_pfor, signed)
-                    );
+                    let size = reference::encoded_int_size(&ints, fast_pfor, signed);
+                    assert_eq!(size, encoded_int_size(&ints, fast_pfor, signed));
+                    for budget in [0, 1, size / 2, size.saturating_sub(1), size, size + 1, usize::MAX] {
+                        let expected = if size < budget { Some(size) } else { None };
+                        assert_eq!(expected, encoded_int_size_below(&ints, fast_pfor, signed, budget));
+                    }
                     assert_eq!(
                         reference::encode_int(&ints, fast_pfor, signed).encoded_values,
                         encode_int(&ints, fast_pfor, signed).encoded_values

@@ -277,7 +277,15 @@ fn decode_commands(geom_type: GeometryType, commands: &[i32], scale: f64) -> Geo
 
         if length > 0 {
             if command == MOVE_TO {
-                all_coord_seqs.push(Vec::new());
+                // room for this point, the LINE_TO points that follow it and a closing point
+                let mut capacity = 1;
+                if length == 1
+                    && let Some(&next) = commands.get(i + 2)
+                    && next & ((1 << 3) - 1) == LINE_TO
+                {
+                    capacity += ((next >> 3).max(0) as usize).min((geometry_count - i) / 2) + 1;
+                }
+                all_coord_seqs.push(Vec::with_capacity(capacity));
             } else if all_coord_seqs.is_empty() {
                 return Err(decode_error("command before first move to"));
             }

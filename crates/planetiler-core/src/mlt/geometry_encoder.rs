@@ -9,7 +9,9 @@ use super::encoding::{
     PhysicalStreamType, StreamMetadata, put_varint, varint_size, zigzag,
 };
 use super::fastpfor;
-use super::integer_encoder::{encode_int_stream, encode_morton_stream, encoded_int_size, encoded_morton_codes_size};
+use super::integer_encoder::{
+    encode_int_stream, encode_morton_stream, encoded_int_size, encoded_int_size_below, encoded_morton_codes_size,
+};
 
 /// `GeometryType` ordinals.
 pub const POINT: i32 = 0;
@@ -298,6 +300,47 @@ fn sort_key(code: i32, position: usize) -> u64 {
     (((code ^ i32::MIN) as u32 as u64) << 32) | position as u64
 }
 
+/// Sorts keys made by [`sort_key`] in position order (the same order as `keys.sort_unstable()`, since positions
+/// are unique): a stable LSD radix sort on the code bits that vary, or a comparison sort for short inputs.
+fn sort_keys(keys: &mut Vec<u64>) {
+    const DIGIT_BITS: u32 = 8;
+    if keys.len() < 256 {
+        keys.sort_unstable();
+        return;
+    }
+    let (mut min, mut max) = (u32::MAX, 0u32);
+    for &k in keys.iter() {
+        let code = (k >> 32) as u32;
+        min = min.min(code);
+        max = max.max(code);
+    }
+    let bits = 32 - (max - min).leading_zeros();
+    let mut from = std::mem::take(keys);
+    let mut to = vec![0u64; from.len()];
+    let mut shift = 0;
+    while shift < bits {
+        let digit = |k: u64| ((((k >> 32) as u32 - min) >> shift) & ((1 << DIGIT_BITS) - 1)) as usize;
+        let mut counts = [0usize; 1 << DIGIT_BITS];
+        for &k in &from {
+            counts[digit(k)] += 1;
+        }
+        let mut sum = 0;
+        for c in counts.iter_mut() {
+            let count = *c;
+            *c = sum;
+            sum += count;
+        }
+        for &k in &from {
+            let d = digit(k);
+            to[counts[d]] = k;
+            counts[d] += 1;
+        }
+        std::mem::swap(&mut from, &mut to);
+        shift += DIGIT_BITS;
+    }
+    *keys = from;
+}
+
 /// For sorted `keys` (see [`sort_key`]), calls `f(position, end)` for each key with the end (exclusive) of the run
 /// of keys with the same code.
 fn for_each_run_end(keys: &[u64], mut f: impl FnMut(usize, usize)) {
@@ -315,21 +358,28 @@ fn for_each_run_end(keys: &[u64], mut f: impl FnMut(usize, usize)) {
     }
 }
 
-/// The vertex dictionary candidates computed for every geometry column.
-struct Dictionaries {
-    zigzag_delta_vertex_buffer: Vec<i32>,
-    zigzag_delta_vertex_dictionary: Vec<i32>,
-    dictionary_offsets: Vec<i32>,
-    morton_dictionary: Vec<i32>,
-    morton_offsets: Vec<i32>,
+/// The vertex buffer candidates of a geometry column: the plain (componentwise delta) vertex buffer, the Hilbert
+/// sorted "dictionary" and the sorted Morton codes, each with an offset stream.
+///
+/// Java computes all three and their encoded sizes for every column. Here the dictionaries are only built when
+/// needed and their offset streams only sized when the result can matter: a dictionary candidate is at least its
+/// vertex / code stream plus the smallest possible offset stream, and once that already reaches the plain size, the
+/// candidate can't be chosen ([`Dictionaries::dictionary_size`] / [`Dictionaries::morton_size`] then return
+/// `usize::MAX`, which compares like the real size in every decision below since the plain size is not larger).
+struct Dictionaries<'a> {
+    vertices: &'a [(i32, i32)],
+    fast_pfor: bool,
     curve: CurveParams,
+    zigzag_delta_vertex_buffer: Vec<i32>,
     plain_size: usize,
-    dictionary_size: usize,
-    morton_size: usize,
+    /// Sorted `hilbert << 32 | position` (see [`sort_key`]), the dictionary in Hilbert order and its stream size.
+    hilbert: Option<(Vec<u64>, Vec<i32>, usize)>,
+    /// Sorted `morton << 32 | position`, the sorted codes and the size of their stream.
+    morton: Option<(Vec<u64>, Vec<i32>, usize)>,
 }
 
-impl Dictionaries {
-    fn compute(vertices: &[(i32, i32)], fast_pfor: bool) -> Dictionaries {
+impl<'a> Dictionaries<'a> {
+    fn new(vertices: &'a [(i32, i32)], fast_pfor: bool) -> Dictionaries<'a> {
         let mut min = i32::MAX;
         let mut max = i32::MIN;
         for &(x, y) in vertices {
@@ -337,46 +387,86 @@ impl Dictionaries {
             max = max.max(x).max(y);
         }
         let curve = CurveParams::new(min, max);
-
-        // addVerticesToDictionary: a stable sort by hilbert index (Java does not actually remove duplicates here),
-        // then each vertex's offset is the last dictionary position of its hilbert index (Java's index map keeps the
-        // last put). Sorting `hilbert << 32 | position` gives the stable order without a hash map.
-        let n = vertices.len();
-        let mut keys: Vec<u64> = Vec::with_capacity(n);
-        keys.extend(vertices.iter().enumerate().map(|(i, &(x, y))| sort_key(curve.hilbert(x, y), i)));
-        keys.sort_unstable();
-        let mut dictionary_vertices: Vec<(i32, i32)> = Vec::with_capacity(n);
-        dictionary_vertices.extend(keys.iter().map(|&k| vertices[(k & 0xFFFF_FFFF) as usize]));
-        let mut dictionary_offsets = vec![0i32; n];
-        for_each_run_end(&keys, |position, end| dictionary_offsets[position] = end as i32 - 1);
-
-        // addVerticesToMortonDictionary: sorted morton codes, also without removing duplicates
-        keys.clear();
-        keys.extend(vertices.iter().enumerate().map(|(i, &(x, y))| sort_key(curve.morton(x, y), i)));
-        keys.sort_unstable();
-        let morton_dictionary: Vec<i32> = keys.iter().map(|&k| (k >> 32) as u32 as i32 ^ i32::MIN).collect();
-        let mut morton_offsets = vec![0i32; n];
-        for_each_run_end(&keys, |position, end| morton_offsets[position] = end as i32 - 1);
-
         let zigzag_delta_vertex_buffer = zigzag_delta_encode_vertices(vertices);
-        let zigzag_delta_vertex_dictionary = zigzag_delta_encode_vertices(&dictionary_vertices);
-
         let plain_size = encoded_int_size(&zigzag_delta_vertex_buffer, fast_pfor, false);
-        let dictionary_size = encoded_int_size(&dictionary_offsets, fast_pfor, false)
-            + encoded_int_size(&zigzag_delta_vertex_dictionary, fast_pfor, false);
-        let morton_size = encoded_int_size(&morton_offsets, fast_pfor, false)
-            + encoded_morton_codes_size(&morton_dictionary, fast_pfor);
-        Dictionaries {
-            zigzag_delta_vertex_buffer,
-            zigzag_delta_vertex_dictionary,
-            dictionary_offsets,
-            morton_dictionary,
-            morton_offsets,
-            curve,
-            plain_size,
-            dictionary_size,
-            morton_size,
+        Dictionaries { vertices, fast_pfor, curve, zigzag_delta_vertex_buffer, plain_size, hilbert: None, morton: None }
+    }
+
+    /// A lower bound of the size of an offset stream of `n > 0` values: varint plain / delta streams have at least
+    /// one byte per value and RLE ones at least a run and a value; any FastPFOR stream is at least two words.
+    fn min_offsets_size(&self) -> usize {
+        if self.fast_pfor { 8 } else { self.vertices.len().min(2) }
+    }
+
+    /// `addVerticesToDictionary`: a stable sort by hilbert index (Java does not actually remove duplicates here).
+    /// Sorting `hilbert << 32 | position` gives the stable order.
+    fn hilbert(&mut self) -> &(Vec<u64>, Vec<i32>, usize) {
+        self.hilbert.get_or_insert_with(|| {
+            let (vertices, curve) = (self.vertices, self.curve);
+            let mut keys: Vec<u64> = Vec::with_capacity(vertices.len());
+            keys.extend(vertices.iter().enumerate().map(|(i, &(x, y))| sort_key(curve.hilbert(x, y), i)));
+            sort_keys(&mut keys);
+            let dictionary_vertices: Vec<(i32, i32)> =
+                keys.iter().map(|&k| vertices[(k & 0xFFFF_FFFF) as usize]).collect();
+            let zigzag_delta_vertex_dictionary = zigzag_delta_encode_vertices(&dictionary_vertices);
+            let size = encoded_int_size(&zigzag_delta_vertex_dictionary, self.fast_pfor, false);
+            (keys, zigzag_delta_vertex_dictionary, size)
+        })
+    }
+
+    /// Each vertex's offset is the last dictionary position of its Hilbert index (Java's index map keeps the last
+    /// put).
+    fn dictionary_offsets(&mut self) -> Vec<i32> {
+        let n = self.vertices.len();
+        let (keys, _, _) = self.hilbert();
+        let mut offsets = vec![0i32; n];
+        for_each_run_end(keys, |position, end| offsets[position] = end as i32 - 1);
+        offsets
+    }
+
+    /// Encoded size of the dictionary candidate, or `usize::MAX` if it is known to be at least the plain size.
+    fn dictionary_size(&mut self) -> usize {
+        let lower_bound = self.hilbert().2 + self.min_offsets_size();
+        if lower_bound >= self.plain_size {
+            return usize::MAX;
         }
+        let vertices_size = self.hilbert().2;
+        let offsets = self.dictionary_offsets();
+        encoded_int_size_below(&offsets, self.fast_pfor, false, self.plain_size - vertices_size)
+            .map_or(usize::MAX, |size| size + vertices_size)
+    }
+
+    /// `addVerticesToMortonDictionary`: sorted morton codes, also without removing duplicates.
+    fn morton(&mut self) -> &(Vec<u64>, Vec<i32>, usize) {
+        self.morton.get_or_insert_with(|| {
+            let (vertices, curve) = (self.vertices, self.curve);
+            let mut keys: Vec<u64> = Vec::with_capacity(vertices.len());
+            keys.extend(vertices.iter().enumerate().map(|(i, &(x, y))| sort_key(curve.morton(x, y), i)));
+            sort_keys(&mut keys);
+            let codes: Vec<i32> = keys.iter().map(|&k| (k >> 32) as u32 as i32 ^ i32::MIN).collect();
+            let size = encoded_morton_codes_size(&codes, self.fast_pfor);
+            (keys, codes, size)
+        })
+    }
+
+    fn morton_offsets(&mut self) -> Vec<i32> {
+        let n = self.vertices.len();
+        let (keys, _, _) = self.morton();
+        let mut offsets = vec![0i32; n];
+        for_each_run_end(keys, |position, end| offsets[position] = end as i32 - 1);
+        offsets
+    }
+
+    /// Encoded size of the Morton candidate, or `usize::MAX` if it is known to be at least the plain size.
+    fn morton_size(&mut self) -> usize {
+        let lower_bound = self.morton().2 + self.min_offsets_size();
+        if lower_bound >= self.plain_size {
+            return usize::MAX;
+        }
+        let codes_size = self.morton().2;
+        let offsets = self.morton_offsets();
+        encoded_int_size_below(&offsets, self.fast_pfor, false, self.plain_size - codes_size)
+            .map_or(usize::MAX, |size| size + codes_size)
     }
 }
 
@@ -388,45 +478,43 @@ pub fn encode_geometry_column(
     use_morton_encoding: bool,
 ) -> anyhow::Result<EncodedGeometryColumn> {
     let t = Topology::build(geometries, false)?;
-    let d = Dictionaries::compute(&t.vertices, fast_pfor);
+    let mut d = Dictionaries::new(&t.vertices, fast_pfor);
+    let plain_size = d.plain_size;
+    let dictionary_size = d.dictionary_size();
+    let morton_size = if use_morton_encoding { d.morton_size() } else { usize::MAX };
     let mut out = Vec::new();
     let num_streams = encode_topology(&mut out, &t, fast_pfor);
-    if d.plain_size <= d.dictionary_size && (!use_morton_encoding || d.plain_size <= d.morton_size) {
+    if plain_size <= dictionary_size && (!use_morton_encoding || plain_size <= morton_size) {
         encode_vertex_buffer(&mut out, &d.zigzag_delta_vertex_buffer, fast_pfor);
         Ok(EncodedGeometryColumn { num_streams: num_streams + 1, encoded: out })
-    } else if d.dictionary_size < d.plain_size && (!use_morton_encoding || d.dictionary_size <= d.morton_size) {
-        encode_vertex_dictionary(&mut out, &d, fast_pfor);
+    } else if dictionary_size < plain_size && (!use_morton_encoding || dictionary_size <= morton_size) {
+        encode_vertex_dictionary(&mut out, &mut d, fast_pfor);
         Ok(EncodedGeometryColumn { num_streams: num_streams + 2, encoded: out })
     } else {
         encode_int_stream(
             &mut out,
-            &d.morton_offsets,
+            &d.morton_offsets(),
             fast_pfor,
             false,
             PhysicalStreamType::Offset,
             Some(LogicalStreamType::Offset(OffsetType::Vertex)),
         );
-        encode_morton_stream(
-            &mut out,
-            &d.morton_dictionary,
-            d.curve.num_bits,
-            d.curve.coordinate_shift as u32,
-            fast_pfor,
-        );
+        let curve = d.curve;
+        encode_morton_stream(&mut out, &d.morton().1, curve.num_bits, curve.coordinate_shift as u32, fast_pfor);
         Ok(EncodedGeometryColumn { num_streams: num_streams + 2, encoded: out })
     }
 }
 
-fn encode_vertex_dictionary(out: &mut Vec<u8>, d: &Dictionaries, fast_pfor: bool) {
+fn encode_vertex_dictionary(out: &mut Vec<u8>, d: &mut Dictionaries, fast_pfor: bool) {
     encode_int_stream(
         out,
-        &d.dictionary_offsets,
+        &d.dictionary_offsets(),
         fast_pfor,
         false,
         PhysicalStreamType::Offset,
         Some(LogicalStreamType::Offset(OffsetType::Vertex)),
     );
-    encode_vertex_buffer(out, &d.zigzag_delta_vertex_dictionary, fast_pfor);
+    encode_vertex_buffer(out, &d.hilbert().1, fast_pfor);
 }
 
 /// Geometry types, then the non-empty geometries / parts / rings streams. Returns the number of streams written.
@@ -453,7 +541,7 @@ pub fn encode_pretessellated_geometry_column(
     encode_polygon_outlines: bool,
 ) -> anyhow::Result<EncodedGeometryColumn> {
     let t = Topology::build(geometries, true)?;
-    let d = Dictionaries::compute(&t.vertices, fast_pfor);
+    let mut d = Dictionaries::new(&t.vertices, fast_pfor);
     let mut out = Vec::new();
     // Currently use pre-tessellation only if all geometries in a FeatureTable are Polygons or MultiPolygons
     let only_polygons = t.geometry_types.iter().all(|&g| g == POLYGON || g == MULTIPOLYGON);
@@ -480,13 +568,13 @@ pub fn encode_pretessellated_geometry_column(
         return Ok(EncodedGeometryColumn { num_streams, encoded: out });
     }
     let num_streams = encode_topology(&mut out, &t, fast_pfor);
-    if d.plain_size <= d.dictionary_size && d.plain_size <= d.morton_size {
+    if d.plain_size <= d.dictionary_size() && d.plain_size <= d.morton_size() {
         encode_vertex_buffer(&mut out, &d.zigzag_delta_vertex_buffer, fast_pfor);
         Ok(EncodedGeometryColumn { num_streams: num_streams + 1, encoded: out })
     } else {
         // Java only considers morton encoding here when useMortonEncoding is set, which it never is for
         // pre-tessellated columns
-        encode_vertex_dictionary(&mut out, &d, fast_pfor);
+        encode_vertex_dictionary(&mut out, &mut d, fast_pfor);
         Ok(EncodedGeometryColumn { num_streams: num_streams + 2, encoded: out })
     }
 }
@@ -494,6 +582,23 @@ pub fn encode_pretessellated_geometry_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_keys_matches_sort_unstable() {
+        let mut state = 3u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as i32
+        };
+        for (len, range) in [(10, 100), (255, 1 << 20), (256, 7), (300, 1 << 26), (5000, 1000), (70_000, i32::MAX)] {
+            let codes: Vec<i32> = (0..len).map(|i| if i % 5 == 0 { -next() % range } else { next() % range }).collect();
+            let mut keys: Vec<u64> = codes.iter().enumerate().map(|(i, &c)| sort_key(c, i)).collect();
+            let mut expected = keys.clone();
+            expected.sort_unstable();
+            sort_keys(&mut keys);
+            assert_eq!(expected, keys);
+        }
+    }
 
     #[test]
     fn curve_params() {
