@@ -65,7 +65,7 @@ See the table at the bottom of this file; update it as modules are completed.
 | `reader::osm::{osm_multipolygon, osm_way_splitter, osm_node_bounds_provider}` | done (`NodeLocationProvider` trait lives in `osm_multipolygon` until `OsmReader` is ported; bounds provider does not use `OsmPhaser` yet) |
 | `util::{translations, language_utils, thread_local_transliterator, wikidata}` | done (`Wikidata` takes a `Fn(&OsmElement) -> bool` filter instead of `Profile`: see `TODO(port)`) |
 | Feature pipeline spine: `profile` (`Profile`, `NullProfile`), `feature_processor`, `forwarding_profile`, `feature_collector`, `reader::{source_feature, simple_feature}`, `reader::osm::osm_relation_info` (+ `RelationMember`), `render::{feature_renderer, tiled_geometry, geometry_coordinate_sequences, rendered_feature}`, `collection::feature_group` | done (see notes below) |
-| `reader::{simple_reader, source_feature_processor, shapefile_reader, geo_package_reader, natural_earth_reader}`, `reader::geojson::*`, `reader::parquet::*` + benchmark `benchmark_simple_readers` | done as *decoders* emitting `ReaderFeature`; wiring into `SimpleFeature`/`Profile`/`FeatureGroup` is `TODO(port)` (see notes) |
+| `reader::{simple_reader, source_feature_processor, shapefile_reader, geo_package_reader, natural_earth_reader}`, `reader::geojson::*`, `reader::parquet::*` + benchmark `benchmark_simple_readers` | done, including profile/`FeatureGroup` wiring (`source_feature_processor::process_files`, per-reader `process` entry points, `impl SourceFeature for ParquetFeature`); see notes for the orchestrator API |
 
 ### `geo` notes
 
@@ -214,17 +214,41 @@ tiles.join()?;
 
 - Readers are *decoders*: they implement `reader::simple_reader::SimpleReader` (`source_name()`, `feature_count() ->
   Result<u64>`, `read_features(&mut dyn FnMut(ReaderFeature) -> Result<()>)`, `read_all()`) and emit
-  `ReaderFeature { geometry (lat/lon), tags, source_layer, id }` (the arguments of Java's `SimpleFeature.create`).
+  `ReaderFeature { geometry (lat/lon), tags, source_layer: Option<Arc<str>> (one shared Arc per layer), id }`.
   Readers may decode in parallel internally but always call the sink from the calling thread.
-  **TODO(port) for whoever ports `SimpleFeature`/`Profile`/`FeatureGroup`:** add `ReaderFeature -> SimpleFeature`
-  (`SimpleFeature.create(geometry, tags, sourceName, sourceLayer, id)`), then build Java's
-  `SourceFeatureProcessor.processFiles(name, paths, readerFactory, writer, config, profile, stats)` on top of
-  `source_feature_processor::process_files(name, paths, reader_factory, config, stats, processor_factory)` (the
-  per-thread `processor_factory` closure should convert to `SimpleFeature`, run `profile.process_feature`, render
-  into `writer.writer_for_thread()`, and `profile.finish(..)` must be called afterwards), and the static
-  `ShapefileReader.processWithProjection`, `GeoPackageReader.process`, `NaturalEarthReader.process`,
-  `GeoJsonReader.process` entry points. Same for `ParquetReader::process(paths, config, cares_about,
-  processor_factory)` (pass `profile.cares_about`, wrap `ParquetFeature` as a `SourceFeature`).
+  `ReaderFeature::into_simple_feature(&Arc<str> source)` moves geometry/tags/layer into a `SimpleFeature` (Java
+  `SimpleFeature.create(geometry, tags, sourceName, sourceLayer, id)`).
+- **Profile wiring** (`reader::source_feature_processor`): `process_files(name, paths, reader_factory, &writer,
+  &config, &profile, stats)` is Java's static `SourceFeatureProcessor.processFiles`: `read` threads ->
+  `process_queue` -> `feature_group::process_and_write` (inline when `config.parallel_temp_io`, else via write
+  threads). Each process thread owns a `ProfileProcessor` (`feature_collector::Factory`, `RenderedFeatureEncoder`,
+  shared `Arc<FeatureRenderer>`), skips features whose lat/lon envelope misses `config.bounds`, runs
+  `profile.process_feature` (panics are caught and logged like Java's `catch (Exception e)`; write errors fail the
+  pipeline) and renders into the sink. Loggers: `read` (rate/percent), `write` (`num_features_written`), file size
+  (`impl DiskBacked for FeatureGroup`), process + pipeline stats. Afterwards `profile.finish(name, ...)` is rendered
+  into `writer.feature_writer()` on the calling thread. Returns immediately if `!profile.cares_about_source(name)`
+  (Java checks this in `Planetiler`, doing it here too is harmless). The closure-based variant is
+  `process_files_with(name, paths, reader_factory, config, stats, processor_factory)` /
+  `ParquetReader::process_with(paths, config, cares_about, processor_factory)`.
+- **API for the `Planetiler` orchestrator** (all take `writer: &Arc<FeatureGroup>`, `config: &Arc<PlanetilerConfig>`,
+  `profile: &Arc<dyn Profile>`, `stats: StatsRef` and return `anyhow::Result<()>`; after the last source reclaim the
+  group with `Arc::into_inner` and call `prepare()`):
+  - `addShapefileSource(projection, name, path/glob)`: `ShapefileReader::process_with_projection(projection:
+    Option<&str>, name, paths: Vec<PathBuf>, writer, config, profile, stats)` (or `ShapefileReader::process(name,
+    paths, ..)` for the `.prj` projection). Expand globs / zip contents with `file_utils::walk_path_with_pattern`.
+  - `addGeoPackageSource(projection, name, path/glob)`: `GeoPackageReader::process(projection, name, paths, tmp_dir,
+    writer, config, profile, stats, keep_unzipped)`.
+  - `addNaturalEarthSource(name, path)`: `NaturalEarthReader::process(name, &path, tmp_dir, writer, config, profile,
+    stats, keep_unzipped)`.
+  - `addGeoJsonSource(name, path/glob)`: `GeoJsonReader::process(name, paths, writer, config, profile, stats)`.
+  - `addParquetSource(name, paths, hive_partitioning, get_id, get_layer)`:
+    `ParquetReader::with_options(name, stats, get_id, get_layer, hive_partitioning).process(&paths, writer, config,
+    profile)` (filters files/row groups with `profile.cares_about`).
+- `ParquetFeature` implements `SourceFeature` itself (owns a `SourceFeatureBase`) instead of being converted to a
+  `SimpleFeature`: WKB/WKT decoding stays lazy so features a profile rejects by tags never parse their geometry, and
+  nothing is copied. `vector_tile_feature_id` now uses `wrapping_mul` (Java `long` overflow semantics; parquet IDs are
+  64-bit hashes). TODO(port): Java's `ParquetReader` feeds features through a `Distributor` so idle threads help
+  with large row groups; here a thread processes a whole block.
 - `ShapefileReader::new(projection, source, path)` / `with_bounds(.., &Bounds)`: self-contained `.shp`/`.dbf`/`.prj`/
   `.cpg` parser (no GeoTools). Inputs: `.shp` on disk, a path inside a zip (`zip/dir/x.shp`, from
   `file_utils::walk_path_with_pattern`) or a zip containing one shapefile; zip entries are streamed (not extracted).
@@ -256,4 +280,4 @@ tiles.join()?;
   straight from arrow arrays (`geo_arrow::GeoArrowColumn`); WKB/WKT lazily (`ParquetFeature::lat_lon_geometry`).
   parquet-mr `FilterPredicate` -> `geo_parquet_metadata::FilterPredicate` (numeric compare/and/or/not) used for row
   group pruning via statistics (`can_drop`) and row filtering (`evaluate`); IDs use the same fnv1a hashes as Java.
-  `ParquetFeature` implements `WithTags` and has `into_reader_feature()`; TODO(port): `impl SourceFeature`.
+  `ParquetFeature` implements `SourceFeature` and has `into_reader_feature()`.

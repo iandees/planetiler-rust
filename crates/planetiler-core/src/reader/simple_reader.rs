@@ -5,19 +5,19 @@
 //! requires complex multi-pass processing.
 //!
 //! In Java, readers emit `SimpleFeature`s directly. Here readers are *decoders* that emit a plain, reader-owned
-//! [`ReaderFeature`] record (lat/lon geometry, tags, source layer and id) that the processing pipeline turns into a
-//! `SimpleFeature`.
-//!
-//! TODO(port): add `ReaderFeature::into_simple_feature(source_name)` (or an `impl From`) once
-//! `reader::simple_feature::SimpleFeature` is ported, mirroring Java's
-//! `SimpleFeature.create(latLonGeometry, tags, sourceName, sourceLayer, id)`.
+//! [`ReaderFeature`] record (lat/lon geometry, tags, source layer and id) that the processing pipeline
+//! ([`source_feature_processor`](crate::reader::source_feature_processor)) moves into a
+//! [`SimpleFeature`] with [`ReaderFeature::into_simple_feature`] (Java's
+//! `SimpleFeature.create(latLonGeometry, tags, sourceName, sourceLayer, id)`).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use geo_types::{Coord, Geometry};
 
 use crate::geo::crs::MathTransform;
 use crate::geo::envelope::Envelope;
+use crate::reader::simple_feature::SimpleFeature;
 use crate::value::Tags;
 
 /// A feature decoded by a [`SimpleReader`]: the equivalent of the arguments to Java's
@@ -28,15 +28,23 @@ pub struct ReaderFeature {
     pub geometry: Geometry<f64>,
     /// Attributes of the feature.
     pub tags: Tags,
-    /// Layer within the source this feature came from (shapefile name, geopackage/sqlite table, ...).
-    pub source_layer: Option<String>,
+    /// Layer within the source this feature came from (shapefile name, geopackage/sqlite table, ...). Readers share
+    /// one `Arc` per layer so emitting a feature does not allocate a new string.
+    pub source_layer: Option<Arc<str>>,
     /// Feature ID, unique within a single reader.
     pub id: i64,
 }
 
 impl ReaderFeature {
-    pub fn new(geometry: Geometry<f64>, tags: Tags, source_layer: Option<String>, id: i64) -> ReaderFeature {
+    pub fn new(geometry: Geometry<f64>, tags: Tags, source_layer: Option<Arc<str>>, id: i64) -> ReaderFeature {
         ReaderFeature { geometry, tags, source_layer, id }
+    }
+
+    /// Converts this record into a [`SimpleFeature`] from source `source` (Java
+    /// `SimpleFeature.create(latLonGeometry, tags, source, sourceLayer, id)`). Geometry, tags and layer name are moved,
+    /// not copied; `source` is a shared `Arc` so this only bumps a reference count.
+    pub fn into_simple_feature(self, source: &Arc<str>) -> SimpleFeature {
+        SimpleFeature::create(self.geometry, self.tags, source, self.source_layer, self.id)
     }
 
     /// Returns the tag value for `key`, if present.

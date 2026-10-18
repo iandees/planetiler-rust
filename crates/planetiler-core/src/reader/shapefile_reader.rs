@@ -90,7 +90,7 @@ struct DbfHeader {
 /// Reads features from an ESRI shapefile.
 pub struct ShapefileReader {
     source_name: String,
-    layer: String,
+    layer: std::sync::Arc<str>,
     input: Input,
     transform: Option<MathTransform>,
     /// Only include records whose bounding box intersects this envelope (in the source CRS).
@@ -156,7 +156,7 @@ impl ShapefileReader {
         let dbf = read_dbf_header(&input_desc, charset)?;
         Ok(ShapefileReader {
             source_name: source_name.to_string(),
-            layer,
+            layer: layer.into(),
             input: input_desc,
             transform,
             source_filter,
@@ -785,6 +785,50 @@ fn build_polygons(rings: Vec<Vec<Coord<f64>>>) -> MultiPolygon<f64> {
     MultiPolygon(polygons)
 }
 
+/// Entry points that run a profile on shapefiles (Java's static `ShapefileReader.processWithProjection`).
+impl ShapefileReader {
+    /// Renders map features for all elements from the shapefiles at `source_paths` (`.shp` files, paths inside zip
+    /// files, or zip files containing one shapefile) based on the mapping logic defined in `profile`, writing them
+    /// to `writer`.
+    ///
+    /// `source_projection` overrides the CRS from the `.prj` file (e.g. `EPSG:3857`). Only features whose bounding
+    /// box intersects `config.bounds` are read.
+    pub fn process_with_projection(
+        source_projection: Option<&str>,
+        source_name: &str,
+        source_paths: Vec<PathBuf>,
+        writer: &std::sync::Arc<crate::collection::feature_group::FeatureGroup>,
+        config: &std::sync::Arc<crate::config::planetiler_config::PlanetilerConfig>,
+        profile: &std::sync::Arc<dyn crate::profile::Profile>,
+        stats: crate::stats::stats::StatsRef,
+    ) -> Result<()> {
+        let projection = source_projection.map(str::to_string);
+        let name = source_name.to_string();
+        let bounds = config.bounds.clone();
+        crate::reader::source_feature_processor::process_files(
+            source_name,
+            source_paths,
+            move |path: &Path| ShapefileReader::with_bounds(projection.as_deref(), &name, path, &bounds),
+            writer,
+            config,
+            profile,
+            stats,
+        )
+    }
+
+    /// [`ShapefileReader::process_with_projection`] using the projection from each shapefile's `.prj` file.
+    pub fn process(
+        source_name: &str,
+        source_paths: Vec<PathBuf>,
+        writer: &std::sync::Arc<crate::collection::feature_group::FeatureGroup>,
+        config: &std::sync::Arc<crate::config::planetiler_config::PlanetilerConfig>,
+        profile: &std::sync::Arc<dyn crate::profile::Profile>,
+        stats: crate::stats::stats::StatsRef,
+    ) -> Result<()> {
+        Self::process_with_projection(None, source_name, source_paths, writer, config, profile, stats)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use geo::Centroid;
@@ -952,5 +996,37 @@ mod tests {
         assert_eq!(1, mp.0[0].interiors().len());
         assert_eq!(0, mp.0[1].interiors().len());
         assert_eq!(Some(&Value::str("a")), features[0].get_tag("name"));
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::reader::source_feature_processor::test_support::*;
+
+    #[test]
+    fn process_shapefile_with_profile() {
+        let zip = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/resources/shapefile.zip");
+        for (write_threads, proj) in [(false, None), (true, Some("EPSG:4326"))] {
+            let profile = Arc::new(CollectingProfile::default());
+            let output = run_with_group(config(write_threads), profile.clone(), |group, config, profile, stats| {
+                ShapefileReader::process_with_projection(
+                    proj,
+                    "shapefile",
+                    vec![zip.clone()],
+                    group,
+                    config,
+                    profile,
+                    stats,
+                )
+            });
+            profile.assert_saw("shapefile", &[("stations", 86)]);
+            assert_eq!(86, output.len());
+            assert!(output.iter().all(|(_, layer, _)| layer == "stations"));
+            assert_eq!(vec!["shapefile"], *profile.finished.lock());
+        }
     }
 }

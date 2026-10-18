@@ -3,11 +3,12 @@
 //! The geometry is decoded lazily on first access (WKB/WKT), or eagerly for geoarrow-encoded columns which are
 //! decoded straight from arrow arrays. The primary geometry column is removed from the tags.
 //!
-//! TODO(port): implement `SourceFeature` for `ParquetFeature` once `reader::source_feature` is ported (Java's
-//! `ParquetFeature extends SourceFeature`: `latLonGeometry`, `worldGeometry`, `isPoint`, `canBePolygon`, `canBeLine`,
-//! dotted `getTag`/`getStruct` access). Until then [`ParquetFeature::into_reader_feature`] converts it to the plain
-//! [`ReaderFeature`] record.
+//! `ParquetFeature` implements [`SourceFeature`] directly (like Java's `ParquetFeature extends SourceFeature`) rather
+//! than being converted to a `SimpleFeature`: that keeps WKB/WKT decoding lazy, so features a profile ignores based
+//! on their tags never have their geometry parsed, and avoids moving tags into a second struct. Dotted tag access
+//! (`names.primary`) comes from the default [`WithTags`](crate::reader::with_tags::WithTags) methods.
 
+use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -17,17 +18,17 @@ use parquet::schema::types::SchemaDescPtr;
 use crate::geo::geo_utils;
 use crate::geo::geometry_exception::GeometryResult;
 use crate::geo::geometry_type::GeometryType;
+use crate::geo::with_geometry::{GeometryCache, WithGeometry};
 use crate::reader::parquet::geometry_reader::GeometryReader;
 use crate::reader::simple_reader::ReaderFeature;
-use crate::reader::with_tags::WithTags;
+use crate::reader::source_feature::{SourceFeature, SourceFeatureBase};
+use crate::reader::with_geometry_type::WithGeometryType;
 use crate::value::{Tags, Value};
 
 /// A single record read from a geoparquet file.
 pub struct ParquetFeature {
-    source: Arc<str>,
-    source_layer: Arc<str>,
-    id: i64,
-    tags: Tags,
+    /// Tags (minus the geometry column), source, layer and id.
+    base: SourceFeatureBase,
     raw_geometry: Value,
     geometry_reader: Arc<GeometryReader>,
     path: Arc<PathBuf>,
@@ -51,10 +52,7 @@ impl ParquetFeature {
     ) -> ParquetFeature {
         let raw_geometry = tags.shift_remove(&geometry_reader.geometry_column).unwrap_or(Value::Null);
         ParquetFeature {
-            source,
-            source_layer,
-            id,
-            tags,
+            base: SourceFeatureBase::new(tags, Some(source), Some(source_layer), Vec::new(), id),
             raw_geometry,
             geometry_reader,
             path,
@@ -74,15 +72,15 @@ impl ParquetFeature {
     }
 
     pub fn source(&self) -> &str {
-        &self.source
+        self.base.source.as_deref().unwrap_or_default()
     }
 
     pub fn source_layer(&self) -> &str {
-        &self.source_layer
+        self.base.source_layer.as_deref().unwrap_or_default()
     }
 
     pub fn id(&self) -> i64 {
-        self.id
+        self.base.id
     }
 
     /// Returns the parquet file that this feature was read from.
@@ -154,22 +152,59 @@ impl ParquetFeature {
         self.geometry_type() == GeometryType::Line
     }
 
-    /// Convert to a plain [`ReaderFeature`], decoding the geometry.
-    pub fn into_reader_feature(self) -> GeometryResult<ReaderFeature> {
-        let geometry = self.lat_lon_geometry()?.clone();
-        Ok(ReaderFeature { geometry, tags: self.tags, source_layer: Some(self.source_layer.to_string()), id: self.id })
+    /// Convert to a plain [`ReaderFeature`], decoding the geometry (moves the geometry and tags out).
+    pub fn into_reader_feature(mut self) -> GeometryResult<ReaderFeature> {
+        self.lat_lon_geometry()?;
+        let geometry = self.lat_lon.take().expect("geometry decoded").expect("geometry ok");
+        let base = self.base;
+        Ok(ReaderFeature { geometry, tags: base.tags, source_layer: base.source_layer, id: base.id })
     }
 }
 
-impl WithTags for ParquetFeature {
-    fn tags(&self) -> &Tags {
-        &self.tags
+impl WithGeometryType for ParquetFeature {
+    fn is_point(&self) -> bool {
+        ParquetFeature::is_point(self)
+    }
+
+    fn can_be_polygon(&self) -> bool {
+        ParquetFeature::can_be_polygon(self)
+    }
+
+    fn can_be_line(&self) -> bool {
+        ParquetFeature::can_be_line(self)
     }
 }
+
+impl WithGeometry for ParquetFeature {
+    fn world_geometry(&self) -> GeometryResult<&Geometry<f64>> {
+        ParquetFeature::world_geometry(self)
+    }
+
+    fn lat_lon_geometry(&self) -> GeometryResult<&Geometry<f64>> {
+        ParquetFeature::lat_lon_geometry(self)
+    }
+
+    fn geometry_cache(&self) -> &GeometryCache {
+        &self.base.geometry_cache
+    }
+}
+
+impl SourceFeature for ParquetFeature {
+    fn base(&self) -> &SourceFeatureBase {
+        &self.base
+    }
+
+    fn as_any_feature(&self) -> &dyn Any {
+        self
+    }
+}
+
+crate::impl_source_feature_traits!(ParquetFeature);
 
 impl std::fmt::Debug for ParquetFeature {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.tags)
+        // like Java's toString(): just the tags
+        write!(f, "{:?}", self.base.tags)
     }
 }
 
@@ -179,6 +214,7 @@ mod tests {
 
     use super::*;
     use crate::reader::parquet::geo_parquet_metadata::{ColumnMetadata, GeoParquetMetadata};
+    use crate::reader::with_tags::WithTags;
     use crate::tags;
 
     fn feature(tags: Tags) -> ParquetFeature {
