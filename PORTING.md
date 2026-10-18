@@ -65,6 +65,7 @@ See the table at the bottom of this file; update it as modules are completed.
 | `reader::osm::{osm_multipolygon, osm_way_splitter, osm_node_bounds_provider}` | done (`NodeLocationProvider` trait lives in `osm_multipolygon` until `OsmReader` is ported; bounds provider does not use `OsmPhaser` yet) |
 | `util::{translations, language_utils, thread_local_transliterator, wikidata}` | done (`Wikidata` takes a `Fn(&OsmElement) -> bool` filter instead of `Profile`: see `TODO(port)`) |
 | Feature pipeline spine: `profile` (`Profile`, `NullProfile`), `feature_processor`, `forwarding_profile`, `feature_collector`, `reader::{source_feature, simple_feature}`, `reader::osm::osm_relation_info` (+ `RelationMember`), `render::{feature_renderer, tiled_geometry, geometry_coordinate_sequences, rendered_feature}`, `collection::feature_group` | done (see notes below) |
+| `reader::{simple_reader, source_feature_processor, shapefile_reader, geo_package_reader, natural_earth_reader}`, `reader::geojson::*`, `reader::parquet::*` + benchmark `benchmark_simple_readers` | done as *decoders* emitting `ReaderFeature`; wiring into `SimpleFeature`/`Profile`/`FeatureGroup` is `TODO(port)` (see notes) |
 
 ### `geo` notes
 
@@ -208,3 +209,51 @@ for tile in &mut tiles {
 tiles.join()?;
 ```
 `TileFeatures` is `Send + 'static` (holds an `Arc` of shared state), so it can be handed to encoder threads.
+
+### Simple readers (shapefile, geopackage, natural earth, geojson, parquet) notes
+
+- Readers are *decoders*: they implement `reader::simple_reader::SimpleReader` (`source_name()`, `feature_count() ->
+  Result<u64>`, `read_features(&mut dyn FnMut(ReaderFeature) -> Result<()>)`, `read_all()`) and emit
+  `ReaderFeature { geometry (lat/lon), tags, source_layer, id }` (the arguments of Java's `SimpleFeature.create`).
+  Readers may decode in parallel internally but always call the sink from the calling thread.
+  **TODO(port) for whoever ports `SimpleFeature`/`Profile`/`FeatureGroup`:** add `ReaderFeature -> SimpleFeature`
+  (`SimpleFeature.create(geometry, tags, sourceName, sourceLayer, id)`), then build Java's
+  `SourceFeatureProcessor.processFiles(name, paths, readerFactory, writer, config, profile, stats)` on top of
+  `source_feature_processor::process_files(name, paths, reader_factory, config, stats, processor_factory)` (the
+  per-thread `processor_factory` closure should convert to `SimpleFeature`, run `profile.process_feature`, render
+  into `writer.writer_for_thread()`, and `profile.finish(..)` must be called afterwards), and the static
+  `ShapefileReader.processWithProjection`, `GeoPackageReader.process`, `NaturalEarthReader.process`,
+  `GeoJsonReader.process` entry points. Same for `ParquetReader::process(paths, config, cares_about,
+  processor_factory)` (pass `profile.cares_about`, wrap `ParquetFeature` as a `SourceFeature`).
+- `ShapefileReader::new(projection, source, path)` / `with_bounds(.., &Bounds)`: self-contained `.shp`/`.dbf`/`.prj`/
+  `.cpg` parser (no GeoTools). Inputs: `.shp` on disk, a path inside a zip (`zip/dir/x.shp`, from
+  `file_utils::walk_path_with_pattern`) or a zip containing one shapefile; zip entries are streamed (not extracted).
+  One thread reads records, `available_parallelism` threads decode + reproject, output stays in file order; IDs
+  start at 1 and skip null shapes like Java. Geometries match GeoTools: points, `MultiPoint`, `MultiLineString`,
+  `MultiPolygon` (CW shells, CCW holes assigned to the smallest containing shell). DBF dates become `YYYY-MM-DD`
+  strings; blank numerics are null; charset from `.cpg` (UTF-8, otherwise ISO-8859-1). Bounds filter uses the
+  record bbox in the source CRS. `geo::crs` now converts WKT `PROJCS` (transverse mercator, LCC, albers, ...) to
+  proj strings, so e.g. SWEREF99 `.prj` files work.
+- `GeoPackageReader::new(projection, source, path, tmp_dir, keep_unzipped, Option<&Bounds>)`: rusqlite +
+  GeoPackageBinary header parsing (`parse_geometry_header`) + WKB. SRS from `gpkg_spatial_ref_sys` WKT (falls back
+  to `organization`/`organization_coordsys_id` EPSG codes), input forced longitude-first like Java. R-tree
+  (`rtree_<table>_<col>`) used when bounds are given. Empty-flagged geometries are skipped. Declared `BOOLEAN`
+  columns -> bool, `FLOAT` -> `Value::Float`, other columns by sqlite storage class; the `fid` column is a tag.
+- `NaturalEarthReader::new(source, path, tmp_dir, keep_unzipped)`: zip inputs are extracted
+  (`simple_reader::extract_from_zip`, Java's URL-encoded name when `keep_unzipped`, otherwise a temp file deleted on
+  drop). Tables matching `ne_[a-z0-9_]+` are read **in parallel** (one read-only connection per thread); IDs are
+  precomputed per table so they match Java's sequential IDs, but features from different tables interleave.
+- GeoJSON: `geojson::geo_json::GeoJson::{from_path, from_bytes, from_str, from_supplier}` with `iter()` (streaming
+  `Iterator<Item = Result<GeoJsonFeature>>`), `features()`, `count()`. Hand-rolled pull tokenizer
+  (`geo_json_feature_iterator::JsonParser`, Jackson token model + `skip_children`) so the Java state machine is
+  ported 1:1 (same warnings/empty geometry rules). `GeoJsonReader::new(source, path)` (layer = file stem, IDs from 0).
+- Parquet: uses `parquet`'s arrow reader (row group = `Block`, read in parallel by `ParquetReader`). Rows convert to
+  `Tags` (`parquet_record_converter::array_value`): nulls omitted, structs -> maps, map keys stringified, legacy
+  `array`/`list` 2-level lists unwrapped, float -> double, decimals -> double. Temporal values have no `Value`
+  variant so they become their Java `toString()`: dates `2000-01-01`, times `05:30:10.123`, timestamps
+  (millis) `2000-01-01T10:30:10.123Z`, UUID strings, `Interval[period=P1M2D, duration=PT3S]` (INTERVAL columns are
+  re-read with the low-level column reader since arrow drops the month part). GeoArrow geometries are decoded
+  straight from arrow arrays (`geo_arrow::GeoArrowColumn`); WKB/WKT lazily (`ParquetFeature::lat_lon_geometry`).
+  parquet-mr `FilterPredicate` -> `geo_parquet_metadata::FilterPredicate` (numeric compare/and/or/not) used for row
+  group pruning via statistics (`can_drop`) and row filtering (`evaluate`); IDs use the same fnv1a hashes as Java.
+  `ParquetFeature` implements `WithTags` and has `into_reader_feature()`; TODO(port): `impl SourceFeature`.
