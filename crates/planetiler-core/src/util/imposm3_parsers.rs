@@ -45,7 +45,12 @@ pub fn direction(obj: &Value) -> i32 {
 
 /// Returns `false` if `tag` is null, empty, "0", "false", or "no" and `true` otherwise.
 pub fn bool(tag: &Value) -> bool {
-    !(tag.is_null() || matches!(tag.to_string_lossy().as_ref(), "" | "0" | "false" | "no"))
+    !tag.is_null() && bool_str(&tag.to_string_lossy())
+}
+
+/// Returns `false` if `tag` is empty, "0", "false", or "no" and `true` otherwise.
+pub fn bool_str(tag: &str) -> bool {
+    !matches!(tag, "" | "0" | "false" | "no")
 }
 
 /// Returns 1 if [`bool`] is `true`, 0 otherwise.

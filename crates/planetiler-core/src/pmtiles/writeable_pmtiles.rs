@@ -24,7 +24,8 @@ use crate::archive::writeable_tile_archive::{TileWriter, WriteableTileArchive};
 use crate::config::planetiler_config::MAX_MAXZOOM;
 use crate::geo::geo_utils;
 use crate::geo::tile_order::TileOrder;
-use crate::pmtiles::pmtiles::{self, Compression, Entry, HEADER_LEN, Header, JsonMetadata, TileType, gzip};
+use crate::pmtiles::pmtiles::{self, Compression, Entry, HEADER_LEN, Header, JsonMetadata, TileType};
+use crate::util::gzip::gzip_zlib as gzip;
 
 pub const INIT_SECTION: usize = 16384;
 

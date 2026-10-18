@@ -8,8 +8,8 @@ use prost::Message;
 use crate::archive::readable_tile_archive::ReadableTileArchive;
 use crate::geo::tile_coord::TileCoord;
 use crate::mbtiles::mbtiles::Mbtiles;
-use crate::pmtiles::pmtiles::gunzip;
 use crate::proto::vector_tile as vt;
+use crate::util::gzip::gunzip;
 
 const GOOD: &str = "\u{1B}[32m✓\u{1B}[0m";
 const BAD: &str = "\u{1B}[31m✕\u{1B}[0m";
@@ -138,7 +138,7 @@ mod tests {
     use super::*;
     use crate::archive::tile_encoding_result::TileEncodingResult;
     use crate::archive::writeable_tile_archive::WriteableTileArchive;
-    use crate::pmtiles::pmtiles::gzip;
+    use crate::util::gzip::gzip_zlib as gzip;
 
     fn point_tile() -> Vec<u8> {
         let tile = vt::Tile {

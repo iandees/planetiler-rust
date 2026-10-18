@@ -16,8 +16,8 @@ use tracing::{info, warn};
 
 use crate::geo::tile_coord::TileCoord;
 use crate::mbtiles::mbtiles::Mbtiles;
-use crate::pmtiles::pmtiles::gunzip;
 use crate::proto::vector_tile as vt;
+use crate::util::gzip::gunzip;
 
 /// Comparable representation of a vector tile feature.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -148,7 +148,7 @@ mod tests {
     use crate::archive::tile_archive_config::ArchiveOptions;
     use crate::archive::tile_encoding_result::TileEncodingResult;
     use crate::archive::writeable_tile_archive::WriteableTileArchive;
-    use crate::pmtiles::pmtiles::gzip;
+    use crate::util::gzip::gzip_zlib as gzip;
 
     fn tile(value: &str) -> Vec<u8> {
         let t = vt::Tile {

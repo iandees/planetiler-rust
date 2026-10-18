@@ -19,9 +19,9 @@ use crate::archive::tile_archives;
 use crate::archive::tile_compression::TileCompression;
 use crate::config::planetiler_config::PlanetilerConfig;
 use crate::geo::tile_coord::TileCoord;
-use crate::pmtiles::pmtiles::gunzip;
 use crate::pmtiles::readable_pmtiles::ReadablePmtiles;
 use crate::proto::vector_tile as vt;
+use crate::util::gzip::gunzip;
 
 /// A comparison failure that prevents comparing the whole archives.
 #[derive(Debug, Error)]
@@ -483,8 +483,8 @@ mod tests {
     use crate::archive::tile_format::TileFormat;
     use crate::archive::writeable_tile_archive::WriteableTileArchive;
     use crate::geo::tile_order::TileOrder;
-    use crate::pmtiles::pmtiles::gzip;
     use crate::pmtiles::writeable_pmtiles::WriteablePmtiles;
+    use crate::util::gzip::gzip_zlib as gzip;
 
     fn metadata(compression: TileCompression) -> TileArchiveMetadata {
         let bounds = *crate::geo::geo_utils::WORLD_LAT_LON_BOUNDS;

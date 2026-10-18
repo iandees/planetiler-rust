@@ -4,13 +4,13 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::archive::tile_archive_metadata::{Coordinate, VectorLayer};
 use crate::geo::envelope::Envelope;
+use crate::util::var_int;
 
 /// Error for malformed PMTiles archives (Java `FileFormatException`).
 #[derive(Debug, Error)]
@@ -241,30 +241,16 @@ impl Ord for Entry {
     }
 }
 
-// TODO(port): switch to crate::util::var_int once ported.
-fn put_var_long(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push((value as u8 & 0x7f) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
+fn put_var_long(value: u64, out: &mut Vec<u8>) {
+    var_int::put_var_long(value as i64, out);
 }
 
 fn get_var_long(bytes: &[u8], pos: &mut usize) -> Result<u64, FileFormatException> {
-    let mut result = 0u64;
-    let mut shift = 0;
-    loop {
-        let b = *bytes.get(*pos).ok_or_else(|| FileFormatException("Unexpected end of PMTiles directory".into()))?;
-        *pos += 1;
-        if shift >= 64 {
-            return Err(FileFormatException("Varint too long".into()));
-        }
-        result |= ((b & 0x7f) as u64) << shift;
-        if b & 0x80 == 0 {
-            return Ok(result);
-        }
-        shift += 7;
-    }
+    let mut s = &bytes[*pos..];
+    let v = var_int::try_get_var_long(&mut s)
+        .ok_or_else(|| FileFormatException("Unexpected end of PMTiles directory".into()))?;
+    *pos = bytes.len() - s.len();
+    Ok(v as u64)
 }
 
 /// Convert a directory of entries (sorted by ascending `tile_id`, non-empty) to uncompressed bytes.
@@ -358,19 +344,6 @@ impl JsonMetadata {
         serde_json::from_slice(bytes)
             .map_err(|e| anyhow::anyhow!("Invalid metadata json: {} ({e})", String::from_utf8_lossy(bytes)))
     }
-}
-
-// TODO(port): switch to crate::util::gzip once ported.
-pub(crate) fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(bytes)?;
-    encoder.finish()
-}
-
-pub(crate) fn gunzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    flate2::read::MultiGzDecoder::new(bytes).read_to_end(&mut out)?;
-    Ok(out)
 }
 
 #[cfg(test)]

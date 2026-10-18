@@ -9,8 +9,9 @@ use crate::archive::tile_archive_metadata::{self as md, Coordinate, TileArchiveM
 use crate::archive::tile_compression::TileCompression;
 use crate::archive::tile_format::TileFormat;
 use crate::geo::tile_coord::TileCoord;
-use crate::pmtiles::pmtiles::{self, Compression, Entry, HEADER_LEN, Header, JsonMetadata, TileType, gunzip};
+use crate::pmtiles::pmtiles::{self, Compression, Entry, HEADER_LEN, Header, JsonMetadata, TileType};
 use crate::pmtiles::writeable_pmtiles::SeekableInMemoryByteChannel;
+use crate::util::gzip::gunzip;
 
 /// Random-access byte source for a PMTiles archive.
 pub trait ByteSource: Send + Sync {
