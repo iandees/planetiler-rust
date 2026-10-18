@@ -135,7 +135,7 @@ Benchmarks are separate binaries in `crates/planetiler-benchmarks` (`cargo run -
 - **Parquet/struct values.** Temporal and UUID columns become their Java `toString()` strings.
 - **`compare`** only reports real content differences (see above), and can also compare MLT archives. Java also
   counts tiles whose bytes differ.
-- **Logging.** There's no `[stage]` prefix on log lines, and data-error debug logs print WKB as hex rather than base64.
+- **Logging.** Data-error debug logs print WKB as hex rather than base64.
 
 ## Known gaps
 
@@ -150,8 +150,7 @@ From [PORTING.md](PORTING.md) and the `TODO(port)` triage in
   can differ by sub-pixel vertices.
 - **Coordinate reference systems.** Only EPSG:4326, 4269 and 3857, PROJ strings and simple WKT are supported. Inputs
   in other projections fail where Java (GeoTools) succeeds.
-- **CLI tasks not ported:** `top-osm-tiles` (needs xz decompression) and `benchmark-mapping`.
-  `benchmark-longlongmap` points you at the benchmarks crate instead.
+- **CLI tasks:** all are ported except `benchmark-longlongmap`, which points you at the benchmarks crate instead.
 - **Parquet load balancing.** Parquet row groups aren't redistributed between threads (Java's `Distributor`), which
   can leave threads idle on inputs with uneven row-group sizes.
 

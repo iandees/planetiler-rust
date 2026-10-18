@@ -3,8 +3,9 @@
 Read-only review of `main` @ `c116961` (2026-10-17). Nothing was compiled or run. Line numbers are as of that commit.
 
 **Status (2026-10-18):** all 2 unsound and 3 risky items in Part 1 are fixed (each section below has a **Fixed** note).
-In Part 2, all 13 (a1) items, 12 of the 16 (a2) markers, #32 and all 8 (c) items are done; see
-[Part 2 status](#part-2-status-2026-10-18). 20 `TODO(port)` markers remain.
+In Part 2, all 13 (a1) items, 15 of the 16 (a2) markers, #27, #28, #32-#37 and all 8 (c) items are done; see
+[Part 2 status](#part-2-status-2026-10-18). 4 `TODO(port)` markers remain under `crates/`
+(#16 `parquet_reader.rs`, #29/#30 `polygon_overlay.rs`, #31 `crs.rs`).
 
 ## Part 1: `unsafe` audit
 
@@ -213,8 +214,12 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 | #14 custommap `SchemaValidator` | **Done.** `planetiler_custommap::validator::{validate, SchemaValidator, main}` on top of `BaseSchemaValidator` (embedded or referenced examples, `--watch`, `verify schema.yml` shortcut, "Malformed expression"/"Malformed yaml input" messages). `planetiler verify`/`verify-custom`/`verify-schema` run it. `tests/schema_tests.rs` uses the core validator (the ~300-line reimplementation is gone) and checks the CLI output like Java's `SchemaValidatorTest`. |
 | #15 `benchmark_osm_read` | **Done.** Runs `OsmReader::pass1` with `NullProfile` and noop node/multipolygon storage. |
 | #16 parquet `Distributor` | Not done: a performance change (S-M) that needs measuring on Overture inputs; out of scope for this cleanup. |
-| #17 `feature_sort` `Worker`, #18 `external_merge_sort` `ProgressLoggers` | Not done: the sort code is being optimized concurrently; left alone to avoid merge conflicts. |
-| #19 `top_osm_tiles` `write_to_file` | Not done: the CLI is still blocked on xz (#33). |
+| #17 `feature_sort` `Worker`, #18 `external_merge_sort` `ProgressLoggers` | **Done** (rows removed). The sort logs Java-style `ProgressLoggers` progress (percent of chunks, sort dir size, process and thread stats) and the reader threads run in a `worker::Worker`. |
+| #19 `top_osm_tiles` `write_to_file`, #33 xz | **Done** (rows removed). `top_osm_tiles::main` is the `top-osm-tiles` CLI; tile logs are decompressed with `lzma-rust2` (pure-Rust port of XZ for Java). On a real day of logs the output matches Java except for which tiles tied at the top-1m cutoff are kept. |
+| #34 stream archive runner tests | **Done** (row removed). `testing::in_memory_stream_archive` reads csv/tsv/json/proto outputs; all csv/tsv/proto/pbf/pbf+MLT/json variants are ported. |
+| #35 `[stage]` log prefix | **Done** (row removed). `util::log_util` (thread-local stage, `fields()` formatter); `Worker` threads log as `[parent:prefix]`. |
+| #36 `Struct` JSON cache | **Done** (row removed). String structs cache their parsed JSON in a `OnceLock`. |
+| #37 `benchmark-mapping` | **Done** (row removed). `crates/planetiler/src/benchmark_mapping.rs`, same sampling and output as Java. |
 | #20 `ArchiveOptions` | **Done.** Removed; every archive takes `&Arguments` (`apply_fallbacks` is `Arguments::of_map(query).or_else(args.with_prefix(format))`). |
 | #21 `CompareArchives` geometry | **Done**, plus a behavior change: layers are paired by name, feature tags are compared as decoded key/value pairs, geometries with different commands are decoded (Java's `compareGeometry` checks) and are equal if they decode the same, and tiles that only differ in encoding are counted in `CompareResult::equivalent_tiles` instead of `tile_diffs`. |
 | #22 `mbtiles::compare` | **Done.** Compares `to_wkt(norm(decode()))` like Java. |
@@ -223,7 +228,7 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 | #26 `Stats` debug log | **Done** (WKB logged as hex, no base64 dependency). |
 | #32 free-after-read disk estimate | **Done.** `ResourceUsage::free_disk` (usage amounts are now signed internally). |
 | #38-#45 (c) | **Done.** Relabeled as "Difference from Java" notes, plain `TODO`s where Java has the same TODO, or a short comment (#38, #42/#43). PORTING.md no longer lists "unify VectorLayer" as a follow-up. |
-| #27-#31, #33-#37 (b) | Unchanged (real missing features). |
+| #29-#31 (b) | Unchanged (real missing features). |
 
 ### (a1) Stale, mechanical (13)
 
@@ -250,9 +255,6 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 | 14 | `planetiler/src/main.rs:46` + `custommap/src/validator.rs:3` + `custommap/tests/schema_tests.rs:3` (3 TODOs) | `planetiler_core::validator::{base_schema_validator, schema_specification}` now exist. Implement `SchemaValidator: BaseSchemaValidator` in `custommap/validator.rs` (`validate(schema, spec)` using `build_root_context` + `ConfiguredProfile` + `base_schema_validator::validate`; `main` handling `--watch` and the `verify schema.yml` shortcut). Delete the ~400-line test-only reimplementation in `schema_tests.rs`. Wire up `verify_schema` in the CLI. `java_profile_validator.rs` (132 lines) is the model to follow. | S-M (~150 LOC net negative) |
 | 15 | `benchmarks/src/bin/benchmark_osm_read.rs:16` | `OsmReader::pass1` exists (`osm_reader.rs:560`). Build an `OsmReader` with a noop node map and a test profile, like Java's `BenchmarkOsmRead`, and call `pass1(&config)` each iteration. Delete the hand-copied pass-1 loop. | S |
 | 16 | `core/src/reader/parquet/parquet_reader.rs:12` | `worker::distributor::Distributor` exists. Wrap each block's per-feature work in `distributor.for_thread(..)` the way Java does, so idle threads help with large row groups. **This matters for performance on Overture inputs**, where some row groups are much larger than others. | S-M |
-| 17 | `core/src/collection/feature_sort.rs:164` | Return or hold a `worker::Worker` (`Worker::new(prefix, stats, threads, task)`) instead of raw `JoinHandle`s, so `ProgressLoggers::add_pipeline_stats`/`add_thread_pool_stats_for_worker` can report reader threads. | S |
-| 18 | `core/src/collection/external_merge_sort.rs:601` | `ProgressLoggers::create().add_percent_counter("chunks", num_groups, \|\| done).add_file_size_path(dir).add_process_stats().add_thread_pool_stats(..)`, and call `.log()` in the wait loop instead of the ad-hoc `info!`. | S |
-| 19 | `core/src/util/top_osm_tiles.rs:116` | `TileWeights::write_to_file` exists. Wire it into the `top-osm-tiles` CLI. Still blocked on xz (#33) for real downloads. | XS |
 | 20 | `core/src/archive/tile_archive_config.rs:453` `ArchiveOptions` | `Arguments` now has `or_else`, `with_prefix`, `subset`, `of_pairs`, typed getters and `"a\|b"` alternative keys (arguments.rs:207). Replace `ArchiveOptions` with `Arguments`. Check that per-key description logging doesn't get noisier. | S-M |
 | 21 | `core/src/util/compare_archives.rs:388` | `VectorGeometry::decode` exists (vector_tile.rs:1006). Port Java's `compareGeometry(Geometry, Geometry)` (type, number of geometries, exterior and interior rings per polygon) for when the command streams differ. | S (~40 LOC) |
 | 22 | `core/src/mbtiles/compare.rs:6` | Decode with `vector_tile::decode` + `VectorGeometry::decode`, then compare with `geo::normalize::norm`/`equals_norm`, like Java. At the moment the comparison is stricter than Java's. | S |
@@ -271,11 +273,6 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 | 30 | `core/src/geo/polygon_overlay.rs:455` | **Snap-rounding for lines** (noding at intersections). Lines are only rounded point by point. | M | Low-medium: JTS nodes self-intersecting lines during `GeometryPrecisionReducer`, which changes vertex counts and output bytes for merged or simplified lines. |
 | 31 | `core/src/geo/crs.rs:15` | Arbitrary EPSG codes and general WKT CRS. Only 4326/4269/3857, PROJ strings and simple WKT work. | M (`proj4rs` + `crs-definitions` feature + a WKT -> PROJ converter for `.prj` files) | Medium: shapefiles or geopackages in other projections fail where Java (GeoTools) succeeds. |
 | 32 | `core/src/planetiler.rs:1136` | The write-phase disk estimate doesn't subtract inputs marked `free_<name>_after_read`. | XS (~10 LOC: for each `input_paths` entry with `free_after_reading`, `write_phase.add_disk(Some(&p.path), -(size))`. Needs a signed amount, or compute it as `saturating_sub`.) | Low-medium: can make `check_disk_space` fail falsely on tight disks unless `--force` is used. |
-| 33 | `planetiler/src/main.rs:102`, `core/src/util/top_osm_tiles.rs:50` (2 TODOs) | xz decompression for openstreetmap.org tile logs (`top-osm-tiles` CLI). | S (add `xz2` or the pure-Rust `lzma-rs`; the default fetcher becomes `XzDecoder::new(http_get(url))`) | Low |
-| 34 | `core/tests/planetiler_runner_tests.rs:64` | In-memory stream archive readers (Java `InMemoryStreamArchive`) for the csv/tsv/json/proto/pbf variants of `testPlanetilerRunner` (the mbtiles/pmtiles/files MLT variants are ported). | S-M | Low (test coverage only; the writers are already ported) |
-| 35 | `core/src/stats/stats.rs:65` | `LogUtil.setStage`: `[stage]` prefix on log lines. | S (a `tracing` span per stage, or a thread-local prefix in the fmt layer) | Low (log cosmetics; makes Java and Rust log diffs noisier) |
-| 36 | `core/src/reader/structs.rs:13` | Cache parsed JSON for string values in `Struct::get`. | S (a `OnceLock<Value>` alongside string values, or a side cache) | Low (performance, only for string-encoded JSON fields) |
-| 37 | `planetiler/src/main.rs:71` | `benchmark-mapping` (`OpenMapTilesMapping` benchmark). | S | Low |
 
 ### (c) Intentional differences or inherited Java TODOs (8): remove `TODO(port)`
 
