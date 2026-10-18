@@ -35,6 +35,18 @@ impl PbfFieldDecoder {
         }
     }
 
+    /// Creates a decoder for coordinates and timestamps only (no string table), used by the hand-written decoder in
+    /// [`crate::reader::osm::pbf_decoder`] which manages strings itself.
+    pub fn with_params(granularity: i64, lat_offset: i64, lon_offset: i64, date_granularity: i64) -> PbfFieldDecoder {
+        PbfFieldDecoder {
+            strings: Vec::new(),
+            coord_granularity: granularity,
+            coord_latitude_offset: lat_offset,
+            coord_longitude_offset: lon_offset,
+            date_granularity,
+        }
+    }
+
     /// True when the block uses the default granularity (100 nanodegrees) and no offsets.
     pub fn is_default_granularity(&self) -> bool {
         self.coord_granularity == 100 && self.coord_latitude_offset == 0 && self.coord_longitude_offset == 0
