@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 geo.workspace = true
 geo-types.workspace = true
+geo-traits.workspace = true
 rstar.workspace = true
 i_overlay.workspace = true
 wkb.workspace = true

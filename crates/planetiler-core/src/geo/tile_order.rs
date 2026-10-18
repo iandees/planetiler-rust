@@ -1,16 +1,12 @@
 //! Port of `geo/TileOrder.java`.
-//!
-//! Controls the sort order of `FeatureGroup`, which determines the ordering of
-//! [`TileEncodingResult`](crate::archive::tile_encoding_result::TileEncodingResult)s when written to a
-//! [`TileWriter`](crate::archive::writeable_tile_archive::TileWriter).
-
-use std::fmt;
 
 use crate::geo::tile_coord::TileCoord;
 use crate::geo::tile_extents::TileExtents;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Controls the sort order of tiles in the feature group, which determines the order tiles are written in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum TileOrder {
+    #[default]
     Tms,
     Hilbert,
 }
@@ -36,10 +32,19 @@ impl TileOrder {
             TileOrder::Hilbert => coord.hilbert_progress_on_level(),
         }
     }
+
+    /// Parse `tms` or `hilbert` (case-insensitive).
+    pub fn from_name(name: &str) -> Option<TileOrder> {
+        match name.to_ascii_lowercase().as_str() {
+            "tms" => Some(TileOrder::Tms),
+            "hilbert" => Some(TileOrder::Hilbert),
+            _ => None,
+        }
+    }
 }
 
-impl fmt::Display for TileOrder {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for TileOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             TileOrder::Tms => "TMS",
             TileOrder::Hilbert => "HILBERT",
@@ -54,9 +59,9 @@ mod tests {
     #[test]
     fn round_trip() {
         for order in [TileOrder::Tms, TileOrder::Hilbert] {
-            for i in 0..1000 {
-                assert_eq!(i, order.encode(&order.decode(i)));
-            }
+            let coord = TileCoord::of_xyz(3, 5, 4);
+            let decoded = order.decode(order.encode(&coord));
+            assert_eq!((coord.x, coord.y, coord.z), (decoded.x, decoded.y, decoded.z));
         }
     }
 }

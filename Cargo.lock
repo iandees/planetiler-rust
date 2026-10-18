@@ -1682,6 +1682,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "flate2",
  "geo",
  "geo-types",
  "indexmap",
@@ -1706,6 +1707,7 @@ dependencies = [
  "csv",
  "flate2",
  "geo",
+ "geo-traits",
  "geo-types",
  "hashbrown 0.17.1",
  "i_overlay 9.1.0",

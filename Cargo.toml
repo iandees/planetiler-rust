@@ -17,6 +17,7 @@ planetiler-examples = { path = "crates/planetiler-examples" }
 # geometry
 geo = "0.33"
 geo-types = "0.7"
+geo-traits = "0.3"
 rstar = "0.13"
 i_overlay = "9"
 wkb = "0.9"
