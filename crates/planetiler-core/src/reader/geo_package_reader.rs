@@ -152,14 +152,22 @@ impl GeoPackageReader {
             .optional()?;
         // GeoPackage spec allows this to be 0 (undefined geographic CRS) or -1 (undefined cartesian CRS)
         let mut source_crs = srs.and_then(|(definition, org, code)| {
-            definition.filter(|d| !d.trim().is_empty()).and_then(|d| Crs::parse_wkt(&d).ok()).or_else(|| {
-                match (org, code) {
+            definition
+                .filter(|d| !d.trim().is_empty() && !d.trim().eq_ignore_ascii_case("undefined"))
+                .and_then(|d| match Crs::parse_wkt(&d) {
+                    Ok(crs) => Some(crs),
+                    Err(e) => {
+                        warn!("Unable to parse reference system {srs_id} of {}: {e:#}", self.input.display());
+                        None
+                    }
+                })
+                .or_else(|| match (org, code) {
+                    // the definition is required by the spec, but fall back to the code if it cannot be parsed
                     (Some(org), Some(code)) if org.eq_ignore_ascii_case("EPSG") && code > 0 => {
                         Crs::decode(&format!("EPSG:{code}"), true).ok()
                     }
                     _ => None,
-                }
-            })
+                })
         });
         if let Some(proj) = &self.source_projection {
             source_crs = Some(decode_crs(proj, source_crs.as_ref()).context("Bad reference system")?);
@@ -510,6 +518,81 @@ mod tests {
             GeoPackageReader::new(Some("garbage"), "test", &resource("geopackage.gpkg"), tmp.path(), false, None)
                 .is_err()
         );
+    }
+
+    /// Writes a geopackage with one point table per (srs definition, organization code, x, y).
+    fn write_projected_geopackage(path: &Path, tables: &[(&str, &str, i64, f64, f64)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT, srs_id INTEGER PRIMARY KEY, organization TEXT, \
+             organization_coordsys_id INTEGER, definition TEXT, description TEXT);
+             CREATE TABLE gpkg_contents (table_name TEXT PRIMARY KEY, data_type TEXT, identifier TEXT, srs_id INTEGER);
+             CREATE TABLE gpkg_geometry_columns (table_name TEXT, column_name TEXT, geometry_type_name TEXT, \
+             srs_id INTEGER, z INTEGER, m INTEGER);",
+        )
+        .unwrap();
+        for (i, (name, definition, code, x, y)) in tables.iter().enumerate() {
+            let srs_id = 100 + i as i64;
+            conn.execute(
+                "INSERT INTO gpkg_spatial_ref_sys VALUES (?1, ?2, 'EPSG', ?3, ?4, NULL)",
+                rusqlite::params![name, srs_id, code, definition],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO gpkg_contents VALUES (?1, 'features', ?1, ?2)", rusqlite::params![name, srs_id])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO gpkg_geometry_columns VALUES (?1, 'geom', 'POINT', ?2, 0, 0)",
+                rusqlite::params![name, srs_id],
+            )
+            .unwrap();
+            conn.execute(&format!("CREATE TABLE {name} (fid INTEGER PRIMARY KEY, geom BLOB)"), []).unwrap();
+            // GeoPackage header (little endian, no envelope) + WKB point
+            let mut blob = vec![b'G', b'P', 0, 0x01];
+            blob.extend_from_slice(&(srs_id as i32).to_le_bytes());
+            blob.extend_from_slice(&[0x01, 0x01, 0, 0, 0]);
+            blob.extend_from_slice(&x.to_le_bytes());
+            blob.extend_from_slice(&y.to_le_bytes());
+            conn.execute(&format!("INSERT INTO {name} (geom) VALUES (?1)"), [blob]).unwrap();
+        }
+    }
+
+    #[test]
+    fn read_projected_geopackage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("projected.gpkg");
+        let lv95 = std::fs::read_to_string(resource("crs/ch1903plus_lv95_esri.prj")).unwrap();
+        write_projected_geopackage(
+            &path,
+            &[
+                // ESRI WKT definition
+                ("lv95", lv95.trim(), 2056, 2600000.0, 1200000.0),
+                // unparseable definition: falls back to the organization code
+                ("bng", "undefined", 27700, 530000.0, 180000.0),
+                // EPSG:3035 has northing first, but geopackages are always x/y (east/north)
+                ("laea", "undefined", 3035, 4300000.0, 3200000.0),
+            ],
+        );
+        let reader = GeoPackageReader::new(None, "test", &path, tmp.path(), false, None).unwrap();
+        let mut features = reader.read_all().unwrap();
+        features.sort_by_key(|f| f.source_layer.clone());
+        // expected values from GeoTools (tests/resources/crs/reference.tsv)
+        for (feature, layer, lon, lat, tolerance) in [
+            (&features[0], "bng", -0.12835394047969878, 51.50399086639797, 1e-6),
+            (&features[1], "laea", 9.694837258790292, 51.909730859622414, 1e-6),
+            // the ESRI WKT has no datum shift (GeoTools lenient mode): ~100 m from EPSG:2056
+            (&features[2], "lv95", 7.439583333333352, 46.95300242404842, 1e-6),
+        ] {
+            assert_eq!(Some(layer), feature.source_layer.as_deref());
+            let geo_types::Geometry::Point(p) = feature.geometry else { panic!("{:?}", feature.geometry) };
+            assert!((p.x() - lon).abs() < tolerance && (p.y() - lat).abs() < tolerance, "{layer} {p:?}");
+        }
+
+        // source projection override, axis order from the geopackage CRS
+        let reader = GeoPackageReader::new(Some("EPSG:2056"), "test", &path, tmp.path(), false, None).unwrap();
+        let features = reader.read_all().unwrap();
+        let lv95 = features.iter().find(|f| f.source_layer.as_deref() == Some("lv95")).unwrap();
+        let geo_types::Geometry::Point(p) = lv95.geometry else { panic!() };
+        assert!((p.x() - 7.438631861421635).abs() < 1e-6 && (p.y() - 46.95108281346148).abs() < 1e-6, "{p:?}");
     }
 
     #[test]

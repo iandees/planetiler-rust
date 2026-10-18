@@ -336,8 +336,9 @@ impl Planetiler {
         self.add_shapefile_source_with_projection(None, name, default_path, default_url)
     }
 
-    /// Adds a new ESRI shapefile source with an explicit `projection` (CRS authority code like `EPSG:3857`, `None` to
-    /// infer it from the `.prj` file).
+    /// Adds a new ESRI shapefile source with an explicit `projection` (`None` to infer it from the `.prj` file). The
+    /// projection can be any EPSG code (`EPSG:2056`, `urn:ogc:def:crs:EPSG::2056`, optionally with a `:lon_first` /
+    /// `:lat_first` suffix), a PROJ string or WKT, see [`crate::geo::crs`].
     pub fn add_shapefile_source_with_projection(
         &mut self,
         projection: Option<&str>,
@@ -385,7 +386,9 @@ impl Planetiler {
     /// Adds a new OGC GeoPackage source that will be processed when [`Planetiler::run`] is called.
     ///
     /// If given a path to a ZIP file containing one or more GeoPackages, each `.gpkg` file within will be extracted to
-    /// a temporary directory at runtime (or next to the zip with `<name>_keep_unzipped`).
+    /// a temporary directory at runtime (or next to the zip with `<name>_keep_unzipped`). `projection` overrides the
+    /// reference system of the feature tables (same syntax as
+    /// [`Planetiler::add_shapefile_source_with_projection`]).
     pub fn add_geopackage_source(
         &mut self,
         projection: Option<&str>,

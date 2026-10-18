@@ -94,8 +94,8 @@ See the table at the bottom of this file; update it as modules are completed.
   and results can differ slightly from JTS snap-rounding). Overlay output: shells CW, holes CCW, OGC-valid.
 - Empty geometries: `GeometryCollection(vec![])` (Java `EMPTY_GEOMETRY`), `Polygon` with empty exterior, empty
   `LineString`; geo has no empty point so `EMPTY_POINT` is an empty `MultiPoint`.
-- CRS support (`geo::crs`) is limited to EPSG:4326/4269/3857 (+aliases), PROJ strings via `proj4rs`, and simple
-  `GEOGCS`/web-mercator `PROJCS` WKT.
+- CRS support (`geo::crs`): all EPSG codes GeoTools knows, WKT1/WKT2 and PROJ strings, see "Coordinate reference
+  systems" below.
 - JTS `BufferOp` -> `geo::buffer::buffer(geom, distance, &BufferParameters)`: port of the offset curve generation
   (`BufferParameters`, `BufferInputLineSimplifier`, `OffsetSegmentGenerator`/`OffsetSegmentString`,
   `OffsetCurveBuilder`, `BufferCurveSetBuilder`; raw curves bit-for-bit identical to JTS) with `i_overlay` (positive
@@ -129,6 +129,70 @@ See the table at the bottom of this file; update it as modules are completed.
 - `LoopLineMerger` stores both directions of an edge as one pair (`id ^ 1` is the reverse) sharing a coordinate range
   in one arena, node edge lists are inline for up to 4 edges, and node lookup uses one `hashbrown` map; output is
   identical to the straight port. `VWSimplifier` reuses thread-local scratch buffers.
+
+### Coordinate reference systems
+
+`geo::crs` replaces GeoTools (`CRS.decode`, `CRS.parseWKT`, `CRS.findMathTransform(.., lenient = true)`,
+`GeoUtils.decodeCRS`/`findMathTransform`) in pure Rust, on top of `proj4rs` (features `krovak` and `esri`) and
+`geographiclib-rs` (already a dependency of `geo`):
+
+- **EPSG codes** (`EPSG:2056`, `epsg:2056`, `urn:ogc:def:crs:EPSG::2056`, `urn:ogc:def:crs:EPSG:9.9:2056`,
+  `http://www.opengis.net/def/crs/EPSG/0/2056`, `http://www.opengis.net/gml/srs/epsg.xml#2056`) come from an
+  embedded table (`geo/crs/epsg.tsv.zst`, 52 KB, ~900 KB uncompressed, decompressed on first use) of all 6,490 2D
+  geographic and projected CRS that GeoTools' `gt-epsg-hsql` 35.1 (EPSG dataset 11.031) can decode. It is generated
+  from GeoTools itself: `tools/crs/DumpEpsg.java` dumps each CRS as WKT plus the datum shift GeoTools actually
+  applies to get to WGS84 (Bursa-Wolf parameters, Molodensky, geocentric-only or identity, read from the
+  `MathTransform`), its EPSG axis order and reference coordinates; the ignored `generate_epsg_table` test in
+  `geo/crs/epsg.rs` converts them with the WKT converter below and checks each entry against GeoTools. Regenerate
+  (with `PLANETILER_JAR` pointing at `planetiler-dist-*-with-deps.jar` and a JDK, see `tools/crs/java.sh`)
+  with `tools/crs/java.sh DumpEpsg target/crsgen/epsg.tsv` then `CRS_GEN_INPUT=target/crsgen/epsg.tsv cargo test -p
+  planetiler-core --lib generate_epsg_table -- --ignored --nocapture`. `crs-definitions` (CC0, PROJ strings from
+  PROJ's database) was considered, but it has no axis order and uses PROJ's datum shift choices, not GeoTools'.
+- **Axis order** like GeoTools with planetiler's settings (it doesn't set `org.geotools.referencing.forceXY`): EPSG
+  codes use the EPSG order (latitude first for geographic CRS, northing first for e.g. EPSG:3035, 2193, 3006, 28404)
+  unless `longitude_first` is requested (`decode_crs` takes it from the `:lon_first`/`:lat_first` suffix or the base
+  CRS, like Java). `Crs::axis_order()` is GeoTools' `CRS.getAxisOrder` (`EastNorth`, `NorthEast`, or
+  `Inapplicable` for polar CRS with axes like "South along 45 deg East", e.g. EPSG:3413, which
+  `find_math_transform(.., Some(true))` - the GeoPackage reader - swaps like Java does).
+- **WKT** (`geo/crs/wkt.rs`): WKT1 in its OGC, ESRI `.prj` and GDAL flavors, WKT2 (`GEOGCRS`, `PROJCRS`,
+  `BOUNDCRS` with `ABRIDGEDTRANSFORMATION`, datum ensembles, per-parameter units), and the horizontal part of
+  `COMPD_CS`/`COMPOUNDCRS`. Projection methods are matched by EPSG method code or normalized name (OGC, EPSG and ESRI
+  names); parameters by EPSG parameter code or name. Like GeoTools, WKT1 angular parameters and the prime meridian
+  are in the `GEOGCS` unit (so GDAL's NTF (Paris) WKT with `PRIMEM["Paris",2.33722917]` in grads is off the same
+  way), axes come from `AXIS` (east/north without), and when the `GEOGCS` (or the `PROJCS`) has an EPSG
+  `AUTHORITY` the EPSG datum shift is used (GeoTools' authority-backed operation lookup), otherwise `TOWGS84`,
+  otherwise GeoTools' lenient "ellipsoid shift" (a Molodensky transformation without translation, e.g. ESRI `.prj`
+  files of OSGB36 or NAD27 are ~100 m off, exactly like Java).
+- **Projections**: `proj4rs` for transverse mercator (exact Poder/Engsager, matches GeoTools to < 1e-7 degrees in
+  each zone), lambert conformal conic 1SP/2SP, albers, polar and oblique stereographic, mercator, equidistant
+  cylindrical, krovak, mollweide, cylindrical equal area and miller; `geo/crs/projections.rs` ports PROJ's cassini,
+  hotine oblique mercator A/B (Swiss/Hungarian grids, RSO), polyconic, sinusoidal, robinson (GeoTools' coefficients),
+  equidistant conic, gnomonic, orthographic, equal earth, new zealand map grid, azimuthal equidistant (GeographicLib
+  geodesics like GeoTools) and lambert azimuthal equal area (proj4rs' has bugs in its spherical oblique and
+  ellipsoidal south polar forms). `proj4rs` also mishandles `+pm`, so prime meridians are applied by `geo::crs`.
+  Unsupported methods fail with a message listing the supported ones (e.g. Winkel Tripel, Van der Grinten, Bonne;
+  GeoTools rejects most of these too). GeoTools quirks that are reproduced: Mercator 1SP with a non-zero latitude
+  of origin uses it as standard parallel, `Polar_Stereographic` only uses the sign of `latitude_of_origin`, Equal
+  Earth is spherical (R = a); the non-standard `+molodensky=dx,dy,dz` and `+spherical` (eqearth) PROJ parameters
+  express those.
+- **Datum shifts**: 3/7-parameter Bursa-Wolf via `proj4rs` (position vector, like `+towgs84`), GeoTools-style
+  2D Molodensky, no shift for datums GeoTools treats as identical. Grid shifts (`+nadgrids`, NTv2, NADCON) are not
+  supported. In GeoTools' lenient mode a missing datum shift never fails, and here neither.
+- **Accuracy vs GeoTools** (reference coordinates in the area of use of every EPSG CRS, CRS -> WGS84): 6,430 entries
+  within 1e-7 degrees, 4 within 1e-6, 4 worse (up to 2.5e-5 degrees for NAD83(HARN) / UTM 59S and the deprecated
+  Monte Mario (Rome) zones, where GeoTools' forward and inverse disagree by as much); 16 have no area of use.
+  Differences from Java on purpose: 35 CRS on ellipsoids defined in feet or German legal metres (Clarke 1858, Clarke
+  1866 Michigan, Everest variants, Bessel Namibia, ...) without Bursa-Wolf parameters, where GeoTools feeds the
+  unconverted axis length into its Molodensky transformation and is off by up to 15 km; here they use the correct
+  ellipsoid. EPSG:31300 (Belge Lambert 72 with the 2SP Belgium variant) is not supported. The WGS84 -> CRS direction
+  (only used to filter by bounds) is the exact inverse here, while GeoTools uses a different operation for 70 CRS
+  (e.g. GDA2020, up to 1.6 m).
+- Beyond Java: `CRS:84`, `OGC:CRS84`, `WGS84`, the web mercator aliases `EPSG:900913`/`102100`/`102113` and
+  `ESRI:102100`/`102113`, PROJ strings, WKT2.
+- Tests: `geo/crs/tests.rs` (ported `GeoUtilsTest` CRS cases plus `reference_coordinates_from_geotools`: 130 points
+  in 86 cases - EPSG codes in various forms, ESRI/GDAL `.prj` files, WKT2 and PROJ strings in
+  `tests/resources/crs/` - with expected values from `tools/crs/RefTransform.java` on the Java dist jar, within
+  1e-6 degrees), and shapefile/geopackage reader tests with projected inputs.
 
 ### `feature_merge` notes
 
@@ -348,8 +412,7 @@ tiles.join()?;
   start at 1 and skip null shapes like Java. Geometries match GeoTools: points, `MultiPoint`, `MultiLineString`,
   `MultiPolygon` (CW shells, CCW holes assigned to the smallest containing shell). DBF dates become `YYYY-MM-DD`
   strings; blank numerics are null; charset from `.cpg` (UTF-8, otherwise ISO-8859-1). Bounds filter uses the
-  record bbox in the source CRS. `geo::crs` now converts WKT `PROJCS` (transverse mercator, LCC, albers, ...) to
-  proj strings, so e.g. SWEREF99 `.prj` files work.
+  record bbox in the source CRS. `.prj` files are parsed by `geo::crs` (ESRI, GDAL/OGC WKT1 and WKT2).
 - `GeoPackageReader::new(projection, source, path, tmp_dir, keep_unzipped, Option<&Bounds>)`: rusqlite +
   GeoPackageBinary header parsing (`parse_geometry_header`) + WKB. SRS from `gpkg_spatial_ref_sys` WKT (falls back
   to `organization`/`organization_coordsys_id` EPSG codes), input forced longitude-first like Java. R-tree

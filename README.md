@@ -148,8 +148,10 @@ From [PORTING.md](PORTING.md) and the `TODO(port)` triage in
   rounded point by point, so a small number of output geometries differ from JTS.
 - **Merged polygon buffering** uses a different offset-curve implementation from JTS, so merged buildings and landuse
   can differ by sub-pixel vertices.
-- **Coordinate reference systems.** Only EPSG:4326, 4269 and 3857, PROJ strings and simple WKT are supported. Inputs
-  in other projections fail where Java (GeoTools) succeeds.
+- **Coordinate reference systems.** EPSG codes, WKT (`.prj` files, GeoPackage SRS definitions) and PROJ strings
+  are supported like GeoTools, but grid-based datum shifts (NTv2/NADCON) are not (Java doesn't ship the grids), and
+  one EPSG projection method GeoTools supports isn't: Lambert Conic Conformal (2SP Belgium), used only by the
+  obsolete EPSG:31300. See [PORTING.md](PORTING.md#coordinate-reference-systems).
 - **CLI tasks not ported:** `top-osm-tiles` (needs xz decompression) and `benchmark-mapping`.
   `benchmark-longlongmap` points you at the benchmarks crate instead.
 - **Parquet load balancing.** Parquet row groups aren't redistributed between threads (Java's `Distributor`), which

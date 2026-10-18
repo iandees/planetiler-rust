@@ -997,6 +997,85 @@ mod tests {
         assert_eq!(Some("test"), features[0].source_layer.as_deref());
     }
 
+    /// Writes a one-point shapefile with a `.prj` file (if given) and returns the lon/lat of the point.
+    fn read_projected_point(prj: Option<&str>, projection: Option<&str>, x: f64, y: f64) -> (f64, f64) {
+        let dir = tempfile::tempdir().unwrap();
+        let shp_path = dir.path().join("test.shp");
+        {
+            let table = shapefile::dbase::TableWriterBuilder::new().add_numeric_field(
+                shapefile::dbase::FieldName::try_from("value").unwrap(),
+                10,
+                0,
+            );
+            let mut writer = shapefile::Writer::from_path(&shp_path, table).unwrap();
+            let mut record = shapefile::dbase::Record::default();
+            record.insert("value".to_string(), shapefile::dbase::FieldValue::Numeric(Some(3.0)));
+            writer.write_shape_and_record(&shapefile::Point::new(x, y), &record).unwrap();
+        }
+        if let Some(prj) = prj {
+            let wkt = std::fs::read_to_string(resource(&format!("crs/{prj}"))).unwrap();
+            std::fs::write(dir.path().join("test.prj"), wkt).unwrap();
+        }
+        let features = ShapefileReader::new(projection, "test", &shp_path).unwrap().read_all().unwrap();
+        let Geometry::Point(p) = features[0].geometry else { panic!("{:?}", features[0].geometry) };
+        (p.x(), p.y())
+    }
+
+    #[test]
+    fn read_shapefiles_in_other_projections() {
+        // expected values from GeoTools (tests/resources/crs/reference.tsv)
+        for (prj, projection, x, y, lon, lat) in [
+            // ESRI .prj without datum shift: GeoTools' lenient mode
+            (Some("british_national_grid_esri.prj"), None, 530000.0, 180000.0, -0.1267476799461731, 51.504165373443854),
+            (Some("british_national_grid_gdal.prj"), None, 530000.0, 180000.0, -0.12835394047969878, 51.50399086639797),
+            (Some("ny_long_island_ftus_esri.prj"), None, 988000.0, 200000.0, -73.98647263351127, 40.71562970237177),
+            (Some("ch1903plus_lv95_esri.prj"), None, 2683000.0, 1248000.0, 8.538819038189189, 47.37956715628123),
+            (Some("nsidc_north_esri.prj"), None, 1000000.0, -1000000.0, 0.0, 76.99881553168265),
+            (Some("utm33n_wkt2.prj"), None, 400000.0, 6000000.0, 13.469298743645592, 54.138373317779724),
+            // source projection overrides the .prj, axis order from the .prj (east/north)
+            (
+                Some("british_national_grid_esri.prj"),
+                Some("EPSG:27700"),
+                530000.0,
+                180000.0,
+                -0.12835394047969878,
+                51.50399086639797,
+            ),
+            // no .prj: EPSG axis order (EPSG:3035 is northing first)
+            (None, Some("EPSG:3035"), 3200000.0, 4300000.0, 9.694837258790292, 51.909730859622414),
+            (None, Some("EPSG:3035:lon_first"), 4300000.0, 3200000.0, 9.694837258790292, 51.909730859622414),
+            (None, Some("EPSG:2056"), 2600000.0, 1200000.0, 7.438631861421635, 46.95108281346148),
+        ] {
+            let (actual_lon, actual_lat) = read_projected_point(prj, projection, x, y);
+            assert!(
+                (actual_lon - lon).abs() < 1e-6 && (actual_lat - lat).abs() < 1e-6,
+                "{prj:?} {projection:?}: {actual_lon},{actual_lat} expected {lon},{lat}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_shapefile_with_unsupported_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let shp_path = dir.path().join("test.shp");
+        {
+            let table = shapefile::dbase::TableWriterBuilder::new();
+            let mut writer = shapefile::Writer::from_path(&shp_path, table).unwrap();
+            writer
+                .write_shape_and_record(&shapefile::Point::new(1.0, 2.0), &shapefile::dbase::Record::default())
+                .unwrap();
+        }
+        std::fs::write(
+            dir.path().join("test.prj"),
+            r#"PROJCS["World_Van_der_Grinten_I",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Van_der_Grinten_I"],PARAMETER["False_Easting",0.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",0.0],UNIT["Meter",1.0]]"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", ShapefileReader::new(None, "test", &shp_path).err().unwrap());
+        assert!(err.contains("unsupported projection \"Van_der_Grinten_I\""), "{err}");
+        // an explicit projection is used instead
+        assert!(ShapefileReader::new(Some("EPSG:4326"), "test", &shp_path).is_ok());
+    }
+
     #[test]
     fn read_polygons_and_lines() {
         let dir = tempfile::tempdir().unwrap();

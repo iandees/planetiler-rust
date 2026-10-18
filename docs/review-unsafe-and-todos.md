@@ -221,6 +221,7 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 | #23 `Verify` feature counts | **Done.** `Verify::{get_num_features, check_min_feature_count, check_min_feature_count_range}`; `verify_monaco` uses them. |
 | #24, #25 `Verify` validity | **Done.** `check_validity` decodes every feature and requires polygons to be simple; `is_simple_polygonal` moved to `geo::is_valid`; `test_invalid_geometry` added. |
 | #26 `Stats` debug log | **Done** (WKB logged as hex, no base64 dependency). |
+| #31 general EPSG/WKT CRS | **Done** (row removed from (b)). `geo::crs` decodes every 2D geographic/projected EPSG code GeoTools knows from an embedded table generated from GeoTools (`geo/crs/epsg.rs`, `tools/crs/DumpEpsg.java`), WKT1 (OGC/ESRI/GDAL) and WKT2 via `geo/crs/wkt.rs`, and implements the projections `proj4rs` lacks in `geo/crs/projections.rs`. See PORTING.md "Coordinate reference systems". |
 | #32 free-after-read disk estimate | **Done.** `ResourceUsage::free_disk` (usage amounts are now signed internally). |
 | #38-#45 (c) | **Done.** Relabeled as "Difference from Java" notes, plain `TODO`s where Java has the same TODO, or a short comment (#38, #42/#43). PORTING.md no longer lists "unify VectorLayer" as a follow-up. |
 | #27-#31, #33-#37 (b) | Unchanged (real missing features). |
@@ -269,7 +270,6 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 | 28 | `openmaptiles/src/layers/boundary.rs:222` | **Done**: JTS `Polygonizer` is ported (`geo::polygonizer`) and `boundary` builds country polygons with it like Java (polygonize, then union). | - | - |
 | 29 | `core/src/geo/polygon_overlay.rs:387` | JTS snap rounding: **hot pixels at segment intersections** (and near-vertex tolerance). Today only vertices are hot pixels and the integer overlay rounds the rest. | M | Medium-high: rare differences from Java in `reduce_precision` output for polygons. Could add slivers or validity differences after tile clipping. |
 | 30 | `core/src/geo/polygon_overlay.rs:455` | **Snap-rounding for lines** (noding at intersections). Lines are only rounded point by point. | M | Low-medium: JTS nodes self-intersecting lines during `GeometryPrecisionReducer`, which changes vertex counts and output bytes for merged or simplified lines. |
-| 31 | `core/src/geo/crs.rs:15` | Arbitrary EPSG codes and general WKT CRS. Only 4326/4269/3857, PROJ strings and simple WKT work. | M (`proj4rs` + `crs-definitions` feature + a WKT -> PROJ converter for `.prj` files) | Medium: shapefiles or geopackages in other projections fail where Java (GeoTools) succeeds. |
 | 32 | `core/src/planetiler.rs:1136` | The write-phase disk estimate doesn't subtract inputs marked `free_<name>_after_read`. | XS (~10 LOC: for each `input_paths` entry with `free_after_reading`, `write_phase.add_disk(Some(&p.path), -(size))`. Needs a signed amount, or compute it as `saturating_sub`.) | Low-medium: can make `check_disk_space` fail falsely on tight disks unless `--force` is used. |
 | 33 | `planetiler/src/main.rs:102`, `core/src/util/top_osm_tiles.rs:50` (2 TODOs) | xz decompression for openstreetmap.org tile logs (`top-osm-tiles` CLI). | S (add `xz2` or the pure-Rust `lzma-rs`; the default fetcher becomes `XzDecoder::new(http_get(url))`) | Low |
 | 34 | `core/tests/planetiler_runner_tests.rs:64` | In-memory stream archive readers (Java `InMemoryStreamArchive`) for the csv/tsv/json/proto/pbf variants of `testPlanetilerRunner` (the mbtiles/pmtiles/files MLT variants are ported). | S-M | Low (test coverage only; the writers are already ported) |
@@ -301,7 +301,7 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 4. **Parquet `Distributor` load balancing** (#16). S-M, and the dependency is already ported. It is the best
    performance gain per line of code for Overture builds, where uneven row-group sizes leave threads idle at the
    end of the read phase.
-5. **General EPSG/WKT CRS support** (#31). M. Inputs that Java accepts fail outright in Rust.
+5. ~~**General EPSG/WKT CRS support** (#31).~~ Done (`geo::crs`: embedded EPSG table generated from GeoTools, WKT1/WKT2).
 
 The best quick wins are #32 (free-after-read disk estimate, ~10 LOC) and #14 (the custommap `SchemaValidator`/
 `verify-schema` CLI), which removes about 400 lines of duplicated test code.
