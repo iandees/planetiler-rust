@@ -1665,7 +1665,9 @@ dependencies = [
  "geo-types",
  "indexmap",
  "planetiler-core",
+ "tempfile",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

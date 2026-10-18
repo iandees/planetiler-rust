@@ -1,4 +1,6 @@
 pub mod readable_tile_archive;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 pub mod tile;
 pub mod tile_archive_config;
 pub mod tile_archive_metadata;

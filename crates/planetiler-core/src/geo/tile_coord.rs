@@ -75,7 +75,7 @@ impl TileCoord {
     }
 
     pub fn encode(x: u32, y: u32, z: u32) -> u64 {
-        start_index_for_zoom(z) + Self::tms_xy_to_position(z, x, y)
+        start_index_for_zoom(z).wrapping_add(Self::tms_xy_to_position(z, x, y))
     }
 
     /// Approximate fraction complete within a zoom level, using columns in `extents`.
@@ -145,7 +145,8 @@ impl TileCoord {
 
     pub fn tms_xy_to_position(z: u32, x: u32, y: u32) -> u64 {
         let dim = 1u64 << z;
-        x as u64 * dim + (dim - 1 - y as u64)
+        // wrapping like Java's long arithmetic so out-of-range coordinates (used by some archive tests) don't panic
+        (x as u64).wrapping_mul(dim).wrapping_add((dim - 1).wrapping_sub(y as u64))
     }
 
     pub fn parent(&self) -> TileCoord {
