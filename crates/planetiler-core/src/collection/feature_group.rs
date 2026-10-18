@@ -520,6 +520,12 @@ fn peek_at_group_info(encoded: &[u8]) -> anyhow::Result<Group> {
     Ok(Group { group, limit })
 }
 
+impl crate::util::file_utils::DiskBacked for FeatureGroup {
+    fn disk_usage_bytes(&self) -> u64 {
+        FeatureGroup::disk_usage_bytes(self)
+    }
+}
+
 /// Encodes rendered features and writes them to a per-thread sort writer.
 pub struct FeatureWriter<'a> {
     encoder: RenderedFeatureEncoder,

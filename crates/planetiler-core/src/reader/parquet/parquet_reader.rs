@@ -5,11 +5,12 @@
 //! `wkt_geometry` fields. Row groups ("blocks") of all files are processed in parallel by
 //! `feature_process_threads` threads.
 //!
-//! TODO(port): Java's `process(sourcePaths, writer, config)` runs `profile.processFeature` on each feature and
-//! renders into a `FeatureGroup`, filters files with `profile.caresAbout`, and calls `profile.finish(sourceName, ...)`
-//! at the end. Once `Profile`/`FeatureCollector`/`FeatureRenderer`/`FeatureGroup` are ported, build that on top of
-//! [`ParquetReader::process`] by passing `|input| profile.cares_about(input)` and a per-thread closure that wraps each
-//! [`ParquetFeature`] as a `SourceFeature`, runs the profile and renders into `writer.writer_for_thread()`.
+//! [`ParquetReader::process`] (Java's `process(sourcePaths, writer, config)`) runs the profile on each feature and
+//! renders into a `FeatureGroup`; [`ParquetReader::process_with`] hands features to caller-provided per-thread
+//! closures instead.
+//!
+//! TODO(port): Java hands features from each block to a `Distributor` so threads that finish early help with large
+//! row groups; here each thread processes whole blocks.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,17 +20,21 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use tracing::{error, info};
 
+use crate::collection::feature_group::FeatureGroup;
 use crate::config::bounds::Bounds;
 use crate::config::planetiler_config::PlanetilerConfig;
 use crate::expression::expression::PartialInput;
+use crate::profile::Profile;
 use crate::reader::parquet::parquet_feature::ParquetFeature;
 use crate::reader::parquet::parquet_input_file::{Block, IdGenerator, ParquetInputFile};
-use crate::stats::counter::Counter;
+use crate::reader::source_feature_processor::{finish_source, process_and_write_with_profile};
+use crate::stats::counter::{Counter, ThreadCounter};
 use crate::stats::progress_loggers::ProgressLoggers;
 use crate::stats::stats::StatsRef;
+use crate::util::file_utils::DiskBacked;
 use crate::util::format;
 use crate::value::{Tags, Value};
-use crate::worker::worker_pipeline::WorkerPipeline;
+use crate::worker::worker_pipeline::{Builder, WorkerPipeline};
 
 pub const DEFAULT_LAYER: &str = "features";
 
@@ -38,6 +43,47 @@ pub type LayerGenerator = Arc<dyn Fn(&Tags) -> Value + Send + Sync>;
 
 /// Processes one feature (called from a processing thread).
 pub type ParquetProcessFn = Box<dyn FnMut(ParquetFeature) -> Result<()> + Send>;
+
+/// Progress counters shared by the processing threads of one run.
+#[derive(Clone)]
+struct Progress {
+    blocks: Counter,
+    features: Counter,
+    /// Number of blocks currently being processed, by layer.
+    working_on: Arc<Mutex<BTreeMap<String, i64>>>,
+}
+
+impl Progress {
+    /// Reads every feature in `block` into `f`, updating the counters.
+    fn read_block(
+        &self,
+        block: &Block,
+        blocks: &ThreadCounter,
+        elements: &ThreadCounter,
+        f: &mut dyn FnMut(ParquetFeature) -> Result<()>,
+    ) -> Result<()> {
+        let layer = block.layer();
+        {
+            let mut working_on = self.working_on.lock();
+            match working_on.get_mut(layer) {
+                Some(count) => *count += 1,
+                None => {
+                    working_on.insert(layer.to_string(), 1);
+                }
+            }
+        }
+        block.read(&mut |feature| {
+            f(feature)?;
+            elements.inc();
+            Ok(())
+        })?;
+        blocks.inc();
+        if let Some(count) = self.working_on.lock().get_mut(layer) {
+            *count -= 1;
+        }
+        Ok(())
+    }
+}
 
 /// Reads features from geoparquet files.
 pub struct ParquetReader {
@@ -130,10 +176,44 @@ impl ParquetReader {
         Ok(result)
     }
 
+    /// Renders map features for every feature in `source_paths` within `config.bounds` based on the mapping logic
+    /// defined in `profile`, writing them to `writer` (Java's `ParquetReader.process(sourcePaths, writer, config)`),
+    /// then calls [`Profile::finish`].
+    ///
+    /// Files and row groups that `profile.cares_about` rules out are skipped without being read. Blocks (row groups)
+    /// are processed in parallel on `config.feature_process_threads` threads; each [`ParquetFeature`] is passed to the
+    /// profile directly as a [`SourceFeature`](crate::reader::source_feature::SourceFeature), so geometries are only
+    /// decoded if the profile asks for them. Does nothing if `profile.cares_about_source(source_name)` is false.
+    pub fn process(
+        &self,
+        source_paths: &[PathBuf],
+        writer: &Arc<FeatureGroup>,
+        config: &Arc<PlanetilerConfig>,
+        profile: &Arc<dyn Profile>,
+    ) -> Result<()> {
+        if !profile.cares_about_source(&self.source_name) {
+            info!("Skipping {} because the profile does not use it", self.source_name);
+            return Ok(());
+        }
+        let cares_about = |input: &PartialInput| profile.cares_about(input);
+        let stats = self.stats.clone();
+        self.run(source_paths, config, &cares_about, Some(writer), |builder, progress| {
+            process_and_write_with_profile(builder, writer, config, profile, &stats, move |prev, process| {
+                let (blocks, elements) = (progress.blocks.counter_for_thread(), progress.features.counter_for_thread());
+                for block in prev {
+                    progress.read_block(&block, &blocks, &elements, &mut |feature| process(&feature))?;
+                }
+                Ok(())
+            })
+        })?;
+        // hook for profile to do any post-processing after this source is read
+        finish_source(&self.source_name, writer, profile.as_ref(), config, &self.stats)
+    }
+
     /// Reads every feature in `source_paths` within `config.bounds`, processing them on `config.feature_process_threads`
     /// threads with closures created by `processor_factory` (one per thread). Errors from a processing closure are
     /// logged and the feature skipped.
-    pub fn process<P>(
+    pub fn process_with<P>(
         &self,
         source_paths: &[PathBuf],
         config: &PlanetilerConfig,
@@ -143,6 +223,35 @@ impl ParquetReader {
     where
         P: Fn() -> ParquetProcessFn + Send + Sync + 'static,
     {
+        let process_threads = config.feature_process_threads.max(1);
+        self.run(source_paths, config, cares_about, None, |builder, progress| {
+            builder.sink_to("process", process_threads, move |prev| {
+                let (blocks, elements) = (progress.blocks.counter_for_thread(), progress.features.counter_for_thread());
+                let mut process = processor_factory();
+                for block in prev {
+                    progress.read_block(&block, &blocks, &elements, &mut |feature| {
+                        let id = feature.id();
+                        if let Err(e) = process(feature) {
+                            error!("Error processing parquet feature {id}: {e:#}");
+                        }
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    /// Opens the input files, starts the pipeline that `build` creates from the blocks of every file, and logs
+    /// progress until it completes.
+    fn run(
+        &self,
+        source_paths: &[PathBuf],
+        config: &PlanetilerConfig,
+        cares_about: &dyn Fn(&PartialInput) -> bool,
+        writer: Option<&Arc<FeatureGroup>>,
+        build: impl FnOnce(Builder<Block>, Progress) -> WorkerPipeline,
+    ) -> Result<()> {
         let timer = self.stats.start_stage(&self.source_name);
         let start = std::time::Instant::now();
         let input_files = self.open_files(source_paths, &config.bounds, cares_about)?;
@@ -154,40 +263,29 @@ impl ParquetReader {
             input_files.iter().map(|f| f.count()).sum()
         };
         let block_count: usize = input_files.iter().map(ParquetInputFile::block_count).sum();
-        let process_threads = config.feature_process_threads.max(1);
-        let blocks_read = Counter::new_multi_thread_counter();
-        let features_read = Counter::new_multi_thread_counter();
-        let working_on: Arc<Mutex<BTreeMap<String, i64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let progress = Progress {
+            blocks: Counter::new_multi_thread_counter(),
+            features: Counter::new_multi_thread_counter(),
+            working_on: Arc::new(Mutex::new(BTreeMap::new())),
+        };
         let input_blocks: Vec<Block> = input_files.iter().flat_map(ParquetInputFile::get).collect();
 
-        let (blocks, features, working) = (blocks_read.clone(), features_read.clone(), working_on.clone());
-        let pipeline = WorkerPipeline::start(&self.source_name, self.stats.clone())
-            .read_from_tiny("blocks", input_blocks)
-            .sink_to("process", process_threads, move |prev| {
-                let blocks = blocks.counter_for_thread();
-                let elements = features.counter_for_thread();
-                let mut process = processor_factory();
-                for block in prev {
-                    let layer = block.layer().to_string();
-                    *working.lock().entry(layer.clone()).or_default() += 1;
-                    block.read(&mut |feature| {
-                        let id = feature.id();
-                        if let Err(e) = process(feature) {
-                            error!("Error processing parquet feature {id}: {e:#}");
-                        }
-                        elements.inc();
-                        Ok(())
-                    })?;
-                    blocks.inc();
-                    *working.lock().entry(layer).or_default() -= 1;
-                }
-                Ok(())
-            });
+        let builder =
+            WorkerPipeline::start(&self.source_name, self.stats.clone()).read_from_tiny("blocks", input_blocks);
+        let pipeline = build(builder, progress.clone());
 
-        let (features, blocks, working) = (features_read.clone(), blocks_read.clone(), working_on.clone());
-        let loggers = ProgressLoggers::create()
+        let (features, blocks, working) =
+            (progress.features.clone(), progress.blocks.clone(), progress.working_on.clone());
+        let mut loggers = ProgressLoggers::create()
             .add_rate_percent_counter("read", feature_count as i64, move || features.get(), true)
-            .add_rate_percent_counter("blocks", block_count as i64, move || blocks.get(), false)
+            .add_rate_percent_counter("blocks", block_count as i64, move || blocks.get(), false);
+        if let Some(writer) = writer {
+            let (written, file) = (writer.clone(), writer.clone());
+            loggers = loggers
+                .add_rate_counter("write", move || written.num_features_written() as i64)
+                .add_file_size(file as Arc<dyn DiskBacked + Send + Sync>);
+        }
+        let loggers = loggers
             .new_line()
             .add(move || {
                 let working = working.lock();
@@ -200,14 +298,16 @@ impl ParquetReader {
             .new_line()
             .add_pipeline_stats(&pipeline);
         pipeline.await_and_log(&loggers, config.log_interval)?;
+        drop(loggers);
+        drop(pipeline);
 
-        let count = features_read.get();
+        let count = progress.features.get();
         let elapsed = start.elapsed().as_secs_f64().max(1e-9);
         info!(
             "Processed {} parquet features ({}/s, {} blocks, {} files) in {:.1}s",
             format::integer(count),
             format::numeric(count as f64 / elapsed, false),
-            format::integer(blocks_read.get()),
+            format::integer(progress.blocks.get()),
             format::integer(input_files.len() as i64),
             elapsed
         );
@@ -277,7 +377,7 @@ mod tests {
             let reader = ParquetReader::new("source", InMemoryStats::arc());
             let (i, g, h) = (ids.clone(), geoms.clone(), height.clone());
             reader
-                .process(std::slice::from_ref(&path), &PlanetilerConfig::defaults(), &|_| true, move || {
+                .process_with(std::slice::from_ref(&path), &PlanetilerConfig::defaults(), &|_| true, move || {
                     let (i, g, h) = (i.clone(), g.clone(), h.clone());
                     Box::new(move |feature: ParquetFeature| {
                         i.lock().push(feature.get_string("id").unwrap());
@@ -302,6 +402,88 @@ mod tests {
             assert!((center.x() - -71.07448).abs() < 1e-5 && (center.y() - 42.35626).abs() < 1e-5, "{center:?}");
             assert!((*height.lock() - 4.7).abs() < 1e-9, "{path:?}");
         }
+    }
+
+    /// Java `ParquetReaderTest.testReadOvertureParquet`: runs a profile through [`ParquetReader::process`].
+    #[test]
+    fn read_overture_parquet_with_profile() {
+        use crate::feature_collector::FeatureCollector;
+        use crate::reader::source_feature::SourceFeature;
+        use crate::reader::source_feature_processor::test_support::{config, run_with_group};
+
+        #[derive(Default)]
+        struct OvertureProfile {
+            ids: Mutex<Vec<String>>,
+            geoms: Mutex<Vec<geo_types::Geometry<f64>>>,
+            height: Mutex<f64>,
+            finished: Mutex<Vec<String>>,
+        }
+        impl Profile for OvertureProfile {
+            fn process_feature(&self, source_feature: &dyn SourceFeature, features: &mut FeatureCollector<'_>) {
+                assert_eq!(Some("source"), source_feature.source());
+                assert_eq!(Some(DEFAULT_LAYER), source_feature.source_layer());
+                assert!(source_feature.as_any_feature().downcast_ref::<ParquetFeature>().is_some());
+                self.ids.lock().push(source_feature.get_string("id").unwrap());
+                *self.height.lock() += source_feature.get_tag("height").and_then(parse_double_or_null).unwrap_or(0.0);
+                self.geoms.lock().push(source_feature.lat_lon_geometry().unwrap().clone());
+                features.centroid("buildings").set_zoom_range(0, 0);
+            }
+
+            fn finish(
+                &self,
+                source_name: &str,
+                _factory: &crate::feature_collector::Factory,
+                _next: &mut crate::profile::FeatureConsumer<'_>,
+            ) {
+                self.finished.lock().push(source_name.to_string());
+            }
+        }
+
+        for (i, path) in bostons().into_iter().enumerate() {
+            let profile = Arc::new(OvertureProfile::default());
+            let output = run_with_group(config(i % 2 == 0), profile.clone(), |group, config, dyn_profile, stats| {
+                ParquetReader::new("source", stats).process(std::slice::from_ref(&path), group, config, dyn_profile)
+            });
+            let mut ids = profile.ids.lock().clone();
+            ids.sort();
+            assert_eq!(
+                vec![
+                    "08b2a306638a0fff02001c5b97636c80",
+                    "08b2a306638a0fff0200a75c80c3d54b",
+                    "08b2a306638a0fff0200d1814977faca"
+                ],
+                ids,
+                "{path:?}"
+            );
+            let center = geo_types::GeometryCollection(profile.geoms.lock().clone()).centroid().unwrap();
+            assert!((center.x() - -71.07448).abs() < 1e-5 && (center.y() - 42.35626).abs() < 1e-5, "{center:?}");
+            assert!((*profile.height.lock() - 4.7).abs() < 1e-9, "{path:?}");
+            assert_eq!(3, output.len(), "{path:?}");
+            assert_eq!(vec!["source"], *profile.finished.lock());
+        }
+    }
+
+    /// `profile.cares_about` rules out the file so nothing gets read.
+    #[test]
+    fn process_skips_files_profile_does_not_care_about() {
+        use crate::feature_collector::FeatureCollector;
+        use crate::reader::source_feature::SourceFeature;
+        use crate::reader::source_feature_processor::test_support::{config, run_with_group};
+
+        struct IgnoreAll;
+        impl Profile for IgnoreAll {
+            fn process_feature(&self, _source_feature: &dyn SourceFeature, _features: &mut FeatureCollector<'_>) {
+                panic!("should not be called");
+            }
+
+            fn cares_about(&self, input: &PartialInput) -> bool {
+                !input.source.contains("source")
+            }
+        }
+        let output = run_with_group(config(false), Arc::new(IgnoreAll), |group, config, profile, stats| {
+            ParquetReader::new("source", stats).process(&bostons(), group, config, profile)
+        });
+        assert!(output.is_empty());
     }
 
     #[test]

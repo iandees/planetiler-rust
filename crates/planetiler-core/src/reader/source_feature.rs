@@ -89,9 +89,10 @@ pub trait SourceFeature: WithGeometry + ExpressionInput + fmt::Debug {
     }
 
     /// The ID to use for output vector tile features. By default, the feature id is taken as-is from the input data
-    /// source id times `multiplier`.
+    /// source id times `multiplier` (wrapping on overflow like Java's `long` arithmetic, since some sources such as
+    /// parquet use 64-bit hashes as IDs).
     fn vector_tile_feature_id(&self, multiplier: i64, _renumber: bool) -> i64 {
-        multiplier * self.id()
+        multiplier.wrapping_mul(self.id())
     }
 
     /// Returns all OSM relations this element belongs to (including super-relations), type-erased.
