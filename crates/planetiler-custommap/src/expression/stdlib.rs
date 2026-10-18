@@ -43,19 +43,6 @@ use crate::tag_value_producer::TagValueProducer;
 const VARARG_LIMIT: usize = 32;
 const HAS_FIELD: &str = "@planetiler_has_field";
 
-/// Marks a value as `Send + Sync` so it can be held by CEL values and resolvers (which require it).
-///
-/// CEL evaluation in this crate is synchronous on the calling thread and none of the wrapped values outlive or escape
-/// the evaluation, so they are never actually shared between threads.
-#[derive(Clone, Copy)]
-pub(crate) struct Shared<T>(pub T);
-
-// SAFETY: see the type docs: values wrapped in `Shared` are only used on the thread that created them, during a
-// single CEL evaluation.
-unsafe impl<T> Send for Shared<T> {}
-// SAFETY: see above.
-unsafe impl<T> Sync for Shared<T> {}
-
 /// The CEL type of geometry values.
 pub static GEOMETRY_TYPE: Type = Type::new_unspecified_type("geometry");
 
@@ -327,7 +314,7 @@ impl<'a> Iterable for TagsVal<'a> {
 /// overloads can't downcast to a value that borrows the source feature.
 #[derive(Clone)]
 pub(crate) enum GeometryVal<'a> {
-    Borrowed(Shared<&'a dyn WithGeometry>),
+    Borrowed(&'a dyn WithGeometry),
     Owned(Arc<FromWorld>),
 }
 
@@ -341,7 +328,7 @@ const FIELD_KEY_PREFIX: char = '\0';
 
 impl<'a> GeometryVal<'a> {
     pub(crate) fn borrowed(geometry: &'a dyn WithGeometry) -> GeometryVal<'a> {
-        GeometryVal::Borrowed(Shared(geometry))
+        GeometryVal::Borrowed(geometry)
     }
 
     pub(crate) fn from_world(geometry: Geometry<f64>) -> GeometryVal<'static> {
@@ -350,7 +337,7 @@ impl<'a> GeometryVal<'a> {
 
     fn geometry(&self) -> &dyn WithGeometry {
         match self {
-            GeometryVal::Borrowed(g) => g.0,
+            GeometryVal::Borrowed(g) => *g,
             GeometryVal::Owned(g) => &**g,
         }
     }
@@ -509,12 +496,12 @@ static EMPTY_LINE: LazyLock<FromWorld> =
 
 /// Resolves CEL variables from a [`ScriptContext`] (Java `ScriptContext.apply(name)` on the CEL side).
 pub(crate) struct Resolver<'a> {
-    ctx: Shared<ScriptContext<'a>>,
+    ctx: ScriptContext<'a>,
 }
 
 impl<'a> Resolver<'a> {
     pub(crate) fn new(ctx: &ScriptContext<'a>) -> Resolver<'a> {
-        Resolver { ctx: Shared(*ctx) }
+        Resolver { ctx: *ctx }
     }
 }
 
@@ -527,7 +514,7 @@ fn opt_str<'b>(s: Option<&'b str>) -> CowVal<'b, 'b> {
 
 impl VariableResolver for Resolver<'_> {
     fn resolve<'b>(&'b self, variable: &str) -> Option<CowVal<'b, 'b>> {
-        let ctx = &self.ctx.0;
+        let ctx = &self.ctx;
         let root = ctx.root().inner();
         if variable.starts_with("args") {
             if variable == "args" {
@@ -560,7 +547,7 @@ impl VariableResolver for Resolver<'_> {
             contexts::FEATURE_SOURCE_LAYER => opt_str(feature.source_layer()),
             contexts::FEATURE_GEOMETRY => match feature.with_geometry() {
                 Some(g) => CowVal::owned(GeometryVal::borrowed(g)),
-                None => CowVal::owned(GeometryVal::Borrowed(Shared(&*EMPTY_LINE))),
+                None => CowVal::owned(GeometryVal::Borrowed(&*EMPTY_LINE)),
             },
             contexts::FEATURE_OSM_TYPE
             | contexts::FEATURE_OSM_FROM_NODE_ID
@@ -1012,6 +999,15 @@ fn register_planetiler_stdlib(env: &mut Env) -> Result<(), cel::DeclarationError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CEL values and resolvers must be `Send + Sync`; that now follows from the types themselves (no `unsafe impl`).
+    #[test]
+    fn values_borrowing_features_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<GeometryVal<'static>>();
+        assert_send_sync::<Resolver<'static>>();
+        assert_send_sync::<ScriptContext<'static>>();
+    }
 
     #[test]
     fn java_replacements() {

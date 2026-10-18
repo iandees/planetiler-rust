@@ -79,7 +79,9 @@ fn point_or_empty(c: Option<geo_types::Coord<f64>>) -> Geometry<f64> {
     c.map_or_else(geo_utils::empty_point, |c| Geometry::Point(Point(c)))
 }
 
-pub trait WithGeometry: WithGeometryType {
+/// `Send + Sync` so borrowed features can be held by values that require it (e.g. CEL values in custommap) without
+/// any `unsafe`; every implementation memoizes through `OnceLock`, which is `Sync`.
+pub trait WithGeometry: WithGeometryType + Send + Sync {
     /// This geometry in world web mercator coordinates.
     fn world_geometry(&self) -> GeometryResult<&Geometry<f64>>;
 
