@@ -38,7 +38,7 @@ use roaring::RoaringTreemap;
 
 use crate::collection::feature_group::{self, FeatureGroup, FeatureSink, RenderedFeatureEncoder};
 use crate::collection::long_long_map::{LongLongMap, LongLongMapType, LongLongMapWriter, MISSING_VALUE, SealOnRead};
-use crate::collection::long_long_multimap::{self, Replaceable};
+use crate::collection::long_long_multimap::{self, ReplaceBatch, Replaceable};
 use crate::collection::storage::Storage;
 use crate::config::planetiler_config::PlanetilerConfig;
 use crate::expression::expression::ExpressionInput;
@@ -858,6 +858,16 @@ impl OsmReader {
                 let emitter =
                     RefCell::new(Emitter { encoder: group.new_rendered_feature_encoder(), sink: next, error: None });
                 let mut phaser = pass2_phaser.for_worker();
+                // multipolygon way node IDs get written to the shared multimap in batches: one lock per batch
+                // instead of one per way (the lock was heavily contended)
+                let mut multipolygon_ways = ReplaceBatch::default();
+                let flush = |batch: &mut ReplaceBatch| -> anyhow::Result<()> {
+                    if !batch.is_empty() {
+                        inner.multipolygon_way_geometries.replace_all(batch)?;
+                        batch.clear();
+                    }
+                    Ok(())
+                };
                 let mut relation_handler = relation_distributor.for_thread(|relation: Relation| {
                     let id = relation.id;
                     if let Some(feature) = inner.process_relation_pass2(relation, &node_locations) {
@@ -877,12 +887,17 @@ impl OsmReader {
                             OsmElement::Way(way) => {
                                 phaser.arrive(Phase::Ways)?;
                                 let id = way.id;
-                                let feature = inner.process_way_pass2(way, &node_locations)?;
+                                let feature =
+                                    inner.process_way_pass2_with(way, &node_locations, Some(&mut multipolygon_ways))?;
+                                if multipolygon_ways.num_values() >= 1 << 16 {
+                                    flush(&mut multipolygon_ways)?;
+                                }
                                 inner.split_way_if_necessary(feature, split_way_multiplier, &mut |feature| {
                                     inner.render(&factory, &renderer, &feature, &emitter, "Way", id);
                                 });
                             }
                             OsmElement::Relation(relation) => {
+                                flush(&mut multipolygon_ways)?;
                                 phaser.arrive_and_wait_for_others(Phase::Relations)?;
                                 relation_handler.accept(relation);
                             }
@@ -892,6 +907,7 @@ impl OsmReader {
                     blocks.inc();
                     emitter.borrow_mut().check()?;
                 }
+                flush(&mut multipolygon_ways)?;
                 phaser.close()?;
                 // do work for other threads that are still processing blocks of relations
                 relation_handler.close();
@@ -1233,12 +1249,26 @@ impl Inner {
     }
 
     fn process_way_pass2(&self, way: Way, node_locations: &Arc<NodeLocations>) -> anyhow::Result<OsmSourceFeature> {
+        self.process_way_pass2_with(way, node_locations, None)
+    }
+
+    /// [`Inner::process_way_pass2`], queueing multipolygon way node IDs in `batch` (when given) instead of writing
+    /// them to the shared multimap right away; the caller must flush the batch before the relations phase.
+    fn process_way_pass2_with(
+        &self,
+        way: Way,
+        node_locations: &Arc<NodeLocations>,
+        batch: Option<&mut ReplaceBatch>,
+    ) -> anyhow::Result<OsmSourceFeature> {
         // ways contain an ordered list of node IDs, so we need to join that with node locations from pass1 to
         // reconstruct the geometry.
         if self.ways_in_multipolygon.read().contains(way.id as u64) {
             // if this is part of a multipolygon, store the node IDs for this way ID so that when we get to the
             // multipolygon we can go from way IDs -> node IDs -> node locations.
-            self.multipolygon_way_geometries.replace_values(way.id, &way.nodes)?;
+            match batch {
+                Some(batch) => batch.push(way.id, &way.nodes),
+                None => self.multipolygon_way_geometries.replace_values(way.id, &way.nodes)?,
+            }
         }
         let nodes = &way.nodes;
         let closed = nodes.len() > 1 && nodes[0] == nodes[nodes.len() - 1];
