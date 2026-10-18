@@ -1527,15 +1527,7 @@ mod tests {
 
     pub(crate) fn read_resource(file: &str) -> Geometry<f64> {
         use std::io::Read;
-        let local = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/test/resources/mergelines").join(file);
-        let path = if local.exists() {
-            local
-        } else {
-            std::path::Path::new(
-                "/Users/ian.dees/Workspace/planetiler-ref/planetiler/planetiler-core/src/test/resources/mergelines",
-            )
-            .join(file)
-        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/resources/mergelines").join(file);
         let compressed = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
         let mut bytes = Vec::new();
         flate2::read::GzDecoder::new(&compressed[..]).read_to_end(&mut bytes).unwrap();
