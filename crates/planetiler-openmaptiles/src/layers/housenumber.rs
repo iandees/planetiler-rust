@@ -278,7 +278,7 @@ fn java_hash_map_order(keys: &[String]) -> Vec<usize> {
         ((h ^ (h >> 16)) as usize) & (capacity - 1)
     };
     let mut order: Vec<usize> = (0..keys.len()).collect();
-    order.sort_by_key(|&i| bucket(&keys[i]));
+    order.sort_by_cached_key(|&i| bucket(&keys[i]));
     order
 }
 

@@ -513,6 +513,32 @@ impl<'a> Reader<'a> {
         Ok(self.take(N)?.try_into().expect("length checked"))
     }
 
+    /// Reads `n` ints (as written by [`put_sint`] for geometry commands, which fit in an `i32`) into `out`.
+    #[inline]
+    fn ints_into(&mut self, n: usize, out: &mut Vec<i32>) -> anyhow::Result<()> {
+        let mut buf = self.buf;
+        for _ in 0..n {
+            let (value, len) = match *buf {
+                [m @ 0x00..=0x7f, ..] => (m as i32, 1),
+                [m @ 0xe0..=0xff, ..] => (m as i8 as i32, 1),
+                [0xcc, b, ..] => (b as i32, 2),
+                [0xcd, b0, b1, ..] => (u16::from_be_bytes([b0, b1]) as i32, 3),
+                [0xd0, b, ..] => (b as i8 as i32, 2),
+                [0xd1, b0, b1, ..] => (i16::from_be_bytes([b0, b1]) as i32, 3),
+                _ => {
+                    self.buf = buf;
+                    out.push(self.int()? as i32);
+                    buf = self.buf;
+                    continue;
+                }
+            };
+            out.push(value);
+            buf = &buf[len..];
+        }
+        self.buf = buf;
+        Ok(())
+    }
+
     fn int_from_marker(&mut self, m: u8) -> anyhow::Result<Option<i64>> {
         Ok(Some(match m {
             0x00..=0x7f => m as i64,
@@ -829,9 +855,7 @@ impl TileFeatures {
         }
         let command_size = r.array_len()?;
         let mut commands = Vec::with_capacity(command_size);
-        for _ in 0..command_size {
-            commands.push(r.int()? as i32);
-        }
+        r.ints_into(command_size, &mut commands)?;
         let layer = self.shared.common_layer_strings.decode(extract_layer_id_from_key(entry.key))?;
         Ok(vector_tile::Feature {
             layer: layer.to_string(),
