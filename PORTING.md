@@ -62,8 +62,9 @@ See the table at the bottom of this file; update it as modules are completed.
 | Archives (`archive::{tile, tile_encoding_result, readable_tile_archive, writeable_tile_archive, tile_archive_config, tile_archive_metadata(_de_ser), tile_archives}`, `mbtiles`, `pmtiles`, `files`, `stream`, `util::compare_archives`, `geo::tile_order`) | done (`TileArchiveMetadata::from_profile`); deferred: `ArchiveOptions` stands in for the unported `Arguments` API, `VectorLayer`/`FieldType` live in `archive::tile_archive_metadata` until `util::layer_attr_stats` is ported, geometry-level checks in `mbtiles::{verify, compare}` / `CompareArchives` wait on `vector_tile` decoding |
 | Benchmarks `benchmark_mbtiles_writer`, `benchmark_mbtiles_read`, `benchmark_pmtiles` (`crates/planetiler-benchmarks/src/bin`) | done |
 | `geo` (geo_utils, simplifiers, smoothers, line_splitter, geometry_pipeline/transformer, point/polygon index, unit, with_geometry, tile_order, simplify_method) + JTS ports (`is_valid`, `polygon_overlay` fix/precision-reduce/boolean ops, `interior_point`/centroid, `maximum_inscribed_circle`, `normalize`, `precision_model`, `wkt`, `crs`) + `util::loop_line_merger` + `geo::test_utils` | done (see notes below) |
-| `reader::osm::{osm_multipolygon, osm_way_splitter, osm_node_bounds_provider}` | done (`NodeLocationProvider` trait lives in `osm_multipolygon` until `OsmReader` is ported; bounds provider does not use `OsmPhaser` yet) |
-| `util::{translations, language_utils, thread_local_transliterator, wikidata}` | done (`Wikidata` takes a `Fn(&OsmElement) -> bool` filter instead of `Profile`: see `TODO(port)`) |
+| `reader::osm::{osm_multipolygon, osm_way_splitter, osm_node_bounds_provider}` | done (`NodeLocationProvider` trait lives in `osm_multipolygon`, re-exported from `osm_reader`) |
+| `reader::osm::{osm_reader, osm_phaser}` (+ `OsmReaderTest`, `OsmPhaserTest`, monaco end-to-end test matching Java feature counts / data errors), `benchmark_osm_reader` bin + `bench/java/BenchmarkOsmReader.java` | done (see notes below) |
+| `util::{translations, language_utils, thread_local_transliterator, wikidata}` | done (`wikidata::fetch` takes a `Fn(&OsmElement) -> bool` filter; `fetch_for_profile` / `profile_filter` adapt a `Profile`) |
 | Feature pipeline spine: `profile` (`Profile`, `NullProfile`), `feature_processor`, `forwarding_profile`, `feature_collector`, `reader::{source_feature, simple_feature}`, `reader::osm::osm_relation_info` (+ `RelationMember`), `render::{feature_renderer, tiled_geometry, geometry_coordinate_sequences, rendered_feature}`, `collection::feature_group` | done (see notes below) |
 
 ### `geo` notes
@@ -208,3 +209,47 @@ for tile in &mut tiles {
 tiles.join()?;
 ```
 `TileFeatures` is `Send + 'static` (holds an `Arc` of shared state), so it can be handed to encoder threads.
+
+### OSM reader notes (`reader::osm::osm_reader`, `osm_phaser`)
+
+How the `Planetiler` orchestrator drives it (Java `Planetiler.addOsmSource`):
+```rust
+let node_locations = long_long_map::from_config(&config.node_map_type, &config.node_map_storage, &node_db_path,
+    config.node_map_madvise)?;                                   // Box<dyn LongLongMap>
+let multipolygons = long_long_multimap::new_replaceable_multimap_from_config(
+    &config.multipolygon_geometry_storage, &multipolygon_path, config.multipolygon_geometry_madvise)?;
+let reader = OsmReader::new(name, osm_input_file.get()?, Arc::from(node_locations), Box::new(multipolygons),
+    profile.clone() /* Arc<dyn Profile> */, stats.clone());
+reader.pass1(&config)?;                    // &PlanetilerConfig
+reader.pass2(&feature_group, &config)?;    // &Arc<FeatureGroup>, &Arc<PlanetilerConfig>; also calls profile.finish
+reader.close();                            // drops node locations / relation info / multipolygon geometries
+```
+(`OsmReader::new_in_memory_multipolygons` uses an in-memory multimap.) Static helpers:
+`OsmReader::estimate_node_location_usage[_str]`, `estimate_multipolygon_geometry_usage[_str]` (return
+`ResourceUsage`), `osm_reader::{can_be_line, can_be_polygon}`.
+
+- Pass 1: with a parallel-write node map (`array`) each of `threads<8 ? threads : threads-1` workers decodes and
+  processes its own blocks. With a sequential map (`sparsearray`, `sortedtable`; the default) `threads-2` parse
+  threads decode blocks, **call `preprocess_osm_node` and encode node locations in parallel** (Java does both on the
+  single writer thread; ordering vs. ways is preserved because the writer consumes blocks in order) and hand
+  `(id, location)` pairs plus the remaining elements over a per-block channel to the single writer thread.
+  Profile panics in `preprocess_*`/`process_feature`/`finish` are caught and logged like Java exceptions.
+- Relation info (`HashMap<i64, Arc<dyn OsmRelationInfo>>`, last info per relation wins like Java), way->relation and
+  relation->parent memberships (sorted `Vec<(i64, i64)>`, role id in the top 16 bits) and the roaring set of
+  multipolygon way ids are built under a lock in pass 1 and frozen on first pass-2 read (`SealOnRead`).
+- Pass 2 features are `OsmSourceFeature` (one type, `OsmFeatureKind::{Node, Way, FullWay, SplitWay{unique_id},
+  Multipolygon}`): owns the decoded element (tags are served from the element, `base().tags` is empty), geometry is
+  computed lazily via the per-thread `Arc<NodeLocations>` (`OsmReader::new_node_location_provider()`); closed ways
+  that are both line and polygon do one node-location lookup (line = polygon exterior). `original_element()`,
+  `is_full_way()`, `is_split_way()`, `unique_id()`, `vector_tile_feature_id` (x10 + 1/2/3, split ways renumber
+  to `id + segment * 10^k`) match Java. Test hooks: `process_pass1_block[s]`, `process_node_pass2`,
+  `process_way_pass2`, `process_relation_pass2`, `split_way_if_necessary`.
+- `GeometryCache` is now allocated lazily (boxed on first use) so creating/moving source features that never ask for
+  derived geometries is cheap.
+- `OsmPhaser`: mutex+condvar port of Java's `Phaser` usage; per-worker counts are plain atomic stores (no RMW per
+  element); `arrive`/`arrive_and_wait_for_others`/`close` return `anyhow::Result` (out-of-order elements);
+  dropping a `ForWorker` that did not reach `Done` closes it so other workers don't deadlock on errors.
+- Benchmarks: `cargo run --release -p planetiler-benchmarks --bin benchmark_osm_reader -- --osm_path=... 
+  --profile=null|emit` and `java -cp planetiler-dist-*-with-deps.jar bench/java/BenchmarkOsmReader.java
+  --osm_path=... --profile=null|emit` (same profiles, same storage defaults, print `RESULT pass1/pass2` wall/CPU).
+
