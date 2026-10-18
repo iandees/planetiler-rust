@@ -17,6 +17,8 @@ serde_json.workspace = true
 regex.workspace = true
 once_cell.workspace = true
 parking_lot.workspace = true
+# StringUtils.stripAccents (NFD) in the place layer
+icu_normalizer = "2.3"
 # used by the temporary feature_merge copy (see src/feature_merge_shim.rs)
 rstar.workspace = true
 hashbrown.workspace = true
