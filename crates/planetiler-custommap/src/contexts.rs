@@ -641,11 +641,20 @@ impl<'a> ScriptContext<'a> {
 
     /// Recovers a [`ScriptContext`] from an expression input (Java's `instanceof` check on the context class).
     pub fn from_input<'b>(input: &'b dyn ExpressionInput) -> Option<&'b ScriptContext<'b>> {
-        let erased = input.as_any()?.downcast_ref::<ScriptContext<'static>>()?;
+        let erased = input.as_any()?.downcast_ref::<ErasedScriptContext>()?;
         // shorten the erased 'static lifetime back down to the borrow of the input (ScriptContext is covariant)
-        Some(shorten(erased))
+        Some(shorten(&erased.0))
     }
 }
+
+/// A [`ScriptContext`] whose lifetime has been erased to `'static` so it can be identified through `TypeId`.
+///
+/// Deliberately private to this module: [`ExpressionInput::as_any`] hands out a `&dyn Any` pointing at one of these,
+/// and the only code that can name the type (and so downcast to it) is [`ScriptContext::from_input`], which shortens
+/// the lifetime back to the borrow of the input. Downcasting to the public `ScriptContext<'static>` fails, so no
+/// reference with an extended lifetime can escape.
+#[repr(transparent)]
+struct ErasedScriptContext(ScriptContext<'static>);
 
 fn shorten<'b>(context: &'b ScriptContext<'static>) -> &'b ScriptContext<'b> {
     context
@@ -674,11 +683,44 @@ impl ExpressionInput for ScriptContext<'_> {
     }
 
     fn as_any(&self) -> Option<&dyn Any> {
-        // SAFETY: this only erases the lifetime parameter so the context can be identified by `TypeId`; the layout of
-        // `ScriptContext<'a>` does not depend on `'a`. The only way to get the context back out is
-        // `ScriptContext::from_input`, which immediately shortens the lifetime to the borrow of `self`, so no
-        // reference with an extended lifetime can escape.
-        let erased: &ScriptContext<'static> = unsafe { std::mem::transmute::<&ScriptContext<'_>, _>(self) };
+        // SAFETY: lifetime-only cast: the layout of `ScriptContext<'a>` does not depend on `'a`, and
+        // `ErasedScriptContext` is `repr(transparent)` over it. `ErasedScriptContext` is private to this module, so
+        // the only code that can downcast to it is `ScriptContext::from_input`, which immediately shortens the
+        // lifetime back to the borrow of `self`; nothing else can observe the erased `'static`.
+        let erased: &ErasedScriptContext =
+            unsafe { &*(self as *const ScriptContext<'_> as *const ErasedScriptContext) };
         Some(erased)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_input_recovers_context() {
+        let root = Root::empty();
+        let ctx = root.as_context();
+        let input: &dyn ExpressionInput = &ctx;
+        let recovered = ScriptContext::from_input(input).expect("script context");
+        assert_eq!(ctx.kind(), recovered.kind());
+        assert!(std::ptr::eq(recovered, &ctx));
+    }
+
+    #[test]
+    fn cannot_downcast_to_public_static_context() {
+        // Code outside this module can only name the public type; downcasting to it must fail so that a `'static`
+        // reference into the feature/value can't be smuggled out through the accessors.
+        let root = Root::empty();
+        let ctx = root.as_context();
+        let input: &dyn ExpressionInput = &ctx;
+        let any = input.as_any().expect("as_any");
+        assert!(any.downcast_ref::<ScriptContext<'static>>().is_none());
+    }
+
+    #[test]
+    fn other_inputs_are_not_contexts() {
+        let tags = Tags::new();
+        assert!(ScriptContext::from_input(&tags).is_none());
     }
 }
