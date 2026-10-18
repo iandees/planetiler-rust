@@ -577,7 +577,8 @@ point/order; scripts in the orchestrator port's final report):
   buildings, 404 landuse, 21 landcover, 10 transportation, 1730 housenumber ID diffs; one extra z13 building in Rust
   (a merged polygon of area 4.002 px² at the 4 px² merge threshold).
   After the JTS buffer port: same feature count in every layer; 578 z13 buildings, 35 landuse, 17 landcover and 10
-  transportation features differ (`docs/switzerland-parity.md`).
+  transportation features differ (`docs/switzerland-parity.md`); unchanged in the `627d901` benchmark pass, where
+  Monaco is identical to Java including feature IDs.
 - Fixes made while comparing: hot-pixel snap rounding in `reduce_precision`, Java multimap order for relation
   memberships (`route_N_*` attributes), Java `HashMap` iteration order for OMT housenumber grouping, custommap OSM
   tags, empty layers after point-buffer filtering (see above).

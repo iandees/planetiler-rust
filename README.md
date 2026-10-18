@@ -17,21 +17,21 @@ The code mirrors the Java layout file by file (see [PORTING.md](PORTING.md)), so
 ## Status
 
 The port is feature-complete for OSM-based OpenMapTiles, custom YAML maps and the examples. Its output matches Java
-closely: on Switzerland both produce the same 23,922 tiles with the same per-layer feature counts, except for one
-extra z13 building. The remaining differences are sub-pixel vertex differences in merged polygons and lines (see
-[docs/switzerland-parity.md](docs/switzerland-parity.md)).
+closely: Monaco output is identical, and on Switzerland both produce the same 23,922 tiles with the same per-layer
+feature counts in all 16 layers. The remaining differences are sub-pixel vertex differences in a few hundred merged
+polygons and 10 merged lines (see [docs/switzerland-parity.md](docs/switzerland-parity.md)).
 
 Performance, OpenMapTiles for Switzerland (549 MB `.osm.pbf`) on a 15-core Apple M5 Pro, from
 [bench/RESULTS.md](bench/RESULTS.md):
 
 | | Java | Rust | |
 |---|---|---|---|
-| Wall time | 37.2s | 14.9s | **2.5x faster** |
-| CPU time | 310s | 168s | **1.84x less CPU** (46% less) |
-| Peak RSS | 9.5 GB | 4.0 GB | **58% less RAM** |
+| Wall time | 37.4s | 10.7s | **3.5x faster** |
+| CPU time | 313s | 121s | **2.6x less CPU** (61% less) |
+| Peak RSS | 9.6 GB | 4.0 GB | **58% less RAM** |
 
 Rust is faster in every stage of the pipeline (OSM pass 1 and 2, sort, archive, simple sources). On Monaco it takes
-2.0s vs 14.0s, but its peak RSS is slightly higher (1.20 vs 1.02 GB). See [bench/RESULTS.md](bench/RESULTS.md) for
+1.6s vs 14.1s wall, 11.0s vs 20.2s CPU and 0.83 vs 1.02 GB peak RSS. See [bench/RESULTS.md](bench/RESULTS.md) for
 the methodology and the component benchmarks.
 
 ## Building
