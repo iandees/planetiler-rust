@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::basic::{ConvertedType, Type as PhysicalType};
 use parquet::column::reader::ColumnReader;
@@ -285,6 +286,14 @@ impl Block {
 
     /// Reads every feature in this block that passes the filters, passing each to `next`.
     pub fn read(&self, next: &mut dyn FnMut(ParquetFeature) -> Result<()>) -> Result<()> {
+        self.read_chunks(BATCH_SIZE, &mut |chunk| chunk.read(next))
+    }
+
+    /// Decodes this block into arrow record batches and passes them to `next` in [`RowChunk`]s of at most
+    /// `chunk_rows` rows, without converting the rows to features yet ([`RowChunk::read`] does that). This lets the
+    /// thread reading a block hand the per-row work (building tags, computing IDs, filtering by geometry bounds) off
+    /// to other threads.
+    pub fn read_chunks(&self, chunk_rows: usize, next: &mut dyn FnMut(RowChunk) -> Result<()>) -> Result<()> {
         let file = &self.file;
         let row_group = file.metadata.metadata().row_group(self.index);
         if file.filter.as_ref().is_some_and(|f| f.can_drop(row_group)) {
@@ -295,10 +304,11 @@ impl Block {
         if !file.interval_columns.is_empty() {
             let reader = SerializedFileReader::new(File::open(file.path.as_ref())?)?;
             let rg = reader.get_row_group(self.index)?;
-            for (name, leaf) in &file.interval_columns {
-                intervals.push((name.as_str(), read_interval_column(rg.as_ref(), *leaf, num_rows)?));
+            for (_, leaf) in &file.interval_columns {
+                intervals.push(read_interval_column(rg.as_ref(), *leaf, num_rows)?);
             }
         }
+        let intervals = Arc::new(intervals);
         let reader =
             ParquetRecordBatchReaderBuilder::new_with_metadata(File::open(file.path.as_ref())?, file.metadata.clone())
                 .with_row_groups(vec![self.index])
@@ -306,61 +316,109 @@ impl Block {
                 .build()?;
         let file_hash = hashing::fnv1a64(file.path.to_string_lossy().as_bytes());
         let block_hash = hashing::fnv1a64_with_init(file_hash, &(self.index as i32).to_be_bytes());
-        let mut i: i64 = 0;
+        let chunk_rows = chunk_rows.max(1);
+        let mut batch_offset = 0;
         for batch in reader {
             let batch = batch?;
-            let mask = file.filter.as_ref().map(|f| f.evaluate(&batch)).transpose()?;
-            let geoarrow = match file.geoarrow_column {
-                Some((idx, encoding)) => Some((idx, GeoArrowColumn::new(encoding, batch.column(idx))?)),
-                None => None,
+            let mask = file.filter.as_ref().map(|f| f.evaluate(&batch)).transpose()?.map(Arc::new);
+            let n = batch.num_rows();
+            let mut start = 0;
+            while start < n {
+                let end = (start + chunk_rows).min(n);
+                next(RowChunk {
+                    file: file.clone(),
+                    batch: batch.clone(),
+                    mask: mask.clone(),
+                    intervals: intervals.clone(),
+                    block_hash,
+                    batch_offset,
+                    rows: start..end,
+                })?;
+                start = end;
+            }
+            batch_offset += n;
+        }
+        Ok(())
+    }
+}
+
+/// A range of rows of one decoded record batch of a [`Block`], not yet converted to [`ParquetFeature`]s.
+///
+/// Cheap to create and move between threads: the batch, filter mask and interval columns are shared.
+pub struct RowChunk {
+    file: Arc<Inner>,
+    batch: RecordBatch,
+    /// rows of `batch` that pass the file's filter
+    mask: Option<Arc<Vec<bool>>>,
+    /// values of each of `file.interval_columns` for every row of the block
+    intervals: Arc<Vec<Vec<Option<Interval>>>>,
+    block_hash: u64,
+    /// index within the block of the first row of `batch`
+    batch_offset: usize,
+    rows: std::ops::Range<usize>,
+}
+
+impl RowChunk {
+    /// Number of rows in this chunk (before filtering).
+    pub fn num_rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Converts every row in this chunk that passes the filters to a feature, passing each to `next`.
+    pub fn read(&self, next: &mut dyn FnMut(ParquetFeature) -> Result<()>) -> Result<()> {
+        let file = &self.file;
+        let batch = &self.batch;
+        let geoarrow = match file.geoarrow_column {
+            Some((idx, encoding)) => Some((idx, GeoArrowColumn::new(encoding, batch.column(idx))?)),
+            None => None,
+        };
+        for row in self.rows.clone() {
+            // 1-based index of the row within the block
+            let i = (self.batch_offset + row + 1) as i64;
+            if self.mask.as_ref().is_some_and(|m| !m[row]) {
+                continue;
+            }
+            let mut tags = file.converter.convert_row_skipping(batch, row, geoarrow.as_ref().map(|(idx, _)| *idx));
+            for ((name, _), values) in file.interval_columns.iter().zip(self.intervals.iter()) {
+                if let Some(Some(interval)) = values.get(i as usize - 1) {
+                    tags.insert(name.to_string(), Value::str(interval.to_string()));
+                }
+            }
+            if let Some(extra) = &file.extra_fields {
+                for (k, v) in extra {
+                    tags.insert(k.clone(), v.clone());
+                }
+            }
+            let id = match &file.id_generator {
+                Some(generator) => hash_to_long(&generator(&tags)),
+                None => hashing::fnv1a64_with_init(self.block_hash, &i.to_be_bytes()) as i64,
             };
-            for row in 0..batch.num_rows() {
-                i += 1;
-                if mask.as_ref().is_some_and(|m| !m[row]) {
-                    continue;
-                }
-                let mut tags = file.converter.convert_row_skipping(&batch, row, geoarrow.as_ref().map(|(idx, _)| *idx));
-                for (name, values) in &intervals {
-                    if let Some(Some(interval)) = values.get(i as usize - 1) {
-                        tags.insert(name.to_string(), Value::str(interval.to_string()));
-                    }
-                }
-                if let Some(extra) = &file.extra_fields {
-                    for (k, v) in extra {
-                        tags.insert(k.clone(), v.clone());
-                    }
-                }
-                let id = match &file.id_generator {
-                    Some(generator) => hash_to_long(&generator(&tags)),
-                    None => hashing::fnv1a64_with_init(block_hash, &i.to_be_bytes()) as i64,
-                };
-                let mut feature = ParquetFeature::new(
-                    file.source.clone(),
-                    file.layer.clone(),
-                    id,
-                    file.geometry_reader.clone(),
-                    tags,
-                    file.path.clone(),
-                    Some(file.schema.clone()),
-                );
-                if let Some((_, column)) = &geoarrow {
-                    feature = feature.with_geometry(column.get(row));
-                }
-                if let Some(bounds) = &file.post_filter_bounds {
-                    match feature.lat_lon_geometry() {
-                        Ok(geom) => {
-                            if !Envelope::of_geometry(geom).intersects(bounds) {
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Error reading geometry to post-filter bounds: {e}");
+            let mut feature = ParquetFeature::new(
+                file.source.clone(),
+                file.layer.clone(),
+                id,
+                file.geometry_reader.clone(),
+                tags,
+                file.path.clone(),
+                Some(file.schema.clone()),
+            );
+            if let Some((_, column)) = &geoarrow {
+                feature = feature.with_geometry(column.get(row));
+            }
+            if let Some(bounds) = &file.post_filter_bounds {
+                match feature.lat_lon_geometry() {
+                    Ok(geom) => {
+                        if !Envelope::of_geometry(geom).intersects(bounds) {
                             continue;
                         }
                     }
+                    Err(e) => {
+                        warn!("Error reading geometry to post-filter bounds: {e}");
+                        continue;
+                    }
                 }
-                next(feature)?;
             }
+            next(feature)?;
         }
         Ok(())
     }

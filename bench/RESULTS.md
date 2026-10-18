@@ -234,6 +234,36 @@ outline reorder shareddict`): 23,922 / 23,922 tiles byte-identical in each, same
 
 ## History (before/after of notable optimizations)
 
+- **Parquet load balancing (`8ccc4e4` -> this change, output byte-identical).** Input: synthetic Overture-like
+  buildings GeoParquet from `gen_skewed_geoparquet` (defaults: 4 files, 3.9M WKB polygons, 412 MB zstd, 160 row
+  groups of 15k rows plus one of 1.5M rows; stored in `../planetiler-bench/data/sources/overture/skewed-buildings`).
+  Command: `planetiler overture --base=<dir> --output=<x>.pmtiles --force` (Java: `java -Xmx8g -jar
+  planetiler-dist-0.10.3-SNAPSHOT-with-deps.jar overture ...`, same input). 5 interleaved rounds (before / after /
+  Java), **measured under load**: other agents were compiling, 1-minute load 15-18 throughout. Medians [min-max];
+  CPU = user+sys of the process; "busy" is the per-thread utilization in the read stage's `process 14x(..)` summary.
+
+  | | wall | CPU | read stage | read stage CPU | process threads busy |
+  |---|---|---|---|---|---|
+  | before | 3.54s [3.43-4.01] | 17.0s [16.9-17.5] | 2.9s [2.8-3.3] | 12s | 24-29%, `done:2s` (idle tail) |
+  | after | 1.86s [1.62-2.12] | 19.4s [18.8-20.3] | 1.2s [1.0-1.3] | 14-15s | 73-97% |
+  | Java | 9.71s [8.33-10.34] | 63.0s [59.9-65.4] | 7s [6-7] | 41s [38-43] | 34-40%, `wait:2-4s` |
+
+  - Before, the thread that got the 1.5M-row row group was the long pole: the other 13 finished their row groups and
+    sat idle for ~2s. Now every thread works until the end. The extra CPU is not extra work: instructions retired are
+    the same (192.4G before and after); with all 15 cores busy (including E cores and shared caches) each instruction
+    costs more cycles (83G vs 70G).
+  - The first version followed Java exactly (hand off each `ParquetFeature`, queue of 1,000) and was 3x *slower*
+    than no balancing: read stage 8.0s, 26s of sys time, 2.8M involuntary context switches. A feature costs ~3us to
+    process, so a queue operation plus a thread wake-up per feature costs more than the feature does. Batching 64
+    features per handoff fixed the overhead (1.7s) but left threads 61% busy, because the reading thread still built
+    every feature's tags and ID serially. The final version hands off chunks of 256 decoded arrow rows
+    (`RowChunk`, sharing the `RecordBatch`), so row-to-feature conversion moves to the idle threads too: 1.0-1.3s.
+    Chunk sizes from 64 to 4,096 rows were all about 1.0s.
+  - No cost on uniform input (8 files x 40 row groups of 12k rows, 4 interleaved pairs): 1.60-1.67s vs
+    1.63-1.78s wall, same CPU.
+  - Java is 5.2x slower in wall time and uses 3.2x more CPU on this input. Its read stage threads were also only
+    34-40% busy, with 2-4s each waiting in the distributor queue.
+
 - **MLT encoder (`38f44fe` -> `3d7e7d4`, output unchanged).** Profiled with `sample` on `mlt_reference bench` (one
   thread over Switzerland) and on `benchmark_vector_tile`. Switzerland one-thread encode 11.65s -> 5.35s default,
   88.6s -> 12.8s advanced; bench tile 2.22 -> 1.01 ms, 3.56 -> 1.45 ms. Hotspots and fixes, in order of impact:

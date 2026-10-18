@@ -40,7 +40,7 @@ All reviewed sites are believed sound. The table lists every remaining `unsafe` 
 Outside the library crates: `planetiler-benchmarks/src/bin/benchmark_line_merge.rs` uses `static mut NUM_LINES`
 (single-threaded, so fine, but an `AtomicUsize` would avoid the edition-2024 `static mut` lint).
 
-## Remaining `TODO(port)` markers (13)
+## Remaining `TODO(port)` markers (12)
 
 Down from 53 at the time of the audit. Everything else was ported, swapped for the shared helper it was waiting on,
 or relabeled as a documented difference from Java.
@@ -50,7 +50,6 @@ or relabeled as a documented difference from Java.
 | `geo/polygon_overlay.rs:431` | JTS snap rounding also adds hot pixels at segment intersections (and near-vertex tolerance); only vertices are hot pixels here | M | Medium: rare geometry/validity differences from Java in `reduce_precision` output |
 | `geo/polygon_overlay.rs:917` | Snap rounding for lines (noding at intersections); lines are only rounded point by point | M | Low-medium: vertex-count and byte differences for merged/simplified lines |
 | `geo/crs.rs:15` | Arbitrary EPSG codes and general WKT CRS (only 4326/4269/3857, PROJ strings and simple WKT) | M | Medium: shapefiles/geopackages in other projections fail where Java (GeoTools) works |
-| `reader/parquet/parquet_reader.rs:12` | Java's `Distributor` load balancing across row groups | S-M | Performance on Overture inputs with uneven row groups |
 | `collection/external_merge_sort.rs:815` | `ProgressLoggers` during the sort (percent of chunks, file size, pipeline stats) | S | Log cosmetics |
 | `collection/feature_sort.rs:164` | Return a `Worker` instead of raw thread handles so pipeline stats can be logged | S | Log cosmetics |
 | `stats/stats.rs:65` | `LogUtil.setStage` `[stage]` log-line prefix | S | Log cosmetics; makes Java/Rust log diffs noisier |
@@ -59,5 +58,5 @@ or relabeled as a documented difference from Java.
 | `planetiler/src/main.rs:77` | `benchmark-mapping` (`OpenMapTilesMapping` benchmark) | S | Low |
 | `tests/planetiler_runner_tests.rs:66` | In-memory stream archive readers for the csv/tsv/json/proto variants of `testPlanetilerRunner` | S-M | Test coverage only (writers are ported) |
 
-Highest value next: snap rounding at intersections (parity), general CRS support (inputs Java accepts), and Parquet
-load balancing (Overture performance).
+Highest value next: snap rounding at intersections (parity) and general CRS support (inputs Java accepts). Parquet
+load balancing is done (row chunks handed to idle threads via the `Distributor`; see PORTING.md).
