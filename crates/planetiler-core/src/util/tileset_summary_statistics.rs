@@ -21,9 +21,8 @@ const WARN_BYTES: i64 = 100_000;
 const ERROR_BYTES: i64 = 500_000;
 const NUM_ZOOMS: usize = (MAX_MAXZOOM - MIN_MINZOOM + 1) as usize;
 
-/// Source of per-tile traffic weights (Java's `TileWeights`).
-// TODO(port): implement this trait for `crate::util::tile_weights::TileWeights` once that is ported (or replace the
-// trait with that concrete type).
+/// Source of per-tile traffic weights (Java's `TileWeights`); implemented by
+/// [`TileWeights`](crate::util::tile_weights::TileWeights).
 pub trait TileWeightSource: Send + Sync {
     /// Weight of a single tile (0 if unknown).
     fn get_weight(&self, coord: &TileCoord) -> i64;

@@ -93,7 +93,8 @@ pub trait FeatureSort: Send + Sync {
             let iter = self.iterator(shard, threads)?;
             let (tx, rx) = bounded::<Batch>(16);
             receivers.push(rx);
-            let handle = std::thread::Builder::new().name(format!("read-{shard}")).spawn(move || {
+            let handle = std::thread::Builder::new().name(format!("read-{}", shard + 1)).spawn(move || {
+                crate::stats::process_info::register_current_thread();
                 let mut batch = Vec::with_capacity(BATCH_SIZE);
                 for item in iter {
                     batch.push(item);

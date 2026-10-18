@@ -168,6 +168,31 @@ impl VectorLayer {
     }
 }
 
+impl From<FieldType> for crate::archive::tile_archive_metadata::FieldType {
+    fn from(value: FieldType) -> Self {
+        use crate::archive::tile_archive_metadata::FieldType as F;
+        match value {
+            FieldType::Number => F::Number,
+            FieldType::Boolean => F::Boolean,
+            FieldType::String => F::String,
+        }
+    }
+}
+
+/// Converts to the archive metadata's `vector_layers` entry type.
+// TODO(port): unify with `archive::tile_archive_metadata::VectorLayer`.
+impl From<VectorLayer> for crate::archive::tile_archive_metadata::VectorLayer {
+    fn from(layer: VectorLayer) -> Self {
+        crate::archive::tile_archive_metadata::VectorLayer {
+            id: layer.id,
+            fields: layer.fields.into_iter().map(|(k, v)| (k, v.into())).collect(),
+            description: layer.description,
+            minzoom: layer.minzoom.map(|z| z as i32),
+            maxzoom: layer.maxzoom.map(|z| z as i32),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ThreadLocalHandler {
     layers: Mutex<BTreeMap<String, StatsForLayer>>,

@@ -27,6 +27,7 @@ use crate::geo::geometry_type::GeometryType;
 use crate::proto::vector_tile as pb;
 use crate::util::hilbert;
 use crate::util::layer_attr_stats;
+use crate::util::tile_size_stats::LayerStats;
 use crate::value::{Tags, Value};
 
 pub const LEFT: i32 = 1;
@@ -479,11 +480,15 @@ pub fn hilbert_index(geometry: &Geometry<f64>) -> i32 {
 
 /// Returns the number of internal geometries in this feature including points/lines/polygons inside multigeometries.
 pub fn count_geometries(feature: &pb::tile::Feature) -> usize {
+    count_geometries_in_commands(&feature.geometry)
+}
+
+/// Returns the number of internal geometries (`MOVE_TO` commands) in encoded geometry `commands`.
+fn count_geometries_in_commands<T: Copy + Into<i64>>(geom: &[T]) -> usize {
     let mut result = 0usize;
     let mut idx = 0usize;
-    let geom = &feature.geometry;
     while idx < geom.len() {
-        let mut length = geom[idx] as i32;
+        let mut length = Into::<i64>::into(geom[idx]) as i32;
         let command = length & ((1 << 3) - 1);
         length >>= 3;
         if command == MOVE_TO {
@@ -617,6 +622,19 @@ impl VectorTile {
     /// Serializes this tile directly to protobuf bytes, byte-identical to
     /// `self.to_proto(include_ids).encode_to_vec()` but without building intermediate protobuf structs.
     pub fn encode_with_ids(&self, include_ids: bool) -> Vec<u8> {
+        self.encode_impl(include_ids, None)
+    }
+
+    /// Like [`VectorTile::encode_with_ids`], but also returns the same per-layer stats as
+    /// [`tile_size_stats::compute_tile_stats`](crate::util::tile_size_stats::compute_tile_stats) of the protobuf
+    /// tile (sorted by layer name), computed from the sizes the encoder already needs.
+    pub fn encode_with_layer_stats(&self, include_ids: bool) -> (Vec<u8>, Vec<LayerStats>) {
+        let mut stats = Vec::with_capacity(self.layers.len());
+        let encoded = self.encode_impl(include_ids, Some(&mut stats));
+        (encoded, stats)
+    }
+
+    fn encode_impl(&self, include_ids: bool, mut layer_stats: Option<&mut Vec<LayerStats>>) -> Vec<u8> {
         // First pass: compute the size of every nested message so the output can be written in one pass into an
         // exactly-sized buffer.
         let mut feature_sizes: Vec<FeatureSize> = Vec::new();
@@ -638,6 +656,21 @@ impl VectorTile {
             }
             // extent (field 5) + version (field 15)
             len += 1 + varint_size(EXTENT as u64) + 2;
+            if let Some(stats) = layer_stats.as_deref_mut() {
+                let attr_bytes: usize = layer.keys.iter().map(|k| k.len()).sum::<usize>()
+                    + layer.values.iter().map(encoded_value_size).sum::<usize>();
+                let geometries: usize =
+                    layer.encoded_features.iter().map(|f| count_geometries_in_commands(f.geometry.commands())).sum();
+                stats.push(LayerStats {
+                    layer: layer_name.clone(),
+                    layer_bytes: len as i64,
+                    layer_features: layer.encoded_features.len() as i64,
+                    layer_geometries: geometries as i64,
+                    layer_attr_bytes: attr_bytes as i64,
+                    layer_attr_keys: layer.keys.len() as i64,
+                    layer_attr_values: layer.values.len() as i64,
+                });
+            }
             layer_sizes.push(len);
             total += len_field_size(len);
         }
@@ -1949,6 +1982,9 @@ mod tests {
         vtm.add_layer_features("empty", &[Feature::new("e", 1, encode_geometry(&empty_geometry()), attrs)]);
         for include_ids in [true, false] {
             assert_eq!(vtm.to_proto(include_ids).encode_to_vec(), vtm.encode_with_ids(include_ids));
+            let (encoded, stats) = vtm.encode_with_layer_stats(include_ids);
+            assert_eq!(vtm.encode_with_ids(include_ids), encoded);
+            assert_eq!(crate::util::tile_size_stats::compute_tile_stats(&vtm.to_proto(include_ids)), stats);
         }
         assert_eq!(VectorTile::new().to_proto(true).encode_to_vec(), VectorTile::new().encode());
     }
