@@ -163,6 +163,29 @@ fn test_empty_tile_after_post_processing_omitted_from_archive() {
     assert_eq!(0, results.tile_data_count);
 }
 
+/// Java layer post-processors that null out every item (OpenMapTiles `MountainPeak`) still produce an empty layer, so
+/// the tile is written. The Rust equivalent is replacing the geometry with an empty one.
+#[test]
+fn test_empty_geometries_after_layer_post_processing_write_empty_tiles() {
+    let results = run_with_reader_features_and_post_process(
+        &[("threads", "1"), ("maxzoom", "2")],
+        vec![new_reader_feature(new_point(0.5, 0.5), tags! {})],
+        |_, features| {
+            features.point("layer");
+        },
+        |_, _, features| {
+            for f in features.iter_mut() {
+                f.geometry =
+                    planetiler_core::vector_tile::VectorGeometry::new(Vec::<i32>::new(), f.geometry.geom_type(), 0);
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(results.tile_data_count > 0);
+    assert!(results.tiles.values().all(|features| features.is_empty()), "{:?}", results.tiles);
+}
+
 #[test]
 fn test_single_empty_tile_omitted_from_archive() {
     let run_omitting = |tile_to_remove: Option<TileCoord>| {

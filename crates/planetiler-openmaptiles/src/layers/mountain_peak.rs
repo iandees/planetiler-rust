@@ -187,20 +187,24 @@ impl MountainPeak {
 impl LayerPostProcessor for MountainPeak {
     fn post_process(&self, _zoom: u32, items: &mut Vec<vector_tile::Feature>) -> GeometryResult<()> {
         let mut group_counts: HashMap<i64, i64> = HashMap::new();
-        items.retain_mut(|feature| {
+        for feature in items.iter_mut() {
             let count = group_counts.entry(feature.group).or_insert(1);
             let gridrank = *count;
             *count += 1;
             // now that we have accurate ranks, remove anything outside the desired buffer
             if !self.inside_tile_buffer(feature) {
-                false
-            } else {
-                if !feature.tags.contains_key(fields::RANK) {
-                    feature.tags.insert(fields::RANK.into(), gridrank.into());
-                }
-                true
+                // Java sets the item to null instead of removing it, so the layer is still added to the tile (empty
+                // when every peak is outside the buffer) and the tile gets written. An empty geometry has the same
+                // effect: the feature is dropped when encoding, and the tile still gets an empty layer.
+                feature.geometry = planetiler_core::vector_tile::VectorGeometry::new(
+                    Vec::<i32>::new(),
+                    feature.geometry.geom_type(),
+                    0,
+                );
+            } else if !feature.tags.contains_key(fields::RANK) {
+                feature.tags.insert(fields::RANK.into(), gridrank.into());
             }
-        });
+        }
         Ok(())
     }
 }
@@ -459,9 +463,20 @@ mod tests {
     fn test_mountain_peak_post_processing_limits_features_outside_zoom() {
         let t = new_test();
         let feature = |id, xy: f64, attrs, group| vt_feature(LAYER_NAME, id, &new_point(xy, xy).into(), attrs, group);
-        // Java sets dropped features to null, Rust removes them
+        // Java sets dropped features to null, Rust gives them an empty geometry
+        let dropped = |id, xy: f64, group| {
+            let mut f = feature(id, xy, Tags::new(), group);
+            f.geometry =
+                planetiler_core::vector_tile::VectorGeometry::new(Vec::<i32>::new(), f.geometry.geom_type(), 0);
+            f
+        };
         assert_eq!(
-            vec![feature(1, -64.0, tags! {"rank" => 1}, 1), feature(3, 256.0 + 64.0, tags! {"rank" => 1}, 2)],
+            vec![
+                feature(1, -64.0, tags! {"rank" => 1}, 1),
+                dropped(2, -65.0, 1),
+                feature(3, 256.0 + 64.0, tags! {"rank" => 1}, 2),
+                dropped(4, 256.0 + 65.0, 2),
+            ],
             t.post_process(
                 LAYER_NAME,
                 13,
