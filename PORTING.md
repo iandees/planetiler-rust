@@ -396,3 +396,16 @@ of that port with the same API (`TODO(port)`: replace with `pub(crate) use plane
 feature constructors, `to_map`/`assert_submap` copies of the core test helpers, `SharedWikidataTranslations` so tests
 can add wikidata translations after building `Translations`). Per-layer tests live in each layer file.
 `OpenMapTilesTest` (end-to-end Monaco build) is deferred until the `Planetiler` runner is ported.
+
+## Follow-ups (tracked by the coordinator)
+
+- Replace `planetiler-openmaptiles/src/feature_merge_shim.rs` with `planetiler_core::feature_merge` once FeatureMerge
+  merges; drop the crate's `rstar`/`hashbrown`/`ahash` deps.
+- Port JTS `Polygonizer` into core and use it for OpenMapTiles boundary country polygons (currently a line-merge +
+  union stand-in that drops rings closing only through a node shared by 3+ ways).
+- Move `Verify.checkMinFeatureCount`/`getNumFeatures` from `planetiler-openmaptiles/src/util/verify_monaco.rs` to
+  `planetiler_core::mbtiles::verify`.
+- Unify the two `VectorLayer` types (`archive::tile_archive_metadata` and `util::layer_attr_stats`).
+- Re-enable the four `#[cfg(any())]` merge tests in `crates/planetiler-core/tests/` once FeatureMerge merges.
+- MLT tile format (MapLibre Tile) encoder.
+- Full benchmark re-run on a quiet machine (see `bench/RESULTS.md`).
