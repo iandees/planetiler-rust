@@ -41,6 +41,7 @@ sysinfo.workspace = true
 indexmap.workspace = true
 hashbrown.workspace = true
 ahash.workspace = true
+foldhash.workspace = true
 regex.workspace = true
 once_cell.workspace = true
 chrono.workspace = true

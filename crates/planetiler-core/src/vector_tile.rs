@@ -143,10 +143,19 @@ fn is_ccw(ring: &[Coord<f64>]) -> bool {
     }
 }
 
-fn encode_commands(input: &Geometry<f64>, scale: u32) -> Vec<i32> {
-    let mut encoder = CommandEncoder::new(scale);
+thread_local! {
+    // scratch buffer reused across geometry encodings so each one only allocates its final `Arc<[i32]>`
+    static COMMAND_BUFFER: std::cell::Cell<Vec<i32>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+fn encode_commands(input: &Geometry<f64>, scale: u32) -> Arc<[i32]> {
+    let mut buffer = COMMAND_BUFFER.take();
+    buffer.clear();
+    let mut encoder = CommandEncoder { result: buffer, ..CommandEncoder::new(scale) };
     encoder.accept(input);
-    encoder.result
+    let result: Arc<[i32]> = Arc::from(&encoder.result[..]);
+    COMMAND_BUFFER.set(encoder.result);
+    result
 }
 
 /// Scales a geometry down by a factor of `2^scale` without materializing an intermediate geometry and returns the
@@ -538,19 +547,23 @@ impl VectorTile {
         let layer = self.layers.get_mut(layer_name).expect("inserted above");
         let mut stats_tracker = self.layer_stats_tracker.for_layer(layer_name);
 
+        layer.encoded_features.reserve(features.len());
         for in_feature in features {
             if !in_feature.geometry.commands.is_empty() {
-                let mut tags = Vec::with_capacity(in_feature.tags.len() * 2);
+                let tags_start = layer.tag_data.len() as u32;
                 for (key, value) in &in_feature.tags {
                     // skip attribute without value
                     if !value.is_null() {
-                        tags.push(layer.key(key));
-                        tags.push(layer.value(value));
+                        let k = layer.key(key);
+                        let v = layer.value(value);
+                        layer.tag_data.push(k);
+                        layer.tag_data.push(v);
                         stats_tracker.accept(key, value);
                     }
                 }
                 layer.encoded_features.push(EncodedFeature {
-                    tags,
+                    tags_start,
+                    tags_end: layer.tag_data.len() as u32,
                     id: in_feature.id,
                     geometry: in_feature.geometry.clone(),
                 });
@@ -579,7 +592,7 @@ impl VectorTile {
             };
             for feature in &layer.encoded_features {
                 let mut feature_builder = pb::tile::Feature {
-                    tags: feature.tags.clone(),
+                    tags: layer.tags_of(feature).to_vec(),
                     r#type: Some(feature.geometry.geom_type.as_protobuf() as i32),
                     geometry: feature.geometry.commands.iter().map(|&c| c as u32).collect(),
                     id: None,
@@ -598,7 +611,85 @@ impl VectorTile {
     ///
     /// Does not compress the result.
     pub fn encode(&self) -> Vec<u8> {
-        self.to_proto(true).encode_to_vec()
+        self.encode_with_ids(true)
+    }
+
+    /// Serializes this tile directly to protobuf bytes, byte-identical to
+    /// `self.to_proto(include_ids).encode_to_vec()` but without building intermediate protobuf structs.
+    pub fn encode_with_ids(&self, include_ids: bool) -> Vec<u8> {
+        // First pass: compute the size of every nested message so the output can be written in one pass into an
+        // exactly-sized buffer.
+        let mut feature_sizes: Vec<FeatureSize> = Vec::new();
+        let mut layer_sizes: Vec<usize> = Vec::with_capacity(self.layers.len());
+        let mut total = 0usize;
+        for (layer_name, layer) in self.non_empty_layers() {
+            let mut len = len_field_size(layer_name.len());
+            feature_sizes.reserve(layer.encoded_features.len());
+            for feature in &layer.encoded_features {
+                let size = FeatureSize::compute(layer.tags_of(feature), feature, include_ids);
+                len += len_field_size(size.total);
+                feature_sizes.push(size);
+            }
+            for key in &layer.keys {
+                len += len_field_size(key.len());
+            }
+            for value in &layer.values {
+                len += len_field_size(encoded_value_size(value));
+            }
+            // extent (field 5) + version (field 15)
+            len += 1 + varint_size(EXTENT as u64) + 2;
+            layer_sizes.push(len);
+            total += len_field_size(len);
+        }
+
+        let mut out = PbWriter::with_capacity(total);
+        let mut sizes = feature_sizes.iter();
+        for ((layer_name, layer), &layer_len) in self.non_empty_layers().zip(&layer_sizes) {
+            out.tag_len(0x1a, layer_len);
+            out.tag_len(0x0a, layer_name.len());
+            out.bytes(layer_name.as_bytes());
+            for feature in &layer.encoded_features {
+                let size = sizes.next().expect("feature size");
+                out.tag_len(0x12, size.total);
+                if include_ids && feature.id != NO_FEATURE_ID {
+                    out.byte(0x08);
+                    out.varint(feature.id as u64);
+                }
+                let tags = layer.tags_of(feature);
+                if !tags.is_empty() {
+                    out.tag_len(0x12, size.tags);
+                    for &t in tags {
+                        out.varint32(t);
+                    }
+                }
+                out.byte(0x18);
+                out.varint(geom_type_varint(feature));
+                let commands = feature.geometry.commands();
+                if !commands.is_empty() {
+                    out.tag_len(0x22, size.geometry);
+                    for &c in commands {
+                        out.varint32(c as u32);
+                    }
+                }
+            }
+            for key in &layer.keys {
+                out.tag_len(0x1a, key.len());
+                out.bytes(key.as_bytes());
+            }
+            for value in &layer.values {
+                out.tag_len(0x22, encoded_value_size(value));
+                write_value(&mut out, value);
+            }
+            out.byte(0x28);
+            out.varint(EXTENT as u64);
+            out.byte(0x78);
+            out.byte(2);
+        }
+        out.finish()
+    }
+
+    fn non_empty_layers(&self) -> impl Iterator<Item = (&String, &Layer)> {
+        self.layers.iter().filter(|(_, l)| !l.encoded_features.is_empty())
     }
 
     /// Returns true if this tile contains only polygon fills.
@@ -672,8 +763,9 @@ impl VectorTile {
                     .encoded_features
                     .iter()
                     .map(|feature| {
-                        let mut properties = Tags::with_capacity(feature.tags.len() / 2);
-                        for pair in feature.tags.as_chunks::<2>().0 {
+                        let tags = layer.tags_of(feature);
+                        let mut properties = Tags::with_capacity(tags.len() / 2);
+                        for pair in tags.as_chunks::<2>().0 {
                             properties
                                 .insert(layer.keys[pair[0] as usize].clone(), layer.values[pair[1] as usize].clone());
                         }
@@ -1300,22 +1392,183 @@ impl CommandEncoder {
     }
 }
 
+/// Sizes of the nested parts of an encoded feature message.
+struct FeatureSize {
+    total: usize,
+    tags: usize,
+    geometry: usize,
+}
+
+impl FeatureSize {
+    fn compute(tags: &[u32], feature: &EncodedFeature, include_ids: bool) -> FeatureSize {
+        let mut total = 0;
+        if include_ids && feature.id != NO_FEATURE_ID {
+            total += 1 + varint_size(feature.id as u64);
+        }
+        let tags_len: usize = tags.iter().map(|&t| varint_size32(t)).sum();
+        if !tags.is_empty() {
+            total += len_field_size(tags_len);
+        }
+        total += 1 + varint_size(geom_type_varint(feature));
+        let commands = feature.geometry.commands();
+        let geometry_len: usize = commands.iter().map(|&c| varint_size32(c as u32)).sum();
+        if !commands.is_empty() {
+            total += len_field_size(geometry_len);
+        }
+        FeatureSize { total, tags: tags_len, geometry: geometry_len }
+    }
+}
+
+/// The geometry type enum as a protobuf varint (`int32` enums are sign-extended to 64 bits).
+#[inline]
+fn geom_type_varint(feature: &EncodedFeature) -> u64 {
+    feature.geometry.geom_type.as_protobuf() as i32 as i64 as u64
+}
+
+/// Number of bytes in the protobuf varint encoding of `v`.
+#[inline]
+fn varint_size(v: u64) -> usize {
+    // 1 + floor(log2(v) / 7)
+    ((64 - (v | 1).leading_zeros()) as usize * 9 + 64) / 64
+}
+
+#[inline]
+fn varint_size32(v: u32) -> usize {
+    ((32 - (v | 1).leading_zeros()) as usize * 9 + 64) / 64
+}
+
+/// Size of a length-delimited field with a single-byte tag and a `len`-byte payload.
+#[inline]
+fn len_field_size(len: usize) -> usize {
+    1 + varint_size(len as u64) + len
+}
+
+fn value_string(value: &Value) -> std::borrow::Cow<'_, str> {
+    match value {
+        Value::String(s) => std::borrow::Cow::Borrowed(s),
+        other => std::borrow::Cow::Owned(other.to_string()),
+    }
+}
+
+/// Size of the encoded `Tile.Value` message for `value` (see [`encode_value`]).
+fn encoded_value_size(value: &Value) -> usize {
+    match value {
+        Value::Int(i) => 1 + varint_size(zig_zag_encode64(*i)),
+        Value::Float(_) => 5,
+        Value::Double(_) => 9,
+        Value::Bool(_) => 2,
+        other => len_field_size(value_string(other).len()),
+    }
+}
+
+/// Writes the `Tile.Value` message for `value` (see [`encode_value`]).
+fn write_value(out: &mut PbWriter, value: &Value) {
+    match value {
+        Value::Int(i) => {
+            out.byte(0x30);
+            out.varint(zig_zag_encode64(*i));
+        }
+        Value::Float(f) => {
+            out.byte(0x15);
+            out.bytes(&f.to_le_bytes());
+        }
+        Value::Double(d) => {
+            out.byte(0x19);
+            out.bytes(&d.to_le_bytes());
+        }
+        Value::Bool(b) => {
+            out.byte(0x38);
+            out.byte(*b as u8);
+        }
+        other => {
+            let s = value_string(other);
+            out.tag_len(0x0a, s.len());
+            out.bytes(s.as_bytes());
+        }
+    }
+}
+
+#[inline]
+fn zig_zag_encode64(n: i64) -> u64 {
+    ((n << 1) ^ (n >> 63)) as u64
+}
+
+/// Minimal protobuf writer into a pre-sized buffer.
+struct PbWriter {
+    buf: Vec<u8>,
+}
+
+impl PbWriter {
+    fn with_capacity(capacity: usize) -> PbWriter {
+        PbWriter { buf: Vec::with_capacity(capacity) }
+    }
+
+    #[inline]
+    fn byte(&mut self, b: u8) {
+        self.buf.push(b);
+    }
+
+    #[inline]
+    fn bytes(&mut self, b: &[u8]) {
+        self.buf.extend_from_slice(b);
+    }
+
+    #[inline]
+    fn varint(&mut self, mut v: u64) {
+        while v >= 0x80 {
+            self.buf.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        self.buf.push(v as u8);
+    }
+
+    #[inline]
+    fn varint32(&mut self, v: u32) {
+        if v < 0x80 {
+            self.buf.push(v as u8);
+        } else {
+            self.varint(v as u64);
+        }
+    }
+
+    #[inline]
+    fn tag_len(&mut self, tag: u8, len: usize) {
+        self.buf.push(tag);
+        self.varint(len as u64);
+    }
+
+    fn finish(self) -> Vec<u8> {
+        debug_assert_eq!(self.buf.len(), self.buf.capacity());
+        self.buf
+    }
+}
+
 struct EncodedFeature {
-    tags: Vec<u32>,
+    // range of this feature's key/value index pairs in `Layer::tag_data`
+    tags_start: u32,
+    tags_end: u32,
     id: i64,
     geometry: VectorGeometry,
 }
+
+type FastIndexSet<T> = IndexSet<T, foldhash::fast::FixedState>;
 
 /// Holds all features in an output layer of this tile, along with the index of each tag key/value so that features
 /// can store each key/value as a pair of integers.
 #[derive(Default)]
 struct Layer {
     encoded_features: Vec<EncodedFeature>,
-    keys: IndexSet<String>,
-    values: IndexSet<Value>,
+    // key/value index pairs of all features, stored contiguously to avoid an allocation per feature
+    tag_data: Vec<u32>,
+    keys: FastIndexSet<String>,
+    values: FastIndexSet<Value>,
 }
 
 impl Layer {
+    fn tags_of(&self, feature: &EncodedFeature) -> &[u32] {
+        &self.tag_data[feature.tags_start as usize..feature.tags_end as usize]
+    }
+
     /// Returns the ID associated with `key` or adds a new one if not present.
     fn key(&mut self, key: &str) -> u32 {
         match self.keys.get_index_of(key) {
@@ -1659,6 +1912,57 @@ mod tests {
         assert_eq!(Some(&Value::str("value6")), attrs.get("key6"));
         assert_eq!(Some(&Value::Bool(true)), attrs.get("key7"));
         assert_eq!(Some(&Value::Bool(false)), attrs.get("key8"));
+    }
+
+    #[test]
+    fn test_direct_encoding_matches_prost() {
+        let mut vtm = VectorTile::new();
+        let big = "x".repeat(300);
+        let attrs = tags! {
+            "key1" => "value1",
+            "key2" => 123,
+            "key3" => 234.1f32,
+            "key4" => 567.123f64,
+            "key5" => -123i64,
+            "key6" => i64::MIN,
+            "key7" => true,
+            "key8" => false,
+            "key9" => big.as_str(),
+            "key10" => Value::list([Value::Int(1), Value::str("a")]),
+            "null" => Value::Null,
+        };
+        let mut features = Vec::new();
+        for (i, id) in [1i64, 0, -1, i64::MAX, 300].into_iter().enumerate() {
+            let x = 3.0 + i as f64 * 50.0;
+            features.push(Feature::new("a", id, encode_geometry(&new_point(x, 6.0)), attrs.clone()));
+            features.push(Feature::new("a", id, encode_geometry(&rectangle(x, x, x + 100.0, x + 120.0)), Tags::new()));
+            features.push(Feature::new(
+                "a",
+                id,
+                encode_geometry(&new_line_string(&[x, 1.0, x + 300.0, 2.0, 0.0, 250.0])),
+                tags! { "i" => i as i64 },
+            ));
+        }
+        vtm.add_layer_features("layer a", &features);
+        vtm.add_layer_features("", &features[3..7]);
+        vtm.add_layer_features(&big, &features[..1]);
+        vtm.add_layer_features("empty", &[Feature::new("e", 1, encode_geometry(&empty_geometry()), attrs)]);
+        for include_ids in [true, false] {
+            assert_eq!(vtm.to_proto(include_ids).encode_to_vec(), vtm.encode_with_ids(include_ids));
+        }
+        assert_eq!(VectorTile::new().to_proto(true).encode_to_vec(), VectorTile::new().encode());
+    }
+
+    #[test]
+    fn test_varint_size() {
+        for v in [0u64, 1, 127, 128, 16383, 16384, u32::MAX as u64, u64::MAX] {
+            let mut buf = Vec::new();
+            prost::encoding::encode_varint(v, &mut buf);
+            assert_eq!(buf.len(), varint_size(v), "{v}");
+            if v <= u32::MAX as u64 {
+                assert_eq!(buf.len(), varint_size32(v as u32), "{v}");
+            }
+        }
     }
 
     #[test]

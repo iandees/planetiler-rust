@@ -142,5 +142,10 @@ public class BenchmarkVectorTile {
       iterations * (double) input.size() / geomSecs, geomSecs * 1000 / iterations);
     System.out.printf("tile encode:    %.0f tiles/sec (%.3f ms per tile), %d bytes/tile%n",
       iterations / tileSecs, tileSecs * 1000 / iterations, bytes);
+    long hash = 0xcbf29ce484222325L;
+    for (byte b : encodeTile(features)) {
+      hash = (hash ^ (b & 0xff)) * 0x100000001b3L;
+    }
+    System.out.printf("tile fnv1a64:   %016x%n", hash);
   }
 }

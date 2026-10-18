@@ -1705,6 +1705,7 @@ dependencies = [
  "crossbeam-channel",
  "csv",
  "flate2",
+ "foldhash 0.2.0",
  "geo",
  "geo-types",
  "hashbrown 0.17.1",

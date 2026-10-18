@@ -129,4 +129,7 @@ fn main() {
         iterations as f64 / tile_secs,
         tile_secs * 1000.0 / iterations as f64
     );
+    let hash =
+        encode_tile(&features).iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    println!("tile fnv1a64:   {hash:016x}");
 }
