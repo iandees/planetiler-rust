@@ -12,8 +12,9 @@ use crate::value::{Tags, Value};
 ///
 /// See <https://wiki.openstreetmap.org/wiki/Multilingual_names>.
 #[deprecated(note = "Use is_valid_osm_name_tag")]
-pub static VALID_NAME_TAGS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^name:[a-z]{2,3}(-[A-Z][a-z]{3})?([-_](x-)?[a-z]{2,})?(-([A-Z]{2}|\d{3}))?$").unwrap());
+pub static VALID_NAME_TAGS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^name:[a-z]{2,3}(-[A-Z][a-z]{3})?([-_](x-)?[a-z]{2,})?(-([A-Z]{2}|\d{3}))?$").unwrap()
+});
 
 // See https://github.com/onthegomap/planetiler/issues/86
 // Match strings that only contain latin characters.
@@ -155,8 +156,7 @@ fn parse_language_tag(tag: &str) -> Option<String> {
         let mut variants = Vec::new();
         while i < n {
             let s = subtags[i];
-            let is_variant = is_alnum(s)
-                && (len_in(s, 5, 8) || (s.len() == 4 && s.as_bytes()[0].is_ascii_digit()));
+            let is_variant = is_alnum(s) && (len_in(s, 5, 8) || (s.len() == 4 && s.as_bytes()[0].is_ascii_digit()));
             if !is_variant {
                 break;
             }

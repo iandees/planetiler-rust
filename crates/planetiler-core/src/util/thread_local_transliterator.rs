@@ -184,6 +184,8 @@ mod tests {
         assert_eq!("Zürich - Ærø", t.transliterate("Zürich - Ærø"));
         assert_eq!("Café Moskva 123", t.transliterate("Café Москва 123"));
         assert_eq!("", t.transliterate(""));
+        // ICU4X can't load Thai-Latin (needs a segmenter), so it falls back to any_ascii
+        assert!(t.transliterate("กรุงเทพ").is_ascii());
     }
 
     #[test]
