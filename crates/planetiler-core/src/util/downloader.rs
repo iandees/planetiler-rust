@@ -291,6 +291,7 @@ impl Downloader {
             dones.push(done.clone());
             let (this, resource) = (this.clone(), resource.clone());
             std::thread::Builder::new().name(format!("download-{}", resource.id)).spawn(move || {
+                crate::util::log_util::set_stage_with_parent(Some("download"), &resource.id);
                 match this.download_if_necessary(&resource) {
                     Ok(()) => done.complete(Ok(())),
                     Err(e) => done.fail(e),
@@ -440,6 +441,7 @@ impl Downloader {
             let handles: Vec<_> = (0..threads)
                 .map(|_| {
                     scope.spawn(|| -> anyhow::Result<()> {
+                        crate::util::log_util::set_stage_with_parent(Some("download"), &resource.id);
                         loop {
                             let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
                             let Some(&(start, end)) = chunks.get(idx) else {

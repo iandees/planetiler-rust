@@ -35,6 +35,7 @@ impl Worker {
         let threads = threads.max(1);
         stats.gauge_value(&format!("{prefix}_threads"), threads as f64);
         let task = Arc::new(task);
+        let parent_stage = crate::util::log_util::get_stage();
         let mut dones = Vec::with_capacity(threads);
         for thread_id in 0..threads {
             let done = Done::new();
@@ -43,8 +44,10 @@ impl Worker {
             let stats = stats.clone();
             let prefix_owned = prefix.to_string();
             let name = format!("{prefix}-{}", thread_id + 1);
+            let parent_stage = parent_stage.clone();
             let spawned = std::thread::Builder::new().name(name.clone()).spawn(move || {
                 process_info::register_current_thread();
+                crate::util::log_util::set_stage_with_parent(parent_stage.as_deref(), &prefix_owned);
                 tracing::trace!("Starting worker");
                 let start = Instant::now();
                 let result = match catch_unwind(AssertUnwindSafe(|| task(thread_id))) {

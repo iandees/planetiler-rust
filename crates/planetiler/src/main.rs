@@ -166,10 +166,8 @@ fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_target(false)
-        // write messages verbatim: progress logs embed ANSI colors, which the default field formatter escapes
-        .fmt_fields(tracing_subscriber::fmt::format::debug_fn(|writer, field, value| {
-            if field.name() == "message" { write!(writer, "{value:?}") } else { write!(writer, "{field}={value:?}") }
-        }))
+        // `[stage]` prefixes like Java, and messages written verbatim (progress logs embed ANSI colors)
+        .fmt_fields(planetiler_core::util::log_util::fields())
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (task, args) = match dispatch(args) {
