@@ -23,6 +23,8 @@
 //! assert!(!results.tiles.is_empty());
 //! ```
 
+pub mod in_memory_stream_archive;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;

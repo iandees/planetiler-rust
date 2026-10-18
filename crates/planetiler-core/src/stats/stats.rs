@@ -60,10 +60,12 @@ pub trait Stats: Send + Sync {
         self.start_stage_with_log(name, false)
     }
 
-    /// Start timing a named stage, logging that it started if `log` is true.
-    ///
-    /// TODO(port): Java also sets a `[stage]` prefix on subsequent log lines (`LogUtil.setStage`).
+    /// Start timing a named stage. If `log` is true, logs that it started and sets the `[stage]` prefix on subsequent
+    /// log lines from this thread (see [`log_util`](crate::util::log_util)).
     fn start_stage_with_log(&self, name: &str, log: bool) -> Finishable {
+        if log {
+            crate::util::log_util::set_stage(name);
+        }
         self.timers().start_timer(name, log)
     }
 

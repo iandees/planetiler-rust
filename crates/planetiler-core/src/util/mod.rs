@@ -18,6 +18,7 @@ pub mod hilbert;
 pub mod imposm3_parsers;
 pub mod language_utils;
 pub mod layer_attr_stats;
+pub mod log_util;
 pub mod loop_line_merger;
 pub mod madvise;
 pub mod memory_estimator;

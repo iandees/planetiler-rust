@@ -17,6 +17,7 @@ use planetiler_core::planetiler::Planetiler;
 use planetiler_core::pmtiles::readable_pmtiles::ReadablePmtiles;
 use planetiler_core::profile::Profile;
 use planetiler_core::reader::source_feature::SourceFeature;
+use planetiler_core::testing::in_memory_stream_archive::InMemoryStreamArchive;
 use planetiler_core::testing::{ComparableFeature, get_tile_map_with_compression, get_tile_map_with_format};
 use planetiler_core::util::gzip::gunzip;
 use planetiler_core::value::Value;
@@ -54,6 +55,10 @@ fn read_tiles(
         "mbtiles" => Box::new(Mbtiles::new_read_only_database(output).unwrap()),
         "pmtiles" => Box::new(ReadablePmtiles::new_read_from_file(output).unwrap()),
         "files" => Box::new(ReadableFilesArchive::new_reader(output, &Arguments::of()).unwrap()),
+        "csv" => Box::new(InMemoryStreamArchive::from_csv(output, ",").unwrap()),
+        "tsv" => Box::new(InMemoryStreamArchive::from_csv(output, "\t").unwrap()),
+        "json" => Box::new(InMemoryStreamArchive::from_json(output).unwrap()),
+        "proto" | "pbf" => Box::new(InMemoryStreamArchive::from_protobuf(output).unwrap()),
         other => panic!("unsupported {other}"),
     };
     let tiles = get_tile_map_with_format(archive.as_ref(), compression, tile_format).unwrap();
@@ -62,9 +67,6 @@ fn read_tiles(
 }
 
 /// `testPlanetilerRunner`.
-///
-/// TODO(port): the csv/tsv/json/proto/pbf output format variants need an in-memory stream archive reader (Java
-/// `InMemoryStreamArchive`).
 fn run_osm(args: &str) {
     let temp = tempfile::tempdir().unwrap();
     let temp_dir = temp.path();
@@ -131,7 +133,11 @@ fn run_osm(args: &str) {
     let expected_ids = if args.contains("exclude-ids") { 0 } else { expected_features };
     assert_eq!(expected_ids, features_with_ids);
 
-    if let Some(metadata) = metadata.filter(|_| format != "files") {
+    // like Java: mbtiles and pmtiles must have metadata, other formats are checked when they have it
+    if matches!(format.as_str(), "mbtiles" | "pmtiles") {
+        assert!(metadata.is_some(), "{format} metadata");
+    }
+    if let Some(metadata) = metadata {
         let expected_format = match tile_format {
             TileFormat::Mlt => "application/vnd.maplibre-tile",
             TileFormat::Mvt | TileFormat::Unknown => "pbf",
@@ -244,6 +250,36 @@ fn test_planetiler_runner_exclude_ids() {
 #[test]
 fn test_planetiler_runner_pmtiles() {
     run_osm("--output-format=pmtiles");
+}
+
+#[test]
+fn test_planetiler_runner_csv() {
+    run_osm("--output-format=csv");
+}
+
+#[test]
+fn test_planetiler_runner_tsv() {
+    run_osm("--output-format=tsv");
+}
+
+#[test]
+fn test_planetiler_runner_proto() {
+    run_osm("--output-format=proto");
+}
+
+#[test]
+fn test_planetiler_runner_pbf() {
+    run_osm("--output-format=pbf");
+}
+
+#[test]
+fn test_planetiler_runner_pbf_mlt() {
+    run_osm("--output-format=pbf --tile-format=mlt");
+}
+
+#[test]
+fn test_planetiler_runner_json() {
+    run_osm("--output-format=json");
 }
 
 #[test]

@@ -24,7 +24,6 @@
 use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use anyhow::Context;
 use hashbrown::HashMap;
@@ -46,6 +45,7 @@ use crate::util::layer_attr_stats;
 use crate::value::{Tags, Value};
 use crate::vector_tile::{self, VectorGeometry, VectorTile};
 use crate::worker::work_queue::{WorkQueueReader, WorkQueueWriter};
+use crate::worker::worker::Worker;
 use crate::worker::worker_pipeline::{Builder, WorkerPipeline};
 
 /// Number of bits the sort key gets packed into.
@@ -320,15 +320,15 @@ impl FeatureGroup {
     /// Returns an iterator over the features in each tile; fails if [`FeatureGroup::prepare`] has not been called.
     pub fn iter_prepared(&self) -> anyhow::Result<TileFeaturesIter> {
         anyhow::ensure!(self.prepared, "FeatureGroup::prepare must be called before iterating");
-        Ok(TileFeaturesIter::new(self.shared.clone(), self.sorter.iterator(0, 1)?, Vec::new()))
+        Ok(TileFeaturesIter::new(self.shared.clone(), self.sorter.iterator(0, 1)?, None))
     }
 
     /// Reads features using `threads` parallel threads and merges them into a sorted iterator of tiles. Call
     /// [`TileFeaturesIter::join`] when done to wait for the reader threads.
     pub fn parallel_iterator(&mut self, threads: usize) -> anyhow::Result<TileFeaturesIter> {
         self.prepare()?;
-        let par = self.sorter.parallel_iterator(threads)?;
-        Ok(TileFeaturesIter::new(self.shared.clone(), par.iterator, par.reader_threads))
+        let par = self.sorter.parallel_iterator(self.shared.stats.clone(), threads)?;
+        Ok(TileFeaturesIter::new(self.shared.clone(), par.iterator, Some(par.reader)))
     }
 }
 
@@ -729,25 +729,26 @@ pub struct TileFeaturesIter {
     shared: Arc<Shared>,
     entries: FeatureIter,
     pending: Option<SortableFeature>,
-    reader_threads: Vec<JoinHandle<()>>,
+    reader: Option<Worker>,
 }
 
 impl TileFeaturesIter {
-    fn new(shared: Arc<Shared>, mut entries: FeatureIter, reader_threads: Vec<JoinHandle<()>>) -> TileFeaturesIter {
+    fn new(shared: Arc<Shared>, mut entries: FeatureIter, reader: Option<Worker>) -> TileFeaturesIter {
         let pending = entries.next();
-        TileFeaturesIter { shared, entries, pending, reader_threads }
+        TileFeaturesIter { shared, entries, pending, reader }
     }
 
-    /// Waits for any parallel reader threads to finish, returning an error if one panicked.
+    /// The parallel reader threads (from [`FeatureGroup::parallel_iterator`]), if any, so progress logs can report
+    /// them.
+    pub fn reader(&self) -> Option<&Worker> {
+        self.reader.as_ref()
+    }
+
+    /// Waits for any parallel reader threads to finish, returning an error if one failed.
     pub fn join(self) -> anyhow::Result<()> {
-        let TileFeaturesIter { entries, reader_threads, .. } = self;
+        let TileFeaturesIter { entries, reader, .. } = self;
         drop(entries);
-        for handle in reader_threads {
-            if handle.join().is_err() {
-                anyhow::bail!("feature reader thread panicked");
-            }
-        }
-        Ok(())
+        reader.map_or(Ok(()), |reader| reader.await_done())
     }
 }
 

@@ -767,7 +767,9 @@ impl Planetiler {
             if ctx.profile.cares_about_source(&name) {
                 task(ctx)
             } else {
-                tracing::info!("[{name}] Skipping since profile does not use it");
+                crate::util::log_util::set_stage(&name);
+                tracing::info!("Skipping since profile does not use it");
+                crate::util::log_util::clear_stage();
                 Ok(())
             }
         })

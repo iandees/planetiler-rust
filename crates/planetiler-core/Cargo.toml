@@ -32,6 +32,7 @@ parquet.workspace = true
 arrow.workspace = true
 csv.workspace = true
 zip.workspace = true
+lzma-rust2.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -65,3 +66,5 @@ protox.workspace = true
 proptest.workspace = true
 approx.workspace = true
 tempfile.workspace = true
+# the encoder writes `.xz` test fixtures
+lzma-rust2 = { workspace = true, features = ["encoder"] }

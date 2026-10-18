@@ -16,6 +16,8 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod benchmark_mapping;
+
 use std::process::ExitCode;
 
 use anyhow::bail;
@@ -73,9 +75,8 @@ fn example_qa(args: &[String]) -> anyhow::Result<ExitCode> {
     ok(planetiler_examples::osm_qa_tiles::main(args))
 }
 
-fn benchmark_mapping(_args: &[String]) -> anyhow::Result<ExitCode> {
-    // TODO(port): `OpenMapTilesMapping` benchmark is not ported.
-    bail!("benchmark-mapping is not ported yet")
+fn benchmark_mapping(args: &[String]) -> anyhow::Result<ExitCode> {
+    ok(benchmark_mapping::main(args))
 }
 
 fn benchmark_longlongmap(_args: &[String]) -> anyhow::Result<ExitCode> {
@@ -104,9 +105,8 @@ fn stats(args: &[String]) -> anyhow::Result<ExitCode> {
     ok(planetiler_core::util::tile_size_stats::main(args))
 }
 
-fn top_osm_tiles(_args: &[String]) -> anyhow::Result<ExitCode> {
-    // TODO(port): `TopOsmTiles.main` needs an xz decoder for the openstreetmap.org tile logs.
-    bail!("top-osm-tiles is not ported yet (needs xz decompression of tile logs)")
+fn top_osm_tiles(args: &[String]) -> anyhow::Result<ExitCode> {
+    ok(planetiler_core::util::top_osm_tiles::main(args))
 }
 
 fn compare(args: &[String]) -> anyhow::Result<ExitCode> {
@@ -166,10 +166,8 @@ fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_target(false)
-        // write messages verbatim: progress logs embed ANSI colors, which the default field formatter escapes
-        .fmt_fields(tracing_subscriber::fmt::format::debug_fn(|writer, field, value| {
-            if field.name() == "message" { write!(writer, "{value:?}") } else { write!(writer, "{field}={value:?}") }
-        }))
+        // `[stage]` prefixes like Java, and messages written verbatim (progress logs embed ANSI colors)
+        .fmt_fields(planetiler_core::util::log_util::fields())
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (task, args) = match dispatch(args) {

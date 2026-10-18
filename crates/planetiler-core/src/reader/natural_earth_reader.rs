@@ -89,6 +89,7 @@ impl NaturalEarthReader {
     /// true, the extracted file is kept after this reader is dropped and reused next time if it is newer than the zip
     /// file.
     pub fn new(source_name: &str, input: &Path, tmp_dir: &Path, keep_unzipped: bool) -> Result<NaturalEarthReader> {
+        crate::util::log_util::set_stage(source_name);
         let extracted = if file_utils::has_extension(input, "zip") {
             extract_from_zip(input, "sqlite", tmp_dir, keep_unzipped)?
         } else {
