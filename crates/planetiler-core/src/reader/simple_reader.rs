@@ -45,6 +45,12 @@ impl ReaderFeature {
     }
 }
 
+impl crate::reader::with_tags::WithTags for ReaderFeature {
+    fn tags(&self) -> &Tags {
+        &self.tags
+    }
+}
+
 /// Callback that receives each feature from a [`SimpleReader`]. Returning an error aborts reading.
 pub type FeatureSink<'a> = dyn FnMut(ReaderFeature) -> anyhow::Result<()> + 'a;
 
@@ -104,8 +110,61 @@ pub(crate) fn inverse_transform_envelope(transform: &MathTransform, env: &Envelo
 
 /// Transform every coordinate of `geom` in place.
 pub(crate) fn transform_in_place(geom: &mut Geometry<f64>, transform: &MathTransform) -> anyhow::Result<()> {
-    use geo::MapCoordsInPlace;
-    geom.try_map_coords_in_place(|c| transform.transform(c))
+    fn line(line: &mut geo_types::LineString<f64>, t: &MathTransform) -> anyhow::Result<()> {
+        for c in &mut line.0 {
+            *c = t.transform(*c)?;
+        }
+        Ok(())
+    }
+    fn polygon(p: &mut geo_types::Polygon<f64>, t: &MathTransform) -> anyhow::Result<()> {
+        let mut result = Ok(());
+        p.exterior_mut(|e| result = line(e, t));
+        result?;
+        let mut result = Ok(());
+        p.interiors_mut(|holes| {
+            for h in holes {
+                if let Err(e) = line(h, t) {
+                    result = Err(e);
+                    return;
+                }
+            }
+        });
+        result
+    }
+    match geom {
+        Geometry::Point(p) => p.0 = transform.transform(p.0)?,
+        Geometry::Line(l) => {
+            l.start = transform.transform(l.start)?;
+            l.end = transform.transform(l.end)?;
+        }
+        Geometry::LineString(l) => line(l, transform)?,
+        Geometry::Polygon(p) => polygon(p, transform)?,
+        Geometry::MultiPoint(mp) => {
+            for p in &mut mp.0 {
+                p.0 = transform.transform(p.0)?;
+            }
+        }
+        Geometry::MultiLineString(ml) => {
+            for l in &mut ml.0 {
+                line(l, transform)?;
+            }
+        }
+        Geometry::MultiPolygon(mp) => {
+            for p in &mut mp.0 {
+                polygon(p, transform)?;
+            }
+        }
+        Geometry::GeometryCollection(gc) => {
+            for g in &mut gc.0 {
+                transform_in_place(g, transform)?;
+            }
+        }
+        Geometry::Rect(_) | Geometry::Triangle(_) => {
+            let mut g = transform.transform_geometry(geom)?;
+            std::mem::swap(geom, &mut g);
+        }
+    }
+    Ok(())
 }
 
 /// If `input` is a path inside a zip file (as returned by `file_utils::walk_path_with_pattern`) or the zip file itself,
