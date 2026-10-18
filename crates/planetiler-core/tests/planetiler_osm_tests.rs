@@ -159,7 +159,7 @@ fn test_osm_point_skip_pass1() {
     );
 }
 
-/// TODO(port): Java throws an `Error` subclass (`ExpectedError`) from the profile, which the OSM reader does not
+/// Difference from Java: Java throws an `Error` subclass (`ExpectedError`) from the profile, which the OSM reader does not
 /// catch, so the run fails. Rust has no `Error`/`Exception` split: every panic from a profile is caught and logged
 /// like a Java `Exception` (see `test_handle_profile_exception`), so this run succeeds with no features.
 #[test]

@@ -172,6 +172,10 @@ impl<F: Fn(&dyn ExpressionInput, Option<&mut MatchKeys>) -> bool + Send + Sync +
     }
 }
 
+/// Set of strings hashed with foldhash (randomly seeded like std's `RandomState`, but much cheaper than SipHash for
+/// the per-element tag value lookups in [`MatchAny`]).
+pub type StringSet = HashSet<String, foldhash::fast::RandomState>;
+
 /// Evaluates to true if the value for `field` tag is any of `exact_matches` or matches `pattern`.
 #[derive(Clone, Debug)]
 pub struct MatchAny {
@@ -180,7 +184,7 @@ pub struct MatchAny {
     /// All raw values that were initially provided.
     pub values: Vec<Value>,
     /// The input `values` that should be treated as exact matches.
-    pub exact_matches: HashSet<String>,
+    pub exact_matches: StringSet,
     /// Regular expression that the value must match, or `None`.
     pub pattern: Option<Regex>,
     /// If `values` contained "" (or null).
@@ -239,7 +243,7 @@ fn wildcard_to_regex(string: &str) -> String {
 
 impl MatchAny {
     pub fn from(field: Option<&str>, getter: Getter, values: Vec<Value>) -> MatchAny {
-        let mut exact_matches = HashSet::new();
+        let mut exact_matches = StringSet::default();
         let mut patterns = Vec::new();
         for value in &values {
             if !value.is_null() {
@@ -881,7 +885,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn exact_of(e: &Expression) -> HashSet<String> {
+    fn exact_of(e: &Expression) -> StringSet {
         match e {
             Expression::MatchAny(any) => any.exact_matches.clone(),
             _ => panic!(),

@@ -16,12 +16,11 @@ use std::sync::Arc;
 
 use geo::CoordsIter;
 use geo::kernels::{Kernel, Orientation, RobustKernel};
-use geo_types::{
-    Coord, Geometry, GeometryCollection, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
-};
+use geo_types::{Coord, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use indexmap::IndexSet;
 use prost::Message;
 
+use crate::geo::geo_utils::empty_geometry;
 use crate::geo::geometry_exception::{GeometryException, GeometryResult};
 use crate::geo::geometry_type::GeometryType;
 use crate::proto::vector_tile as pb;
@@ -91,14 +90,9 @@ fn command_and_length(command: i32, repeat: i32) -> i32 {
     (repeat << 3) | command
 }
 
-/// The empty geometry (Java's `GeoUtils.EMPTY_GEOMETRY`).
-// TODO(port): switch to a shared constant in geo_utils once one exists.
-fn empty_geometry() -> Geometry<f64> {
-    Geometry::GeometryCollection(GeometryCollection(Vec::new()))
-}
-
 /// Port of JTS `Orientation.isCCW(CoordinateSequence)` (returns false for flat or degenerate rings).
-// TODO(port): move to geo/ once a shared JTS orientation port exists.
+// Kept private here: this is its only caller (the signed-area `is_ccw` in `render/tiled_geometry.rs` is a test-only
+// helper with different semantics).
 fn is_ccw(ring: &[Coord<f64>]) -> bool {
     if ring.is_empty() {
         return false;
@@ -1249,7 +1243,6 @@ impl fmt::Debug for VectorGeometry {
 /// - `group`: grouping key used to limit point density or [`Feature::NO_GROUP`] if not in a group. NOTE: this is only
 ///   populated when this feature was deserialized from `FeatureGroup`, not when parsed from a tile since vector tile
 ///   schema does not encode group.
-// TODO(port): implement `crate::reader::with_tags::WithTags` once that trait is ported.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Feature {
     pub layer: String,
@@ -1257,6 +1250,12 @@ pub struct Feature {
     pub geometry: VectorGeometry,
     pub tags: Tags,
     pub group: i64,
+}
+
+impl crate::reader::with_tags::WithTags for Feature {
+    fn tags(&self) -> &Tags {
+        &self.tags
+    }
 }
 
 impl Feature {
@@ -1637,65 +1636,40 @@ impl fmt::Debug for Layer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geo::test_utils as tu;
     use crate::tags;
     use geo::MapCoords;
 
-    // ---- local geometry helpers (TODO(port): switch to crate::geo::test_utils) ----
+    // ---- `Geometry`-returning wrappers around crate::geo::test_utils ----
 
     fn coords(c: &[f64]) -> Vec<Coord<f64>> {
-        c.chunks(2).map(|p| Coord { x: p[0], y: p[1] }).collect()
+        tu::new_coordinate_list(c)
     }
 
     fn new_point(x: f64, y: f64) -> Geometry<f64> {
-        Geometry::Point(Point::new(x, y))
+        tu::new_point(x, y).into()
     }
 
     fn new_multi_point(points: &[Geometry<f64>]) -> Geometry<f64> {
-        Geometry::MultiPoint(MultiPoint::new(
-            points
-                .iter()
-                .map(|p| match p {
-                    Geometry::Point(p) => *p,
-                    _ => panic!("not a point"),
-                })
-                .collect(),
-        ))
+        tu::new_multi_point(points.iter().map(|p| Point::try_from(p.clone()).expect("not a point")).collect()).into()
     }
 
     fn new_line_string(c: &[f64]) -> Geometry<f64> {
-        Geometry::LineString(LineString::new(coords(c)))
+        tu::new_line_string(c).into()
     }
 
     fn new_multi_line_string(lines: &[Geometry<f64>]) -> Geometry<f64> {
-        Geometry::MultiLineString(MultiLineString::new(
-            lines
-                .iter()
-                .map(|l| match l {
-                    Geometry::LineString(l) => l.clone(),
-                    _ => panic!("not a line"),
-                })
-                .collect(),
-        ))
-    }
-
-    fn polygon_of(c: &[f64]) -> Polygon<f64> {
-        Polygon::new(LineString::new(coords(c)), vec![])
+        tu::new_multi_line_string(lines.iter().map(|l| LineString::try_from(l.clone()).expect("not a line")).collect())
+            .into()
     }
 
     fn new_polygon(c: &[f64]) -> Geometry<f64> {
-        Geometry::Polygon(polygon_of(c))
+        tu::new_polygon(c).into()
     }
 
     fn new_multi_polygon(polys: &[Geometry<f64>]) -> Geometry<f64> {
-        Geometry::MultiPolygon(MultiPolygon::new(
-            polys
-                .iter()
-                .map(|p| match p {
-                    Geometry::Polygon(p) => p.clone(),
-                    _ => panic!("not a polygon"),
-                })
-                .collect(),
-        ))
+        tu::new_multi_polygon(polys.iter().map(|p| Polygon::try_from(p.clone()).expect("not a polygon")).collect())
+            .into()
     }
 
     fn rectangle(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Geometry<f64> {
@@ -2059,8 +2033,10 @@ mod tests {
 
     #[test]
     fn test_geometry_collection_silently_ignored() {
-        let gc =
-            Geometry::GeometryCollection(GeometryCollection(vec![octagon(13.0, 16.0, 3.0), new_point(24.0, 25.0)]));
+        let gc = Geometry::GeometryCollection(geo_types::GeometryCollection(vec![
+            octagon(13.0, 16.0, 3.0),
+            new_point(24.0, 25.0),
+        ]));
         let mut vtm = VectorTile::new();
         vtm.add_layer_features("gc", &[new_vector_tile_feature("gc", &gc, tags! {"key1" => "value1"})]);
         let encoded = vtm.encode();

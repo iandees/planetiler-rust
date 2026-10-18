@@ -3,73 +3,41 @@
 //! Feature ids are not compared and the `rank` attribute is ignored since the value planetiler produces is not
 //! stable.
 //!
-//! TODO(port): Java compares *normalized decoded JTS geometries* (`VectorTile.Feature.geometry().decode().norm()`).
-//! Until `vector_tile.rs` geometry decoding is ported, this compares the raw geometry command streams instead, which
-//! is stricter (geometries that only differ in ring start point/orientation count as different).
+//! Like Java, geometries are compared after decoding and normalizing them (`geometry().decode().norm()`), so
+//! geometries that only differ in ring start point or orientation are equal.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::bail;
-use prost::Message;
 use tracing::{info, warn};
 
+use crate::geo::normalize::norm;
 use crate::geo::tile_coord::TileCoord;
+use crate::geo::wkt::to_wkt;
 use crate::mbtiles::mbtiles::Mbtiles;
-use crate::pmtiles::pmtiles::gunzip;
-use crate::proto::vector_tile as vt;
+use crate::util::gzip::gunzip;
+use crate::vector_tile;
 
-/// Comparable representation of a vector tile feature.
+/// Comparable representation of a vector tile feature: the layer, normalized geometry (as WKT so it can be ordered)
+/// and attributes other than `rank`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct VectorTileFeatureForCmp {
     layer: String,
-    geom_type: i32,
-    geometry: Vec<u32>,
+    normalized_geometry: String,
     attrs: BTreeMap<String, String>,
-}
-
-fn value_to_string(v: &vt::tile::Value) -> String {
-    if let Some(s) = &v.string_value {
-        format!("{s:?}")
-    } else if let Some(f) = v.float_value {
-        format!("{f}f")
-    } else if let Some(d) = v.double_value {
-        format!("{d}d")
-    } else if let Some(i) = v.int_value {
-        format!("{i}")
-    } else if let Some(u) = v.uint_value {
-        format!("{u}")
-    } else if let Some(s) = v.sint_value {
-        format!("{s}")
-    } else if let Some(b) = v.bool_value {
-        format!("{b}")
-    } else {
-        "null".into()
-    }
 }
 
 fn decode_features(data: Option<Vec<u8>>) -> anyhow::Result<BTreeSet<VectorTileFeatureForCmp>> {
     let Some(data) = data else { return Ok(BTreeSet::new()) };
-    let tile = vt::Tile::decode(gunzip(&data)?.as_slice())?;
     let mut result = BTreeSet::new();
-    for layer in &tile.layers {
-        for feature in &layer.features {
-            let mut attrs = BTreeMap::new();
-            for pair in feature.tags.chunks(2) {
-                if let [k, v] = pair
-                    && let (Some(key), Some(value)) = (layer.keys.get(*k as usize), layer.values.get(*v as usize))
-                    && key != "rank"
-                {
-                    attrs.insert(key.clone(), value_to_string(value));
-                }
-            }
-            result.insert(VectorTileFeatureForCmp {
-                layer: layer.name.clone(),
-                geom_type: feature.r#type() as i32,
-                geometry: feature.geometry.clone(),
-                attrs,
-            });
-        }
+    for feature in vector_tile::decode(&gunzip(&data)?)? {
+        let attrs = feature.tags.iter().filter(|(k, _)| *k != "rank").map(|(k, v)| (k.to_string(), format!("{v:?}")));
+        result.insert(VectorTileFeatureForCmp {
+            normalized_geometry: to_wkt(&norm(&feature.geometry.decode()?)),
+            layer: feature.layer,
+            attrs: attrs.collect(),
+        });
     }
     Ok(result)
 }
@@ -145,12 +113,18 @@ pub fn compare(db_path0: &Path, db_path1: &Path, fail_on_feature_diff: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::tile_archive_config::ArchiveOptions;
     use crate::archive::tile_encoding_result::TileEncodingResult;
     use crate::archive::writeable_tile_archive::WriteableTileArchive;
-    use crate::pmtiles::pmtiles::gzip;
+    use crate::config::arguments::Arguments;
+    use crate::proto::vector_tile as vt;
+    use crate::util::gzip::gzip_zlib as gzip;
+    use prost::Message;
 
     fn tile(value: &str) -> Vec<u8> {
+        tile_with_geometry(value, vec![9, 0, 0])
+    }
+
+    fn tile_with_geometry(value: &str, geometry: Vec<u32>) -> Vec<u8> {
         let t = vt::Tile {
             layers: vec![vt::tile::Layer {
                 version: 2,
@@ -158,8 +132,8 @@ mod tests {
                 features: vec![vt::tile::Feature {
                     id: Some(1),
                     tags: vec![0, 0, 1, 1],
-                    r#type: Some(1),
-                    geometry: vec![9, 0, 0],
+                    r#type: Some(if geometry.len() > 3 { 3 } else { 1 }),
+                    geometry,
                 }],
                 keys: vec!["key".into(), "rank".into()],
                 values: vec![
@@ -177,10 +151,14 @@ mod tests {
     }
 
     fn write(path: &Path, value: &str) {
-        let mut db = Mbtiles::new_write_to_file_database(path, &ArchiveOptions::empty()).unwrap();
+        write_bytes(path, tile(value));
+    }
+
+    fn write_bytes(path: &Path, bytes: Vec<u8>) {
+        let mut db = Mbtiles::new_write_to_file_database(path, &Arguments::of()).unwrap();
         db.initialize().unwrap();
         let mut w = db.new_tile_writer().unwrap();
-        w.write(TileEncodingResult::new(TileCoord::of_xyz(0, 0, 0), tile(value), None)).unwrap();
+        w.write(TileEncodingResult::new(TileCoord::of_xyz(0, 0, 0), bytes, None)).unwrap();
         w.close().unwrap();
     }
 
@@ -194,5 +172,15 @@ mod tests {
         assert_eq!((1, 0), compare(&a, &b, true).unwrap());
         assert_eq!((1, 1), compare(&a, &c, false).unwrap());
         assert!(compare(&a, &c, true).is_err());
+    }
+
+    #[test]
+    fn test_compare_normalizes_geometry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a.mbtiles"), tmp.path().join("b.mbtiles"));
+        // the same square starting at different corners: (0,0) (1,0) (1,1) (0,1) vs (1,0) (1,1) (0,1) (0,0)
+        write_bytes(&a, tile_with_geometry("x", vec![9, 0, 0, 26, 2, 0, 0, 2, 1, 0, 15]));
+        write_bytes(&b, tile_with_geometry("x", vec![9, 2, 0, 26, 0, 2, 1, 0, 0, 1, 15]));
+        assert_eq!((1, 0), compare(&a, &b, true).unwrap());
     }
 }

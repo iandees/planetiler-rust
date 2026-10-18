@@ -45,6 +45,10 @@ fn is_valid_table_name(name: &str) -> bool {
         && lower[3..].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
+/// Memory-mapped I/O size for read connections; capped by SQLITE_MAX_MMAP_SIZE (2 GB), larger files fall back to
+/// regular reads past that offset.
+const MMAP_SIZE: i64 = 1 << 40;
+
 /// Opens a read-only connection to the sqlite file at `path`, set up so that many threads with their own connection can
 /// read concurrently without contending on sqlite's global locks.
 ///
@@ -65,8 +69,7 @@ pub(crate) fn open_sqlite_for_parallel_reads(path: &Path) -> Result<Connection> 
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
     )?;
-    // capped by SQLITE_MAX_MMAP_SIZE (2 GB); larger files fall back to regular reads past that offset
-    conn.pragma_update(None, "mmap_size", 1i64 << 40)?;
+    conn.pragma_update(None, "mmap_size", MMAP_SIZE)?;
     Ok(conn)
 }
 
@@ -265,9 +268,15 @@ impl NaturalEarthReader {
                             let i = next_table.fetch_add(1, Ordering::Relaxed);
                             let Some((table, first_id)) = tables.get(i) else { return Ok(()) };
                             trace!("Naturalearth loading {i}/{}: {table}", tables.len());
-                            if !self.read_table(&conn, table, *first_id, bounds, skipped, &mut |batch| {
+                            conn.pragma_update(None, "mmap_size", MMAP_SIZE)?;
+                            let more = self.read_table(&conn, table, *first_id, bounds, skipped, &mut |batch| {
                                 tx.send(Ok(batch)).is_ok()
-                            })? {
+                            })?;
+                            // Unmap the file after each table: pages of a memory-mapped file count as resident
+                            // memory while they stay mapped, so keeping every connection's mapping until all tables
+                            // are read made the whole ~850 MB file resident at once (most of Monaco's peak RSS).
+                            conn.pragma_update(None, "mmap_size", 0)?;
+                            if !more {
                                 return Ok(());
                             }
                         }

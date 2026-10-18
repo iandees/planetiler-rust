@@ -36,6 +36,54 @@ pub trait LongLongMultimap: Send + Sync {
 pub trait Replaceable: LongLongMultimap {
     /// Replaces the previous list of values for `key` with `values`.
     fn replace_values(&self, key: i64, values: &[i64]) -> anyhow::Result<()>;
+
+    /// Calls [`Replaceable::replace_values`] for every entry of `batch` in order (implementations can do it under a
+    /// single lock).
+    fn replace_all(&self, batch: &ReplaceBatch) -> anyhow::Result<()> {
+        for (key, values) in batch.iter() {
+            self.replace_values(key, values)?;
+        }
+        Ok(())
+    }
+}
+
+/// A buffer of pending [`Replaceable::replace_values`] calls, so a thread can apply many of them at once.
+#[derive(Default)]
+pub struct ReplaceBatch {
+    entries: Vec<(i64, usize)>,
+    values: Vec<i64>,
+}
+
+impl ReplaceBatch {
+    /// Queues `replace_values(key, values)`.
+    pub fn push(&mut self, key: i64, values: &[i64]) {
+        self.entries.push((key, values.len()));
+        self.values.extend_from_slice(values);
+    }
+
+    /// Number of values queued.
+    pub fn num_values(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.values.clear();
+    }
+
+    /// The queued `(key, values)` pairs in order.
+    pub fn iter(&self) -> impl Iterator<Item = (i64, &[i64])> {
+        let mut offset = 0;
+        self.entries.iter().map(move |&(key, len)| {
+            let values = &self.values[offset..offset + len];
+            offset += len;
+            (key, values)
+        })
+    }
 }
 
 /// A multimap where [`Appendable::put`] adds a value for a key.
@@ -174,7 +222,7 @@ impl Appendable for SparseUnorderedBinarySearchMultimap {
 }
 
 struct DenseState {
-    key_to_values_index: HashMap<i64, u64>,
+    key_to_values_index: HashMap<i64, u64, foldhash::fast::FixedState>,
     // each block starts with a "length" header then contains that number of entries
     values: Box<dyn Longs>,
 }
@@ -190,7 +238,7 @@ impl DenseOrderedMultimap {
     pub fn new(storage: Storage, params: &StorageParams) -> anyhow::Result<DenseOrderedMultimap> {
         Ok(DenseOrderedMultimap {
             state: SealOnRead::new(DenseState {
-                key_to_values_index: HashMap::new(),
+                key_to_values_index: HashMap::default(),
                 values: create_longs(storage, params)?,
             }),
         })
@@ -229,12 +277,35 @@ impl Replaceable for DenseOrderedMultimap {
         let Some(state) = guard.as_mut() else {
             anyhow::bail!("Cannot write to multimap after it has been read");
         };
-        let index = state.values.size();
-        state.values.append_long(values.len() as i64)?;
-        for &v in values {
-            state.values.append_long(v)?;
+        state.append(key, values)
+    }
+
+    fn replace_all(&self, batch: &ReplaceBatch) -> anyhow::Result<()> {
+        if batch.is_empty() {
+            return Ok(());
         }
-        state.key_to_values_index.insert(key, index);
+        let mut guard = self.state.lock_blocking();
+        let Some(state) = guard.as_mut() else {
+            anyhow::bail!("Cannot write to multimap after it has been read");
+        };
+        for (key, values) in batch.iter() {
+            if !values.is_empty() {
+                state.append(key, values)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DenseState {
+    #[inline]
+    fn append(&mut self, key: i64, values: &[i64]) -> anyhow::Result<()> {
+        let index = self.values.size();
+        self.values.append_long(values.len() as i64)?;
+        for &v in values {
+            self.values.append_long(v)?;
+        }
+        self.key_to_values_index.insert(key, index);
         Ok(())
     }
 }

@@ -3,6 +3,8 @@
 pub mod distributor;
 pub mod weighted_handoff_queue;
 pub mod work_queue;
+// Named after the Java class `Worker` that it ports, like every other module in this package.
+#[allow(clippy::module_inception)]
 pub mod worker;
 pub mod worker_pipeline;
 

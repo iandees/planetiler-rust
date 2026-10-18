@@ -149,7 +149,7 @@ impl TileWriter for JsonTileWriter<'_> {
 mod tests {
     use super::*;
     use crate::archive::test_fixtures::*;
-    use crate::archive::tile_archive_config::ArchiveOptions;
+    use crate::config::arguments::Arguments;
     use crate::geo::tile_coord::TileCoord;
     use serde_json::Value;
 
@@ -245,7 +245,7 @@ mod tests {
     fn test_tile_options(options: &[(&str, &str)], expected: &str) -> String {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("out.json");
-        let config = StreamArchiveConfig::new(false, ArchiveOptions::of_pairs(options));
+        let config = StreamArchiveConfig::new(false, Arguments::of_pairs(options.iter().copied()));
         let mut archive = WriteableJsonStreamArchive::new_write_to_file(&file, config).unwrap();
         archive.initialize().unwrap();
         {

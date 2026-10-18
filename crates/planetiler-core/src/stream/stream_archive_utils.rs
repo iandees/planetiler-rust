@@ -2,7 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::archive::tile_archive_config::{ArchiveOptions, Format};
+use crate::archive::tile_archive_config::Format;
+use crate::config::arguments::Arguments;
 
 /// Path of the `index`-th output file: the base path for 0, else the base path with `index` appended.
 pub fn construct_indexed_path(base_path: &Path, index: usize) -> PathBuf {
@@ -12,7 +13,7 @@ pub fn construct_indexed_path(base_path: &Path, index: usize) -> PathBuf {
 /// Reads a string option that may be wrapped in single quotes (to preserve whitespace) and contain Java escape
 /// sequences like `\n` or `\t`.
 pub fn get_escaped_string(
-    options: &ArchiveOptions,
+    options: &Arguments,
     format: Format,
     key: &str,
     description_prefix: &str,
@@ -145,7 +146,7 @@ mod tests {
     #[test]
     fn test_get_escaped_string() {
         for (input, output) in [("a", "a"), ("'a'", "a"), ("' '", " "), ("'\\n'", "\n")] {
-            let options = ArchiveOptions::of_pairs(&[("key", input)]);
+            let options = Arguments::of_pairs([("key", input)]);
             assert_eq!(output, get_escaped_string(&options, Format::Csv, "key", "descr.", "ex", &["\n", " "]));
         }
     }

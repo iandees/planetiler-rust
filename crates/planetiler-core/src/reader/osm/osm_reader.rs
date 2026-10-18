@@ -38,7 +38,7 @@ use roaring::RoaringTreemap;
 
 use crate::collection::feature_group::{self, FeatureGroup, FeatureSink, RenderedFeatureEncoder};
 use crate::collection::long_long_map::{LongLongMap, LongLongMapType, LongLongMapWriter, MISSING_VALUE, SealOnRead};
-use crate::collection::long_long_multimap::{self, Replaceable};
+use crate::collection::long_long_multimap::{self, ReplaceBatch, Replaceable};
 use crate::collection::storage::Storage;
 use crate::config::planetiler_config::PlanetilerConfig;
 use crate::expression::expression::ExpressionInput;
@@ -420,6 +420,15 @@ impl<'a> Pass1Worker<'a> {
         Ok(())
     }
 
+    /// Counts ways that were already preprocessed on a parse thread.
+    fn process_preprocessed_ways(&mut self, n: usize) -> anyhow::Result<()> {
+        if n > 0 {
+            self.finish_nodes();
+            self.phases.arrive_and_wait_for_others_many(Phase::Ways, n)?;
+        }
+        Ok(())
+    }
+
     /// Flushes node locations once this worker is done with nodes (Java `whenWorkerFinishes(NODES, nodeWriter::close)`).
     #[inline]
     fn finish_nodes(&mut self) {
@@ -444,7 +453,104 @@ impl<'a> Pass1Worker<'a> {
 /// to the processing thread as-is.
 struct ParsedBlock {
     nodes: Vec<(i64, u64)>,
+    /// number of ways after the nodes that were already preprocessed on the parse thread
+    num_ways: usize,
     others: Vec<OsmElement>,
+}
+
+/// Tracks which pass 1 blocks (numbered in file order) have finished preprocessing their nodes on parse threads.
+#[derive(Default)]
+struct BlockWatermark {
+    /// (number of leading blocks that are done, done blocks after the first one that is not)
+    state: parking_lot::Mutex<(u64, std::collections::BTreeSet<u64>)>,
+    cond: parking_lot::Condvar,
+}
+
+impl BlockWatermark {
+    fn mark(&self, seq: u64) {
+        let mut state = self.state.lock();
+        if seq == state.0 {
+            state.0 += 1;
+            loop {
+                let next = state.0;
+                if !state.1.remove(&next) {
+                    break;
+                }
+                state.0 += 1;
+            }
+            self.cond.notify_all();
+        } else {
+            state.1.insert(seq);
+        }
+    }
+
+    /// Blocks until every block before `seq` is done.
+    fn wait_for_blocks_before(&self, seq: u64) {
+        let mut state = self.state.lock();
+        while state.0 < seq {
+            self.cond.wait(&mut state);
+        }
+    }
+}
+
+/// Marks a block as done with its nodes when its first way is reached, or when it is dropped (block finished or
+/// failed), so that later blocks never wait on it forever.
+struct NodesDone<'a> {
+    watermark: &'a BlockWatermark,
+    seq: u64,
+    marked: bool,
+}
+
+impl NodesDone<'_> {
+    fn mark_and_wait_for_earlier(&mut self) {
+        if !self.marked {
+            self.marked = true;
+            self.watermark.mark(self.seq);
+        }
+        self.watermark.wait_for_blocks_before(self.seq);
+    }
+}
+
+impl Drop for NodesDone<'_> {
+    fn drop(&mut self) {
+        if !self.marked {
+            self.watermark.mark(self.seq);
+        }
+    }
+}
+
+/// Pass 1 way preprocessing on a parse thread (profile `preprocess_osm_way` and the way splitter).
+struct WayPreprocessor<'a> {
+    inner: &'a Inner,
+    way_split_writer: Box<dyn PerThreadWriter + 'a>,
+    max_way_id: i64,
+}
+
+impl<'a> WayPreprocessor<'a> {
+    fn new(inner: &'a Inner) -> WayPreprocessor<'a> {
+        WayPreprocessor { inner, way_split_writer: inner.way_splitter.writer_for_thread(), max_way_id: i64::MIN }
+    }
+
+    #[inline]
+    fn process(&mut self, way: &Way) {
+        let profile = &*self.inner.profile;
+        let split_writer = &mut self.way_split_writer;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            profile.preprocess_osm_way(way);
+            if profile.split_osm_way_at_intersections(way) {
+                split_writer.add_way(&way.nodes);
+            }
+        }));
+        if let Err(e) = result {
+            tracing::error!("Error preprocessing OSM way {}: {}", way.id, panic_message(&*e));
+        }
+        self.max_way_id = self.max_way_id.max(way.id);
+    }
+
+    /// Flushes the way splitter writer and records the largest way ID seen.
+    fn finish(self) {
+        self.inner.max_way_id.fetch_max(self.max_way_id, Ordering::Relaxed);
+    }
 }
 
 /// Collects rendered features for one worker thread and writes them to the feature sink.
@@ -606,13 +712,17 @@ impl OsmReader {
             let parse_threads = 1.max(if threads < 8 { threads } else { threads - 2 });
             let pending_blocks = parse_threads * 2;
             type Pending = crossbeam_channel::Receiver<anyhow::Result<ParsedBlock>>;
-            type ToParse =
-                (crate::reader::osm::osm_block_source::Block, crossbeam_channel::Sender<anyhow::Result<ParsedBlock>>);
+            type ToParse = (
+                crate::reader::osm::osm_block_source::Block,
+                crossbeam_channel::Sender<anyhow::Result<ParsedBlock>>,
+                u64,
+            );
             inner.pass1_phaser.register_workers(1);
             let parsed_batches: WorkQueue<Pending> = WorkQueue::new("elements", pending_blocks, 1, stats);
             let source = inner.block_source.clone();
             let parse_inner = inner.clone();
             let batches = parsed_batches.clone();
+            let watermark = BlockWatermark::default();
             let read_branch = WorkerPipeline::start("osm_pass1", stats.clone())
                 .from_generator("read", move |next: &mut crate::worker::work_queue::WorkQueueWriter<ToParse>| {
                     // close the queue of parsed batches even if reading fails so the process thread finishes
@@ -624,10 +734,12 @@ impl OsmReader {
                     }
                     let mut enqueuer = batches.thread_local_writer();
                     let _close = CloseOnDrop(&batches);
+                    let mut seq = 0;
                     source.for_each_block(&mut |block| {
                         let (tx, rx) = crossbeam_channel::bounded(1);
                         enqueuer.accept(rx);
-                        next.accept((block, tx));
+                        next.accept((block, tx, seq));
+                        seq += 1;
                         Ok(())
                     })?;
                     enqueuer.flush();
@@ -635,11 +747,17 @@ impl OsmReader {
                 })
                 .add_buffer("pbf_blocks", pending_blocks)
                 .sink_to("parse", parse_threads, move |blocks| {
-                    for (block, result) in blocks {
-                        let parsed = block.into_elements().and_then(|elements| parse_inner.parse_pass1_block(elements));
+                    let mut ways = WayPreprocessor::new(&parse_inner);
+                    for (block, result, seq) in blocks {
+                        let mut nodes_done = NodesDone { watermark: &watermark, seq, marked: false };
+                        let parsed = block
+                            .into_elements()
+                            .and_then(|elements| parse_inner.parse_pass1_block(elements, &mut nodes_done, &mut ways));
+                        drop(nodes_done);
                         // the receiver is gone if processing failed
                         let _ = result.send(parsed);
                     }
+                    ways.finish();
                     Ok(())
                 });
             let worker_inner = inner.clone();
@@ -740,6 +858,16 @@ impl OsmReader {
                 let emitter =
                     RefCell::new(Emitter { encoder: group.new_rendered_feature_encoder(), sink: next, error: None });
                 let mut phaser = pass2_phaser.for_worker();
+                // multipolygon way node IDs get written to the shared multimap in batches: one lock per batch
+                // instead of one per way (the lock was heavily contended)
+                let mut multipolygon_ways = ReplaceBatch::default();
+                let flush = |batch: &mut ReplaceBatch| -> anyhow::Result<()> {
+                    if !batch.is_empty() {
+                        inner.multipolygon_way_geometries.replace_all(batch)?;
+                        batch.clear();
+                    }
+                    Ok(())
+                };
                 let mut relation_handler = relation_distributor.for_thread(|relation: Relation| {
                     let id = relation.id;
                     if let Some(feature) = inner.process_relation_pass2(relation, &node_locations) {
@@ -759,12 +887,17 @@ impl OsmReader {
                             OsmElement::Way(way) => {
                                 phaser.arrive(Phase::Ways)?;
                                 let id = way.id;
-                                let feature = inner.process_way_pass2(way, &node_locations)?;
+                                let feature =
+                                    inner.process_way_pass2_with(way, &node_locations, Some(&mut multipolygon_ways))?;
+                                if multipolygon_ways.num_values() >= 1 << 16 {
+                                    flush(&mut multipolygon_ways)?;
+                                }
                                 inner.split_way_if_necessary(feature, split_way_multiplier, &mut |feature| {
                                     inner.render(&factory, &renderer, &feature, &emitter, "Way", id);
                                 });
                             }
                             OsmElement::Relation(relation) => {
+                                flush(&mut multipolygon_ways)?;
                                 phaser.arrive_and_wait_for_others(Phase::Relations)?;
                                 relation_handler.accept(relation);
                             }
@@ -774,6 +907,7 @@ impl OsmReader {
                     blocks.inc();
                     emitter.borrow_mut().check()?;
                 }
+                flush(&mut multipolygon_ways)?;
                 phaser.close()?;
                 // do work for other threads that are still processing blocks of relations
                 relation_handler.close();
@@ -1004,17 +1138,25 @@ impl Inner {
     }
 
     /// Decodes a block on a parse thread for the single-threaded pass 1 writer: preprocesses leading nodes and
-    /// pre-computes their encoded locations since that is fairly expensive and should be done in parallel.
+    /// pre-computes their encoded locations since that is fairly expensive and should be done in parallel, then
+    /// preprocesses the ways that follow them (profile `preprocess_osm_way` and the way splitter) in parallel too.
     ///
-    /// All node blocks come before way blocks, and the writer waits for each block in order, so every
-    /// `preprocess_osm_node` call still finishes before the first `preprocess_osm_way` call.
-    fn parse_pass1_block(&self, elements: impl Iterator<Item = OsmElement>) -> anyhow::Result<ParsedBlock> {
+    /// All node blocks come before way blocks, and before preprocessing its first way a parse thread waits until
+    /// every earlier block has finished preprocessing its nodes, so every `preprocess_osm_node` call still finishes
+    /// before the first `preprocess_osm_way` call. Relations (and anything out of order) go to the writer as-is.
+    fn parse_pass1_block(
+        &self,
+        elements: impl Iterator<Item = OsmElement>,
+        nodes_done: &mut NodesDone<'_>,
+        ways: &mut WayPreprocessor<'_>,
+    ) -> anyhow::Result<ParsedBlock> {
         let mut nodes = Vec::new();
+        let mut num_ways = 0;
         let mut others = Vec::new();
         let profile = &*self.profile;
         for element in elements {
             match element {
-                OsmElement::Node(node) if others.is_empty() => {
+                OsmElement::Node(node) if num_ways == 0 && others.is_empty() => {
                     if node.id < 0 {
                         anyhow::bail!("Negative OSM element IDs not supported: {node:?}");
                     }
@@ -1023,10 +1165,20 @@ impl Inner {
                     }
                     nodes.push((node.id, node.encoded_location()));
                 }
+                OsmElement::Way(way) if others.is_empty() => {
+                    if way.id < 0 {
+                        anyhow::bail!("Negative OSM element IDs not supported: {way:?}");
+                    }
+                    if num_ways == 0 {
+                        nodes_done.mark_and_wait_for_earlier();
+                    }
+                    ways.process(&way);
+                    num_ways += 1;
+                }
                 other => others.push(other),
             }
         }
-        Ok(ParsedBlock { nodes, others })
+        Ok(ParsedBlock { nodes, num_ways, others })
     }
 
     fn process_pass1_parsed_blocks(
@@ -1035,8 +1187,9 @@ impl Inner {
     ) -> anyhow::Result<()> {
         let mut worker = Pass1Worker::new(self);
         for block in blocks {
-            let ParsedBlock { nodes, others } = block?;
+            let ParsedBlock { nodes, num_ways, others } = block?;
             worker.process_preprocessed_nodes(&nodes)?;
+            worker.process_preprocessed_ways(num_ways)?;
             for element in others {
                 worker.process(element, None)?;
             }
@@ -1096,12 +1249,26 @@ impl Inner {
     }
 
     fn process_way_pass2(&self, way: Way, node_locations: &Arc<NodeLocations>) -> anyhow::Result<OsmSourceFeature> {
+        self.process_way_pass2_with(way, node_locations, None)
+    }
+
+    /// [`Inner::process_way_pass2`], queueing multipolygon way node IDs in `batch` (when given) instead of writing
+    /// them to the shared multimap right away; the caller must flush the batch before the relations phase.
+    fn process_way_pass2_with(
+        &self,
+        way: Way,
+        node_locations: &Arc<NodeLocations>,
+        batch: Option<&mut ReplaceBatch>,
+    ) -> anyhow::Result<OsmSourceFeature> {
         // ways contain an ordered list of node IDs, so we need to join that with node locations from pass1 to
         // reconstruct the geometry.
         if self.ways_in_multipolygon.read().contains(way.id as u64) {
             // if this is part of a multipolygon, store the node IDs for this way ID so that when we get to the
             // multipolygon we can go from way IDs -> node IDs -> node locations.
-            self.multipolygon_way_geometries.replace_values(way.id, &way.nodes)?;
+            match batch {
+                Some(batch) => batch.push(way.id, &way.nodes),
+                None => self.multipolygon_way_geometries.replace_values(way.id, &way.nodes)?,
+            }
         }
         let nodes = &way.nodes;
         let closed = nodes.len() > 1 && nodes[0] == nodes[nodes.len() - 1];

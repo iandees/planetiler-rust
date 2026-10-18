@@ -302,17 +302,51 @@ fn positive_contours(polys: &[&Polygon<f64>], grid: Grid) -> Vec<Contour> {
 
 /// A JTS snap-rounding hot pixel: the unit square (in grid units) centered on a rounded vertex, with open top and
 /// right sides.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct HotPixel {
     x: i64,
     y: i64,
 }
 
-impl rstar::RTreeObject for HotPixel {
-    type Envelope = rstar::AABB<[f64; 2]>;
+/// Hot pixels sorted by `(x, y)` and by `(y, x)`, queried by envelope. Each query scans whichever of the two sorted
+/// ranges (pixels with x in range, or with y in range) is shorter. Tile polygons have a few hundred vertices, where
+/// this is much cheaper than building an R-tree per call.
+struct HotPixelIndex {
+    by_x: Vec<HotPixel>,
+    by_y: Vec<HotPixel>,
+}
 
-    fn envelope(&self) -> Self::Envelope {
-        rstar::AABB::from_point([self.x as f64, self.y as f64])
+impl HotPixelIndex {
+    /// `pixels` must be sorted by `(x, y)` and deduplicated.
+    fn new(pixels: &[(i64, i64)]) -> HotPixelIndex {
+        let by_x: Vec<HotPixel> = pixels.iter().map(|&(x, y)| HotPixel { x, y }).collect();
+        let mut by_y = by_x.clone();
+        by_y.sort_unstable_by_key(|p| (p.y, p.x));
+        HotPixelIndex { by_x, by_y }
+    }
+
+    /// Calls `f` for every pixel inside (or on the boundary of) the envelope `[min, max]`.
+    #[inline]
+    fn for_each_in(&self, min: (f64, f64), max: (f64, f64), mut f: impl FnMut(&HotPixel)) {
+        let x_start = self.by_x.partition_point(|p| (p.x as f64) < min.0);
+        let x_end = self.by_x.partition_point(|p| (p.x as f64) <= max.0);
+        let y_start = self.by_y.partition_point(|p| (p.y as f64) < min.1);
+        let y_end = self.by_y.partition_point(|p| (p.y as f64) <= max.1);
+        if x_end.saturating_sub(x_start) <= y_end.saturating_sub(y_start) {
+            for p in &self.by_x[x_start..x_end.max(x_start)] {
+                let y = p.y as f64;
+                if min.1 <= y && y <= max.1 {
+                    f(p);
+                }
+            }
+        } else {
+            for p in &self.by_y[y_start..y_end.max(y_start)] {
+                let x = p.x as f64;
+                if min.0 <= x && x <= max.0 {
+                    f(p);
+                }
+            }
+        }
     }
 }
 
@@ -416,7 +450,7 @@ fn snap_round_rings(rings: &[(&[Coord<f64>], Option<bool>)], extra_pixels: &[(i6
     pixels.extend_from_slice(extra_pixels);
     pixels.sort_unstable();
     pixels.dedup();
-    let index = rstar::RTree::bulk_load(pixels.iter().map(|&(x, y)| HotPixel { x, y }).collect());
+    let index = HotPixelIndex::new(&pixels);
     let scaled = |c: &Coord<f64>| (c.x * grid.scale, c.y * grid.scale);
     let mut out = Vec::with_capacity(rings.len());
     let mut nodes: Vec<(f64, (i64, i64))> = Vec::new();
@@ -431,20 +465,20 @@ fn snap_round_rings(rings: &[(&[Coord<f64>], Option<bool>)], extra_pixels: &[(i6
                 continue;
             }
             let (p0, p1) = (scaled(&w[0]), scaled(&w[1]));
-            let envelope = rstar::AABB::from_corners(
-                [p0.0.min(p1.0) - HotPixel::TOLERANCE, p0.1.min(p1.1) - HotPixel::TOLERANCE],
-                [p0.0.max(p1.0) + HotPixel::TOLERANCE, p0.1.max(p1.1) + HotPixel::TOLERANCE],
-            );
+            let min = (p0.0.min(p1.0) - HotPixel::TOLERANCE, p0.1.min(p1.1) - HotPixel::TOLERANCE);
+            let max = (p0.0.max(p1.0) + HotPixel::TOLERANCE, p0.1.max(p1.1) + HotPixel::TOLERANCE);
             nodes.clear();
             let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
-            for hp in index.locate_in_envelope_intersecting(envelope) {
+            index.for_each_in(min, max, |hp| {
                 let key = (hp.x, hp.y);
                 if key != a && key != b && hp.intersects(p0, p1) {
                     let t = (hp.x as f64 - p0.0) * dx + (hp.y as f64 - p0.1) * dy;
                     nodes.push((t, key));
                 }
-            }
-            nodes.sort_by(|x, y| x.0.total_cmp(&y.0));
+            });
+            // ties (pixels at the same distance along the segment) are ordered by pixel so the result does not depend
+            // on the index's iteration order
+            nodes.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
             for &(_, key) in &nodes {
                 if contour.last() != Some(&key) {
                     contour.push(key);

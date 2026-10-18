@@ -32,7 +32,7 @@ use geo_types::Geometry;
 use indexmap::IndexMap;
 
 use crate::archive::readable_tile_archive::ReadableTileArchive;
-use crate::archive::tile_archive_config::ArchiveOptions;
+
 use crate::archive::tile_archive_metadata::TileArchiveMetadata;
 use crate::archive::tile_archive_writer;
 use crate::archive::tile_compression::TileCompression;
@@ -223,8 +223,7 @@ pub fn run(
     let mut feature_group =
         Arc::into_inner(feature_group).ok_or_else(|| anyhow::anyhow!("feature group still in use after runner"))?;
     feature_group.prepare()?;
-    let mut db =
-        Mbtiles::new_in_memory_database_with_options(&ArchiveOptions::from_arguments(config.arguments.clone()))?;
+    let mut db = Mbtiles::new_in_memory_database_with_options(&config.arguments.clone())?;
     tile_archive_writer::write_output(
         &mut feature_group,
         &mut db,

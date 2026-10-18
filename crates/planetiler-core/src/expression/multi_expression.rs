@@ -254,7 +254,7 @@ pub struct KeyIndex<T> {
     // index from source feature tag key to the expressions that include it so that
     // we can limit the number of expressions we need to evaluate for each input,
     // improves matching performance by ~5x
-    key_to_expressions_map: HashMap<Arc<str>, Vec<usize>>,
+    key_to_expressions_map: HashMap<Arc<str>, Vec<usize>, foldhash::fast::RandomState>,
     // same as key_to_expressions_map but as a list (optimized for iteration when # source feature keys > # tags we
     // care about)
     key_to_expressions_list: Vec<(Arc<str>, Vec<usize>)>,
@@ -264,7 +264,7 @@ pub struct KeyIndex<T> {
 
 impl<T> KeyIndex<T> {
     fn new(expressions: MultiExpression<T>, warn: bool) -> KeyIndex<T> {
-        let mut key_to_expressions: HashMap<Arc<str>, Vec<usize>> = HashMap::new();
+        let mut key_to_expressions: HashMap<Arc<str>, Vec<usize>, foldhash::fast::RandomState> = HashMap::default();
         let mut always = Vec::new();
         let mut entries = Vec::with_capacity(expressions.expressions.len());
         for (idx, e) in expressions.expressions.into_iter().enumerate() {
@@ -418,7 +418,7 @@ impl StringField {
 /// Index that limits the search space of expressions based on the source or source layer of an input element.
 #[derive(Debug)]
 pub struct StringFieldIndex<T> {
-    by_value: HashMap<String, Index<T>>,
+    by_value: HashMap<String, Index<T>, foldhash::fast::RandomState>,
     all_values_index: Index<T>,
 }
 
@@ -433,7 +433,7 @@ impl<T: Clone + PartialEq> StringFieldIndex<T> {
             });
         }
         let is_field = move |e: &Expression| field.extract(e).is_some();
-        let mut by_value = HashMap::with_capacity(values.len());
+        let mut by_value = HashMap::with_capacity_and_hasher(values.len(), Default::default());
         for value in values {
             let for_this = expressions
                 .replace(&field.make(&value), &Expression::TRUE)

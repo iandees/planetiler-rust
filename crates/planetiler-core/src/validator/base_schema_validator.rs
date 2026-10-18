@@ -36,7 +36,7 @@ use crate::value::{Tags, Value};
 pub struct ExampleResult {
     pub example: Example,
     /// The list of mismatches, or the error (or panic) raised while processing the example.
-    // TODO(port): include a symmetric diff so we can pretty-print the expected/actual output diff
+    // TODO: include a symmetric diff so we can pretty-print the expected/actual output diff
     pub issues: anyhow::Result<Vec<String>>,
 }
 
@@ -169,7 +169,7 @@ fn print_failure(example: &ExampleResult, out: &mut dyn Write) {
 }
 
 /// Java `String.indent(n)` for positive `n`: prefixes every line with `n` spaces and terminates it with `\n`.
-pub(crate) fn indent(string: &str, n: usize) -> String {
+pub fn indent(string: &str, n: usize) -> String {
     let prefix = " ".repeat(n);
     string.lines().map(|line| format!("{prefix}{line}\n")).collect()
 }
@@ -268,7 +268,7 @@ fn validate_example(
         return Ok(issues);
     }
 
-    // TODO(port): print a diff of the input and output feature YAML representations
+    // TODO: print a diff of the input and output feature YAML representations
     for (i, expected) in expected_features.iter().enumerate() {
         // first feature with the highest proximity (Java Stream.max keeps the first of equal elements)
         let mut best = 0;

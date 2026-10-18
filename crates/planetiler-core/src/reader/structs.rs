@@ -9,7 +9,10 @@
 //!
 //! In Rust a struct is a thin wrapper around a [`Value`] (cloning is cheap since nested values are reference counted).
 //!
-//! TODO(port): Java also supports `Instant`/`LocalDate`/`LocalTime`/`UUID` inputs; [`Value`] has no such variants.
+//! Difference from Java: [`Value`] has no `Instant`/`LocalDate`/`LocalTime`/`UUID` variants. Parquet temporal and UUID
+//! columns are converted to their Java `toString()` strings (see `parquet_primitive_converter`), which is what ends up
+//! in tiles, and [`Struct::as_timestamp`] parses them back.
+//!
 //! TODO(port): Java caches the parsed JSON of string values; here it is re-parsed on each access.
 
 use std::fmt;
@@ -19,7 +22,7 @@ use indexmap::IndexMap;
 use serde::de::DeserializeOwned;
 
 use crate::reader::json_conversion;
-use crate::reader::with_tags::parse_shim;
+use crate::util::{imposm3_parsers, parse};
 use crate::value::{Value, java_double_to_string};
 
 /// A key used to traverse a [`Struct`]: either a map key or a list index.
@@ -187,7 +190,7 @@ impl Struct {
             Value::Int(i) => Some(*i as i32),
             Value::Float(f) => Some(*f as i32),
             Value::Double(d) => Some(*d as i32),
-            Value::String(s) => parse_shim::parse_int_or_null(s),
+            Value::String(s) => parse::parse_int_or_null_str(s),
             _ => None,
         }
     }
@@ -198,7 +201,7 @@ impl Struct {
             Value::Int(i) => Some(*i),
             Value::Float(f) => Some(*f as i64),
             Value::Double(d) => Some(*d as i64),
-            Value::String(s) => parse_shim::parse_long_or_null(s),
+            Value::String(s) => parse::parse_long_or_null_str(s),
             _ => None,
         }
     }
@@ -209,7 +212,7 @@ impl Struct {
             Value::Int(i) => Some(*i as f64),
             Value::Float(f) => Some(*f as f64),
             Value::Double(d) => Some(*d),
-            Value::String(s) => parse_shim::parse_double_or_null(s),
+            Value::String(s) => parse::parse_double_or_null_str(s),
             _ => None,
         }
     }
@@ -218,7 +221,7 @@ impl Struct {
     pub fn as_boolean(&self) -> bool {
         match &self.0 {
             Value::Bool(b) => *b,
-            Value::String(s) => parse_shim::bool_str(s),
+            Value::String(s) => imposm3_parsers::bool_str(s),
             _ => false,
         }
     }

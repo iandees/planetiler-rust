@@ -3,7 +3,7 @@
 use std::io::{self, Read, Write};
 
 use flate2::Compression;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 
 thread_local! {
@@ -32,10 +32,11 @@ pub fn gzip_zlib(input: &[u8]) -> io::Result<Vec<u8>> {
     encoder.finish()
 }
 
-/// Decompresses gzipped `zipped` bytes.
+/// Decompresses gzipped `zipped` bytes, reading every member of a multi-member stream (like Java's
+/// `GZIPInputStream`).
 pub fn gunzip(zipped: &[u8]) -> io::Result<Vec<u8>> {
     let mut result = Vec::new();
-    GzDecoder::new(zipped).read_to_end(&mut result)?;
+    MultiGzDecoder::new(zipped).read_to_end(&mut result)?;
     Ok(result)
 }
 

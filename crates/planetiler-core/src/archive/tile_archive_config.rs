@@ -391,9 +391,8 @@ impl TileArchiveConfig {
 
     /// Returns options that return the value directly from the query parameters in the URI, or from `arguments`
     /// prefixed by `"<format>_"`.
-    pub fn apply_fallbacks(&self, arguments: &Arguments) -> ArchiveOptions {
-        ArchiveOptions::of_map(self.options.clone())
-            .or_else(ArchiveOptions::from_arguments_with_prefix(arguments.clone(), self.format.id()))
+    pub fn apply_fallbacks(&self, arguments: &Arguments) -> Arguments {
+        Arguments::of_map(self.options.clone()).or_else(arguments.with_prefix(self.format.id()))
     }
 
     pub fn get_path_for_multi_threaded_writer(&self, index: usize) -> anyhow::Result<PathBuf> {
@@ -404,139 +403,6 @@ impl TileArchiveConfig {
             }
             Format::Files => Ok(path),
             other => bail!("not supported by {other}"),
-        }
-    }
-}
-
-/// Normalizes an option key like Java `Arguments`: lowercase with `.`, `-` and `_` mapped to `_`.
-pub fn normalize_key(key: &str) -> String {
-    key.chars().map(|c| if matches!(c, '.' | '-' | '_') { '_' } else { c.to_ascii_lowercase() }).collect()
-}
-
-#[derive(Clone, Debug)]
-enum OptionsLayer {
-    Map(IndexMap<String, String>),
-    Args { args: Arguments, prefix: Option<String>, allowed: Option<Vec<String>> },
-}
-
-impl OptionsLayer {
-    fn get(&self, option: &str) -> Option<String> {
-        let normalized = normalize_key(option);
-        match self {
-            OptionsLayer::Map(map) => map.get(&normalized).cloned(),
-            OptionsLayer::Args { args, prefix, allowed } => {
-                if let Some(allowed) = allowed
-                    && !allowed.contains(&normalized)
-                {
-                    return None;
-                }
-                let key = match prefix {
-                    Some(prefix) => normalize_key(&format!("{prefix}_{option}")),
-                    None => normalized,
-                };
-                args.get_arg(&key).or_else(|| {
-                    // tolerate un-normalized keys in the backing arguments
-                    let dashed = key.replace('_', "-");
-                    args.get_arg(&dashed)
-                })
-            }
-        }
-    }
-}
-
-/// Layered view of archive options: URI query parameters falling back to (prefixed) command-line [`Arguments`].
-///
-/// Mirrors the subset of Java's `Arguments` API used by the archive implementations (`Arguments.of(map)`,
-/// `orElse`, `withPrefix`, `subset`, `getString`, `getBoolean`, `getInteger`), including `"key|legacy_key"`
-/// alternatives.
-///
-/// TODO(port): replace with `crate::config::arguments::Arguments` once its full API (`or_else`, `with_prefix`,
-/// `subset`, typed getters) is ported.
-#[derive(Clone, Debug, Default)]
-pub struct ArchiveOptions {
-    layers: Vec<OptionsLayer>,
-}
-
-impl ArchiveOptions {
-    pub fn empty() -> ArchiveOptions {
-        ArchiveOptions::default()
-    }
-
-    /// Options from a map of (un-normalized) keys to values.
-    pub fn of_map<K: AsRef<str>, V: Into<String>>(map: impl IntoIterator<Item = (K, V)>) -> ArchiveOptions {
-        let map = map.into_iter().map(|(k, v)| (normalize_key(k.as_ref()), v.into())).collect();
-        ArchiveOptions { layers: vec![OptionsLayer::Map(map)] }
-    }
-
-    /// Options from key/value pairs, like Java `Arguments.of("k1", "v1", "k2", "v2")`.
-    pub fn of_pairs(pairs: &[(&str, &str)]) -> ArchiveOptions {
-        Self::of_map(pairs.iter().map(|(k, v)| (*k, *v)))
-    }
-
-    pub fn from_arguments(args: Arguments) -> ArchiveOptions {
-        ArchiveOptions { layers: vec![OptionsLayer::Args { args, prefix: None, allowed: None }] }
-    }
-
-    /// Equivalent of `arguments.withPrefix(prefix)`: looks up `<prefix>_<key>`.
-    pub fn from_arguments_with_prefix(args: Arguments, prefix: &str) -> ArchiveOptions {
-        ArchiveOptions { layers: vec![OptionsLayer::Args { args, prefix: Some(prefix.to_string()), allowed: None }] }
-    }
-
-    /// Equivalent of `arguments.subset(keys...)`.
-    pub fn from_arguments_subset(args: Arguments, keys: &[&str]) -> ArchiveOptions {
-        let allowed = keys.iter().map(|k| normalize_key(k)).collect();
-        ArchiveOptions { layers: vec![OptionsLayer::Args { args, prefix: None, allowed: Some(allowed) }] }
-    }
-
-    /// Returns options that use values from `self`, falling back to `other`.
-    pub fn or_else(mut self, other: ArchiveOptions) -> ArchiveOptions {
-        self.layers.extend(other.layers);
-        self
-    }
-
-    fn get(&self, option: &str) -> Option<String> {
-        self.layers.iter().find_map(|l| l.get(option))
-    }
-
-    /// Raw value of `key` (which may contain `|`-separated deprecated alternatives), trimmed.
-    pub fn get_arg(&self, key: &str) -> Option<String> {
-        for (i, option) in key.split('|').enumerate() {
-            let option = option.trim();
-            if let Some(value) = self.get(option) {
-                if i != 0 {
-                    tracing::warn!("Argument '{option}' is deprecated");
-                }
-                return Some(value.trim().to_string());
-            }
-        }
-        None
-    }
-
-    pub fn get_string_opt(&self, key: &str, description: &str) -> Option<String> {
-        let value = self.get_arg(key);
-        tracing::debug!("argument: {key}={value:?} ({description})");
-        value
-    }
-
-    pub fn get_string(&self, key: &str, description: &str, default_value: &str) -> String {
-        self.get_string_opt(key, description).unwrap_or_else(|| default_value.to_string())
-    }
-
-    pub fn get_boolean(&self, key: &str, description: &str, default_value: bool) -> bool {
-        match self.get_string_opt(key, description) {
-            Some(v) => v.eq_ignore_ascii_case("true"),
-            None => default_value,
-        }
-    }
-
-    pub fn get_integer(&self, key: &str, description: &str, default_value: i64) -> anyhow::Result<i64> {
-        match self.get_string_opt(key, description) {
-            None => Ok(default_value),
-            Some(v) => match v.to_ascii_lowercase().as_str() {
-                "false" => Ok(0),
-                "true" => Ok(default_value),
-                other => other.parse().map_err(|e| anyhow!("invalid integer for {key}: {other} ({e})")),
-            },
         }
     }
 }
@@ -694,7 +560,7 @@ mod tests {
         assert_eq!("1", options.get_string("page-size", "", "x"));
         assert_eq!(None, options.get_arg("other"));
         assert_eq!(Some("false".to_string()), options.get_arg("missing|compact"));
-        let subset = ArchiveOptions::from_arguments_subset(args, &["other"]);
+        let subset = args.subset(&["other"]);
         assert_eq!(Some("1".to_string()), subset.get_arg("other"));
         assert_eq!(None, subset.get_arg("mbtiles_compact"));
     }

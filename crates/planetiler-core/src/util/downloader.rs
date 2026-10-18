@@ -36,6 +36,7 @@ use parking_lot::Mutex;
 use crate::config::planetiler_config::PlanetilerConfig;
 use crate::stats::counter::Counter;
 use crate::stats::progress_loggers::ProgressLoggers;
+use crate::util::resource_usage::ResourceUsage;
 use crate::worker::Done;
 
 const MAX_REDIRECTS: usize = 5;
@@ -530,37 +531,10 @@ fn delete(path: &Path) -> std::io::Result<()> {
 }
 
 /// Fails if there is not enough free disk space to write `size` bytes at `path`, unless `force` is set.
-///
-/// TODO(port): use `util::resource_usage::ResourceUsage` like Java once its API settles.
 fn check_disk_space(path: &Path, size: u64, id: &str, force: bool) -> anyhow::Result<()> {
-    let mut dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    if dir.as_os_str().is_empty() {
-        dir = PathBuf::from(".");
-    }
-    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    let available = disks
-        .list()
-        .iter()
-        .filter(|d| dir.starts_with(d.mount_point()))
-        .max_by_key(|d| d.mount_point().as_os_str().len())
-        .map(|d| d.available_space());
-    if let Some(available) = available
-        && size > available
-    {
-        let msg = format!(
-            "{id} requires {}B on {} but only {}B is available, use the --force argument to continue anyway",
-            crate::util::format::storage(size as f64, false),
-            dir.display(),
-            crate::util::format::storage(available as f64, false)
-        );
-        if force {
-            tracing::warn!("{msg}");
-        } else {
-            bail!("{msg}");
-        }
-    }
-    Ok(())
+    ResourceUsage::new("download")
+        .add_disk(Some(path), size, &format!("download {id}"))
+        .check_against_limits(force, false)
 }
 
 #[cfg(test)]

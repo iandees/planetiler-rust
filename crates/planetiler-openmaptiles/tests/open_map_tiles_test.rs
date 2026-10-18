@@ -12,6 +12,7 @@ use planetiler_core::config::arguments::Arguments;
 use planetiler_core::geo::geometry_type::GeometryType;
 use planetiler_core::geo::tile_coord::TileCoord;
 use planetiler_core::mbtiles::mbtiles::Mbtiles;
+use planetiler_core::mbtiles::verify::Verify;
 use planetiler_core::tags;
 use planetiler_core::util::gzip::gunzip;
 use planetiler_core::value::Tags;
@@ -135,7 +136,7 @@ fn assert_feature_near(layer: &str, attrs: Tags, lng: f64, lat: f64, minzoom: u3
 
 #[track_caller]
 fn assert_num_features(layer: &str, attrs: Tags, zoom: u32, expected: usize, geometry_type: GeometryType) {
-    let num = verify_monaco::get_num_features(&mbtiles(), layer, zoom, &attrs, &MONACO_BOUNDS, geometry_type).unwrap();
+    let num = Verify::get_num_features(&mbtiles(), layer, zoom, &attrs, &MONACO_BOUNDS, geometry_type).unwrap();
     assert_eq!(expected, num, "z{zoom} features in {layer}");
 }
 

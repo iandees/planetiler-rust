@@ -456,7 +456,7 @@ impl ConfiguredFeature {
                     }
                 })));
             }
-            // TODO(port): merge_polygons.min_area* (also a TODO in Java)
+            // TODO: merge_polygons.min_area* (same TODO as Java)
         }
         Ok(())
     }

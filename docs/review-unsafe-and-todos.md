@@ -3,7 +3,8 @@
 Read-only review of `main` @ `c116961` (2026-10-17). Nothing was compiled or run. Line numbers are as of that commit.
 
 **Status (2026-10-18):** all 2 unsound and 3 risky items in Part 1 are fixed (each section below has a **Fixed** note).
-Part 2 is unchanged.
+In Part 2, all 13 (a1) items, 12 of the 16 (a2) markers, #32 and all 8 (c) items are done; see
+[Part 2 status](#part-2-status-2026-10-18). 20 `TODO(port)` markers remain.
 
 ## Part 1: `unsafe` audit
 
@@ -203,6 +204,26 @@ There are **53** `TODO(port)` markers: 47 in `src/` and 6 in `tests/`. They're g
 - **(c) Intentional difference or inherited Java TODO**: document it, then delete the `TODO(port)` (or turn it into a plain `TODO` if Java has the same one). **8**
 
 So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
+
+### Part 2 status (2026-10-18)
+
+| Rows | Status |
+|---|---|
+| #1-#13 (a1) | **Done** as described, with these details: #2 points both pmtiles helpers at `util::gzip` (`gzip_zlib`, and `util::gzip::gunzip` now uses `MultiGzDecoder`); #5 keeps thin `Geometry`-returning wrappers over `geo::test_utils`; #6 adds `imposm3_parsers::bool_str`; #12 also moved `FieldType::of` into the archive type. |
+| #14 custommap `SchemaValidator` | **Done.** `planetiler_custommap::validator::{validate, SchemaValidator, main}` on top of `BaseSchemaValidator` (embedded or referenced examples, `--watch`, `verify schema.yml` shortcut, "Malformed expression"/"Malformed yaml input" messages). `planetiler verify`/`verify-custom`/`verify-schema` run it. `tests/schema_tests.rs` uses the core validator (the ~300-line reimplementation is gone) and checks the CLI output like Java's `SchemaValidatorTest`. |
+| #15 `benchmark_osm_read` | **Done.** Runs `OsmReader::pass1` with `NullProfile` and noop node/multipolygon storage. |
+| #16 parquet `Distributor` | Not done: a performance change (S-M) that needs measuring on Overture inputs; out of scope for this cleanup. |
+| #17 `feature_sort` `Worker`, #18 `external_merge_sort` `ProgressLoggers` | Not done: the sort code is being optimized concurrently; left alone to avoid merge conflicts. |
+| #19 `top_osm_tiles` `write_to_file` | Not done: the CLI is still blocked on xz (#33). |
+| #20 `ArchiveOptions` | **Done.** Removed; every archive takes `&Arguments` (`apply_fallbacks` is `Arguments::of_map(query).or_else(args.with_prefix(format))`). |
+| #21 `CompareArchives` geometry | **Done**, plus a behavior change: layers are paired by name, feature tags are compared as decoded key/value pairs, geometries with different commands are decoded (Java's `compareGeometry` checks) and are equal if they decode the same, and tiles that only differ in encoding are counted in `CompareResult::equivalent_tiles` instead of `tile_diffs`. |
+| #22 `mbtiles::compare` | **Done.** Compares `to_wkt(norm(decode()))` like Java. |
+| #23 `Verify` feature counts | **Done.** `Verify::{get_num_features, check_min_feature_count, check_min_feature_count_range}`; `verify_monaco` uses them. |
+| #24, #25 `Verify` validity | **Done.** `check_validity` decodes every feature and requires polygons to be simple; `is_simple_polygonal` moved to `geo::is_valid`; `test_invalid_geometry` added. |
+| #26 `Stats` debug log | **Done** (WKB logged as hex, no base64 dependency). |
+| #32 free-after-read disk estimate | **Done.** `ResourceUsage::free_disk` (usage amounts are now signed internally). |
+| #38-#45 (c) | **Done.** Relabeled as "Difference from Java" notes, plain `TODO`s where Java has the same TODO, or a short comment (#38, #42/#43). PORTING.md no longer lists "unify VectorLayer" as a follow-up. |
+| #27-#31, #33-#37 (b) | Unchanged (real missing features). |
 
 ### (a1) Stale, mechanical (13)
 

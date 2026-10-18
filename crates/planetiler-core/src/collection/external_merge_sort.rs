@@ -39,6 +39,28 @@ const MAX_CHUNK_SIZE: u64 = 2_000_000_000; // 2GB
 const WRITE_BUFFER_BYTES: usize = 1 << 20;
 const READ_BUFFER_BYTES: usize = 1 << 16;
 
+/// Target size of each chunk file written in parallel when a sorted group is large.
+const WRITE_PIECE_BYTES: u64 = 128 << 20;
+
+/// Splits sorted `entries` into at most `pieces` ranges of similar length, only between entries with different keys
+/// (so features with the same key stay in one chunk, in sorted order).
+fn split_at_key_changes(entries: &[Entry], pieces: usize) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::with_capacity(pieces);
+    let mut start = 0;
+    for k in 1..pieces {
+        let mut end = (entries.len() * k / pieces).max(start);
+        while end > start && end < entries.len() && entries[end - 1].key == entries[end].key {
+            end += 1;
+        }
+        if end > start && end < entries.len() {
+            ranges.push(start..end);
+            start = end;
+        }
+    }
+    ranges.push(start..entries.len());
+    ranges
+}
+
 /// Estimated bytes of RAM needed to sort a feature with `len` value bytes (same estimate as Java, so chunk sizes
 /// match).
 #[inline]
@@ -185,14 +207,17 @@ impl ExternalMergeSort {
         ChunkReader::open(chunk, self.mmap_io, self.compress, self.madvise)
     }
 
-    /// Reads all chunks in `group` into memory, sorts, and writes the result to the first chunk's path.
+    /// Reads all chunks in `group` into memory, sorts, and writes the result to the first chunk's path, or for large
+    /// groups to several chunks with consecutive key ranges (the first chunk's path plus `-1`, `-2`, ...) written in
+    /// parallel. Writing a sorted group is mostly memory copying into the page cache, which ran at ~1.3 GB/s on one
+    /// thread and made the sort stage use ~2-3 cores.
     fn sort_group(
         &self,
         group: Vec<Chunk>,
         read_sem: &Semaphore,
         write_sem: &Semaphore,
         timing: &Timing,
-    ) -> anyhow::Result<Chunk> {
+    ) -> anyhow::Result<Vec<Chunk>> {
         let item_count: u64 = group.iter().map(|c| c.item_count).sum();
         let bytes: u64 = group.iter().map(|c| c.bytes_in_memory).sum();
         let data_bytes = bytes.saturating_sub(item_count * bytes_in_memory(0));
@@ -222,18 +247,44 @@ impl ExternalMergeSort {
         sortable.sort(self.parallel_sort);
         timing.sorting.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-        {
+        let first = &group[0].path;
+        let pieces = split_at_key_changes(&sortable.entries, (data_bytes / WRITE_PIECE_BYTES).clamp(1, 8) as usize);
+        let write_piece = |k: usize, entries: &[Entry]| -> anyhow::Result<Chunk> {
             let _permit = write_sem.acquire();
             let start = std::time::Instant::now();
-            let first = &group[0];
-            let mut out = open_writer(&first.path, self.compress)?;
-            for e in &sortable.entries {
+            let path = if k == 0 {
+                first.clone()
+            } else {
+                let mut name = first.file_name().unwrap_or_default().to_os_string();
+                name.push(format!("-{k}"));
+                first.with_file_name(name)
+            };
+            let mut out = open_writer(&path, self.compress)?;
+            let mut piece_bytes = 0;
+            for e in entries {
                 write_feature(&mut out, e.key as i64, sortable.value(e))?;
+                piece_bytes += bytes_in_memory(e.len as usize);
             }
             finish_writer(out)?;
             timing.writing.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            Ok(Chunk { path, item_count: entries.len() as u64, bytes_in_memory: piece_bytes })
+        };
+        if pieces.len() == 1 {
+            let chunk = write_piece(0, &sortable.entries)?;
+            return Ok(vec![Chunk { bytes_in_memory: bytes, ..chunk }]);
         }
-        Ok(Chunk { path: group[0].path.clone(), item_count, bytes_in_memory: bytes })
+        std::thread::scope(|s| {
+            let handles: Vec<_> = pieces
+                .iter()
+                .enumerate()
+                .map(|(k, range)| {
+                    let entries = &sortable.entries[range.clone()];
+                    let write_piece = &write_piece;
+                    s.spawn(move || write_piece(k, entries))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("sort writer panicked")).collect()
+        })
     }
 }
 
@@ -274,25 +325,8 @@ impl Drop for Permit<'_> {
 }
 
 /// Best-fit-decreasing bin packing of chunks by estimated memory size.
-///
-/// TODO(port): replace with `util::bin_pack::pack` once ported (owned by another module).
 fn bin_pack(items: Vec<Chunk>, max_bin_size: u64) -> Vec<Vec<Chunk>> {
-    let mut items = items;
-    items.sort_by_key(|c| std::cmp::Reverse(c.bytes_in_memory));
-    let mut bins: Vec<(u64, Vec<Chunk>)> = Vec::new();
-    for item in items {
-        let size = item.bytes_in_memory;
-        // use the "fullest" bin the item fits in
-        let best = bins.iter_mut().filter(|b| max_bin_size.saturating_sub(b.0) >= size).max_by_key(|b| b.0);
-        match best {
-            Some(bin) => {
-                bin.0 += size;
-                bin.1.push(item);
-            }
-            None => bins.push((size, vec![item])),
-        }
-    }
-    bins.into_iter().map(|b| b.1).collect()
+    crate::util::bin_pack::pack(items, max_bin_size as i64, |c| c.bytes_in_memory as i64)
 }
 
 /// An entry of a chunk being sorted in memory: the key plus the location of the value bytes in a shared buffer.
@@ -338,41 +372,132 @@ impl SortableChunk {
     }
 }
 
-/// Output sink for a chunk file.
-enum Sink {
-    Plain(File),
-    Gzip(Box<GzEncoder<File>>),
+/// Output for a chunk file.
+enum ChunkOut {
+    Plain(AsyncFileWriter),
+    Gzip(BufWriter<GzEncoder<File>>),
 }
 
-impl Write for Sink {
+impl Write for ChunkOut {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            Sink::Plain(f) => f.write(buf),
-            Sink::Gzip(g) => g.write(buf),
+            ChunkOut::Plain(w) => w.write(buf),
+            ChunkOut::Gzip(g) => g.write(buf),
+        }
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            ChunkOut::Plain(w) => w.write_all(buf),
+            ChunkOut::Gzip(g) => g.write_all(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            Sink::Plain(f) => f.flush(),
-            Sink::Gzip(g) => g.flush(),
+            ChunkOut::Plain(w) => w.flush(),
+            ChunkOut::Gzip(g) => g.flush(),
         }
     }
 }
 
-fn open_writer(path: &Path, compress: bool) -> anyhow::Result<BufWriter<Sink>> {
-    let file = File::create(path).with_context(|| format!("Unable to create {path:?}"))?;
-    let sink =
-        if compress { Sink::Gzip(Box::new(GzEncoder::new(file, Compression::fast()))) } else { Sink::Plain(file) };
-    Ok(BufWriter::with_capacity(WRITE_BUFFER_BYTES, sink))
+/// Buffers writes and hands each full buffer to a background thread that writes it to the file, so the writing
+/// thread does not stall in `write` syscalls (copying into the page cache, which can block when the system is
+/// writing back a lot of dirty data). In OSM pass 2 the single feature writer thread spent ~2/3 of its time there,
+/// and processing threads blocked on its full queue.
+struct AsyncFileWriter {
+    buf: Vec<u8>,
+    tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
+    recycle: crossbeam_channel::Receiver<Vec<u8>>,
+    handle: Option<std::thread::JoinHandle<io::Result<()>>>,
 }
 
-fn finish_writer(out: BufWriter<Sink>) -> anyhow::Result<()> {
-    match out.into_inner().map_err(|e| e.into_error())? {
-        Sink::Plain(_) => {}
-        Sink::Gzip(g) => {
-            g.finish()?;
+impl AsyncFileWriter {
+    /// Buffers kept in flight between the writer and its I/O thread.
+    const IN_FLIGHT: usize = 4;
+
+    fn new(mut file: File) -> io::Result<AsyncFileWriter> {
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(Self::IN_FLIGHT);
+        let (recycle_tx, recycle) = crossbeam_channel::bounded::<Vec<u8>>(Self::IN_FLIGHT + 1);
+        let handle = std::thread::Builder::new().name("chunk-io".to_string()).spawn(move || -> io::Result<()> {
+            for mut buf in rx {
+                file.write_all(&buf)?;
+                buf.clear();
+                let _ = recycle_tx.try_send(buf);
+            }
+            file.flush()
+        })?;
+        Ok(AsyncFileWriter { buf: Vec::with_capacity(WRITE_BUFFER_BYTES), tx: Some(tx), recycle, handle: Some(handle) })
+    }
+
+    fn send_buffer(&mut self) -> io::Result<()> {
+        let next = self.recycle.try_recv().unwrap_or_else(|_| Vec::with_capacity(WRITE_BUFFER_BYTES));
+        let full = std::mem::replace(&mut self.buf, next);
+        let sent = self.tx.as_ref().is_some_and(|tx| tx.send(full).is_ok());
+        if sent { Ok(()) } else { Err(self.join().err().unwrap_or_else(|| io::Error::other("chunk writer stopped"))) }
+    }
+
+    /// Stops the I/O thread and returns its result.
+    fn join(&mut self) -> io::Result<()> {
+        self.tx = None;
+        match self.handle.take() {
+            Some(handle) => handle.join().map_err(|_| io::Error::other("chunk writer panicked"))?,
+            None => Ok(()),
+        }
+    }
+
+    /// Writes the remaining buffered bytes and waits for everything to be written.
+    fn finish(mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            self.send_buffer()?;
+        }
+        self.join()
+    }
+}
+
+impl Write for AsyncFileWriter {
+    #[inline]
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.write_all(data)?;
+        Ok(data.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        if self.buf.len() + data.len() > WRITE_BUFFER_BYTES && !self.buf.is_empty() {
+            self.send_buffer()?;
+        }
+        self.buf.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for AsyncFileWriter {
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
+}
+
+fn open_writer(path: &Path, compress: bool) -> anyhow::Result<ChunkOut> {
+    let file = File::create(path).with_context(|| format!("Unable to create {path:?}"))?;
+    Ok(if compress {
+        ChunkOut::Gzip(BufWriter::with_capacity(WRITE_BUFFER_BYTES, GzEncoder::new(file, Compression::fast())))
+    } else {
+        ChunkOut::Plain(AsyncFileWriter::new(file)?)
+    })
+}
+
+fn finish_writer(out: ChunkOut) -> anyhow::Result<()> {
+    match out {
+        ChunkOut::Plain(w) => w.finish()?,
+        ChunkOut::Gzip(g) => {
+            g.into_inner().map_err(|e| e.into_error())?.finish()?;
         }
     }
     Ok(())
@@ -391,7 +516,7 @@ fn write_feature(out: &mut impl Write, key: i64, value: &[u8]) -> io::Result<()>
 /// The chunk a thread-local writer is currently writing to.
 struct ChunkWriter {
     path: PathBuf,
-    out: BufWriter<Sink>,
+    out: ChunkOut,
     item_count: u64,
     bytes_in_memory: u64,
 }
@@ -574,7 +699,8 @@ impl FeatureSort for ExternalMergeSort {
         let num_groups = groups.len();
         let queue: Mutex<std::vec::IntoIter<(usize, Vec<Chunk>)>> =
             Mutex::new(groups.into_iter().enumerate().collect::<Vec<_>>().into_iter());
-        let results: Mutex<Vec<Option<anyhow::Result<Chunk>>>> = Mutex::new((0..num_groups).map(|_| None).collect());
+        let results: Mutex<Vec<Option<anyhow::Result<Vec<Chunk>>>>> =
+            Mutex::new((0..num_groups).map(|_| None).collect());
         let failed = AtomicBool::new(false);
         let threads = self.workers.min(num_groups).max(1);
         let this = &*self;
@@ -611,20 +737,22 @@ impl FeatureSort for ExternalMergeSort {
         });
 
         let mut sorted_chunks = Vec::with_capacity(num_groups);
+        let mut sorted_groups = 0;
         for result in results.into_inner().into_iter().flatten() {
-            sorted_chunks.push(result?);
+            sorted_chunks.extend(result?);
+            sorted_groups += 1;
         }
-        if sorted_chunks.len() != num_groups {
-            anyhow::bail!("Sort did not complete: {} of {num_groups} chunks sorted", sorted_chunks.len());
+        if sorted_groups != num_groups {
+            anyhow::bail!("Sort did not complete: {sorted_groups} of {num_groups} chunks sorted");
         }
         *self.chunks.get_mut() = sorted_chunks;
         self.sorted = true;
         timer.stop();
         info!(
-            "read:{}s write:{}s sort:{}s",
-            Duration::from_nanos(timing.reading.load(Ordering::Relaxed)).as_secs(),
-            Duration::from_nanos(timing.writing.load(Ordering::Relaxed)).as_secs(),
-            Duration::from_nanos(timing.sorting.load(Ordering::Relaxed)).as_secs()
+            "read:{:.2}s write:{:.2}s sort:{:.2}s (summed over threads)",
+            Duration::from_nanos(timing.reading.load(Ordering::Relaxed)).as_secs_f64(),
+            Duration::from_nanos(timing.writing.load(Ordering::Relaxed)).as_secs_f64(),
+            Duration::from_nanos(timing.sorting.load(Ordering::Relaxed)).as_secs_f64()
         );
         Ok(())
     }
@@ -719,6 +847,19 @@ impl Drop for ExternalMergeSort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_at_key_changes() {
+        let entries =
+            |keys: &[u64]| -> Vec<Entry> { keys.iter().map(|&key| Entry { key, offset: 0, len: 0 }).collect() };
+        assert_eq!(vec![0..0], split_at_key_changes(&[], 4));
+        assert_eq!(vec![0..4], split_at_key_changes(&entries(&[1, 2, 3, 4]), 1));
+        assert_eq!(vec![0..2, 2..4], split_at_key_changes(&entries(&[1, 2, 3, 4]), 2));
+        // never splits a run of equal keys
+        assert_eq!(vec![0..3, 3..4], split_at_key_changes(&entries(&[1, 1, 1, 2]), 2));
+        assert_eq!(vec![0..4], split_at_key_changes(&entries(&[1, 1, 1, 1]), 3));
+        assert_eq!(vec![0..1, 1..2, 2..3], split_at_key_changes(&entries(&[1, 2, 3]), 8));
+    }
     use crate::collection::array_long_min_heap::tests::Rng;
     use crate::stats::stats::InMemoryStats;
 

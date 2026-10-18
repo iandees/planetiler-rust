@@ -7,6 +7,7 @@
 //! planetiler custom --schema=path/to/schema.yml
 //! planetiler path/to/schema.yml                         # same as custom --schema=...
 //! planetiler example-toilets --osm-path=monaco.osm.pbf
+//! planetiler verify schema.yml [--watch]               # check a schema against its examples
 //! planetiler compare a.mbtiles b.mbtiles
 //! ```
 
@@ -47,9 +48,9 @@ fn shortbread(args: &[String]) -> anyhow::Result<ExitCode> {
     custom(&with_schema)
 }
 
-fn verify_schema(_args: &[String]) -> anyhow::Result<ExitCode> {
-    // TODO(port): custommap `SchemaValidator.main` (CLI + --watch) is not ported yet.
-    bail!("verify-schema is not ported yet (custommap SchemaValidator)")
+fn verify_schema(args: &[String]) -> anyhow::Result<ExitCode> {
+    let passed = planetiler_custommap::validator::main(args)?;
+    Ok(if passed { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 fn example_bikeroutes(args: &[String]) -> anyhow::Result<ExitCode> {

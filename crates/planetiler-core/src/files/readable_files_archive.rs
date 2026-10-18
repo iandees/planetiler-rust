@@ -13,9 +13,9 @@ use anyhow::{Context, bail};
 use tracing::info;
 
 use crate::archive::readable_tile_archive::{ArchiveIter, ReadableTileArchive};
-use crate::archive::tile_archive_config::ArchiveOptions;
 use crate::archive::tile_archive_metadata::TileArchiveMetadata;
 use crate::archive::tile_archive_metadata_de_ser;
+use crate::config::arguments::Arguments;
 use crate::files::files_archive_utils;
 use crate::files::tile_scheme_encoding::{TileSchemeDecoder, TileSchemeEncoding};
 use crate::geo::tile_coord::TileCoord;
@@ -46,7 +46,7 @@ fn find_files(dir: &Path, depth_remaining: usize, out: &mut Vec<PathBuf>) -> std
 }
 
 impl ReadableFilesArchive {
-    pub fn new_reader(base_path: &Path, options: &ArchiveOptions) -> anyhow::Result<ReadableFilesArchive> {
+    pub fn new_reader(base_path: &Path, options: &Arguments) -> anyhow::Result<ReadableFilesArchive> {
         let path_and_scheme = files_archive_utils::base_path_with_tile_scheme_encoding(options, base_path)?;
         let base_path = path_and_scheme.base_path;
         info!("using {} as base files archive path", base_path.display());
@@ -124,7 +124,7 @@ mod tests {
         for (i, f) in files.iter().enumerate() {
             write(&tiles_dir.join(f), &[i as u8]);
         }
-        let reader = ReadableFilesArchive::new_reader(&tiles_dir, &ArchiveOptions::empty()).unwrap();
+        let reader = ReadableFilesArchive::new_reader(&tiles_dir, &Arguments::of()).unwrap();
         let mut tiles: Vec<Tile> = reader.get_all_tiles().unwrap().map(|t| t.unwrap()).collect();
         tiles.sort();
         assert_eq!(
@@ -138,7 +138,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
         std::fs::create_dir_all(&tiles_dir).unwrap();
-        let reader = ReadableFilesArchive::new_reader(&tiles_dir, &ArchiveOptions::empty()).unwrap();
+        let reader = ReadableFilesArchive::new_reader(&tiles_dir, &Arguments::of()).unwrap();
         assert_eq!(None, reader.get_tile(0, 0, 0).unwrap());
     }
 
@@ -147,14 +147,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
         std::fs::create_dir_all(tiles_dir.join("0/0/0.pbf")).unwrap();
-        let reader = ReadableFilesArchive::new_reader(&tiles_dir, &ArchiveOptions::empty()).unwrap();
+        let reader = ReadableFilesArchive::new_reader(&tiles_dir, &Arguments::of()).unwrap();
         assert!(reader.get_tile(0, 0, 0).is_err());
     }
 
     #[test]
     fn test_requires_existing_path() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(ReadableFilesArchive::new_reader(&tmp.path().join("tiles"), &ArchiveOptions::empty()).is_err());
+        assert!(ReadableFilesArchive::new_reader(&tmp.path().join("tiles"), &Arguments::of()).is_err());
     }
 
     #[test]
@@ -172,7 +172,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let tiles_dir = tmp.path().join("tiles");
             write(&tiles_dir.join(file), &[1]);
-            let options = ArchiveOptions::of_pairs(&[(OPTION_TILE_SCHEME, scheme)]);
+            let options = Arguments::of_pairs([(OPTION_TILE_SCHEME, scheme)]);
             let archive = ReadableFilesArchive::new_reader(&tiles_dir, &options).unwrap();
             let coords: Vec<TileCoord> = archive.get_all_tile_coords().unwrap().map(|c| c.unwrap()).collect();
             assert_eq!(vec![TileCoord::of_xyz(1, 2, 3)], coords, "{scheme}");
@@ -194,7 +194,7 @@ mod tests {
             let actual_path = test_base.join(actual);
             write(&test_base.join(file), &[1]);
             std::fs::write(actual_path.join("metadata.json"), MAX_METADATA_SERIALIZED).unwrap();
-            let archive = ReadableFilesArchive::new_reader(&shortcut_path, &ArchiveOptions::empty()).unwrap();
+            let archive = ReadableFilesArchive::new_reader(&shortcut_path, &Arguments::of()).unwrap();
             let coords: Vec<TileCoord> = archive.get_all_tile_coords().unwrap().map(|c| c.unwrap()).collect();
             assert_eq!(vec![TileCoord::of_xyz(1, 2, 3)], coords, "{shortcut}");
             assert!(archive.metadata().unwrap().is_some());
@@ -206,11 +206,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
         std::fs::create_dir_all(&tiles_dir).unwrap();
-        let reader = ReadableFilesArchive::new_reader(&tiles_dir, &ArchiveOptions::empty()).unwrap();
+        let reader = ReadableFilesArchive::new_reader(&tiles_dir, &Arguments::of()).unwrap();
         assert_eq!(None, reader.metadata().unwrap());
     }
 
-    fn test_metadata(base_path: &Path, options: ArchiveOptions, metadata_path: &Path) {
+    fn test_metadata(base_path: &Path, options: Arguments, metadata_path: &Path) {
         let reader = ReadableFilesArchive::new_reader(base_path, &options).unwrap();
         assert_eq!(None, reader.metadata().unwrap());
         std::fs::write(metadata_path, MAX_METADATA_SERIALIZED).unwrap();
@@ -222,7 +222,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
         std::fs::create_dir_all(&tiles_dir).unwrap();
-        test_metadata(&tiles_dir, ArchiveOptions::empty(), &tiles_dir.join("metadata.json"));
+        test_metadata(&tiles_dir, Arguments::of(), &tiles_dir.join("metadata.json"));
     }
 
     #[test]
@@ -230,7 +230,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
         std::fs::create_dir_all(&tiles_dir).unwrap();
-        test_metadata(&tiles_dir, ArchiveOptions::of_pairs(&[(OPTION_METADATA_PATH, "x.y")]), &tiles_dir.join("x.y"));
+        test_metadata(&tiles_dir, Arguments::of_pairs([(OPTION_METADATA_PATH, "x.y")]), &tiles_dir.join("x.y"));
     }
 
     #[test]
@@ -240,7 +240,7 @@ mod tests {
         std::fs::create_dir_all(&tiles_dir).unwrap();
         std::fs::create_dir_all(tmp.path().join("abs")).unwrap();
         let p = tmp.path().join("abs").join("x.y");
-        test_metadata(&tiles_dir, ArchiveOptions::of_pairs(&[(OPTION_METADATA_PATH, &p.to_string_lossy())]), &p);
+        test_metadata(&tiles_dir, Arguments::of_pairs([(OPTION_METADATA_PATH, &p.to_string_lossy())]), &p);
     }
 
     #[test]
@@ -248,7 +248,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tiles_dir = tmp.path().join("tiles");
         std::fs::create_dir_all(&tiles_dir).unwrap();
-        let options = ArchiveOptions::of_pairs(&[(OPTION_METADATA_PATH, "none")]);
+        let options = Arguments::of_pairs([(OPTION_METADATA_PATH, "none")]);
         let reader = ReadableFilesArchive::new_reader(&tiles_dir, &options).unwrap();
         assert_eq!(None, reader.metadata().unwrap());
         std::fs::write(tiles_dir.join("none"), MAX_METADATA_SERIALIZED).unwrap();

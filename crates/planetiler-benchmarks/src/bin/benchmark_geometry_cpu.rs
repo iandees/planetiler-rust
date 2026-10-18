@@ -4,8 +4,7 @@
 //! running.
 //!
 //! Run with `cargo run --release -p planetiler-benchmarks --bin benchmark_geometry_cpu [-- <cpu seconds per cell>]`.
-//! Merge-lines resources are read from `$PLANETILER_REF/planetiler-core/src/test/resources/mergelines` (defaults to
-//! `../planetiler-ref/planetiler` next to the workspace).
+//! Merge-lines resources are read from `crates/planetiler-core/tests/resources/mergelines`.
 
 use std::alloc::{GlobalAlloc, Layout};
 
@@ -90,15 +89,8 @@ fn fmt_ns(ns: f64) -> String {
 }
 
 fn resource(file: &str) -> Geometry<f64> {
-    let reference = std::env::var("PLANETILER_REF")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../../planetiler-ref/planetiler").to_string());
-    let mut path = PathBuf::from(&reference).join("planetiler-core/src/test/resources/mergelines").join(file);
-    if !path.exists() {
-        path = PathBuf::from(
-            "/Users/ian.dees/Workspace/planetiler-ref/planetiler/planetiler-core/src/test/resources/mergelines",
-        )
-        .join(file);
-    }
+    let path =
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../planetiler-core/tests/resources/mergelines")).join(file);
     let compressed = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
     let mut bytes = Vec::new();
     flate2::read::GzDecoder::new(&compressed[..]).read_to_end(&mut bytes).unwrap();

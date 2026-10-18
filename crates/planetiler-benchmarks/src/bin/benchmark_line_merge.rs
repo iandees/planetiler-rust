@@ -2,9 +2,7 @@
 //! synthetic inputs.
 //!
 //! Run with `cargo run --release -p planetiler-benchmarks --bin benchmark_line_merge`. Test resources are read from
-//! `planetiler-core/src/test/resources/mergelines` relative to the working directory, then
-//! `crates/planetiler-core/src/test/resources/mergelines`, then `$PLANETILER_REF/planetiler-core/...`
-//! (defaults to `../planetiler-ref/planetiler`).
+//! `crates/planetiler-core/tests/resources/mergelines`.
 
 // see the `mimalloc` feature in Cargo.toml
 #[cfg(feature = "mimalloc")]
@@ -152,22 +150,7 @@ fn format_decimal(v: f64) -> String {
 }
 
 fn resource_path(file: &str) -> PathBuf {
-    let rel = PathBuf::from("planetiler-core/src/test/resources/mergelines").join(file);
-    if rel.exists() {
-        return rel;
-    }
-    let crate_rel = PathBuf::from("crates/planetiler-core/src/test/resources/mergelines").join(file);
-    if crate_rel.exists() {
-        return crate_rel;
-    }
-    let reference = std::env::var("PLANETILER_REF")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../../planetiler-ref/planetiler").to_string());
-    let candidate = PathBuf::from(&reference).join("planetiler-core/src/test/resources/mergelines").join(file);
-    if candidate.exists() {
-        return candidate;
-    }
-    PathBuf::from("/Users/ian.dees/Workspace/planetiler-ref/planetiler/planetiler-core/src/test/resources/mergelines")
-        .join(file)
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../planetiler-core/tests/resources/mergelines")).join(file)
 }
 
 fn read(file: &str) -> Geometry<f64> {

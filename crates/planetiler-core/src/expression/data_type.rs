@@ -1,7 +1,8 @@
 //! Port of `expression/DataType.java`: destination data types for an attribute that link the type to functions that
 //! can parse the value from an input object.
 
-use crate::reader::with_tags::{WithTags, parse_shim};
+use crate::reader::with_tags::WithTags;
+use crate::util::parse;
 use crate::value::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -73,11 +74,11 @@ impl DataType {
         let value = value.filter(|v| !v.is_null());
         match self {
             DataType::GetString => value.map_or(Value::Null, |v| Value::from(v.to_string_lossy().as_ref())),
-            DataType::GetBoolean => Value::Bool(parse_shim::bool(value)),
-            DataType::GetDirection => Value::Int(parse_shim::direction(value) as i64),
-            DataType::GetLong => parse_shim::parse_long_or_null_value(value).map_or(Value::Null, Value::Int),
-            DataType::GetInt => parse_shim::parse_int_or_null_value(value).map_or(Value::Null, Value::from),
-            DataType::GetDouble => parse_shim::parse_double_or_null_value(value).map_or(Value::Null, Value::Double),
+            DataType::GetBoolean => Value::Bool(value.is_some_and(parse::bool)),
+            DataType::GetDirection => Value::Int(value.map_or(0, parse::direction) as i64),
+            DataType::GetLong => value.and_then(parse::parse_long_or_null).map_or(Value::Null, Value::Int),
+            DataType::GetInt => value.and_then(parse::parse_int_or_null).map_or(Value::Null, Value::from),
+            DataType::GetDouble => value.and_then(parse::parse_double_or_null).map_or(Value::Null, Value::Double),
             DataType::GetTag => value.cloned().unwrap_or_default(),
         }
     }
