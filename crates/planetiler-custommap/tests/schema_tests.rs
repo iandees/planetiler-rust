@@ -441,10 +441,8 @@ fn bench_shortbread() {
         ("line", tags! {"footway" => "sidewalk"}),
         ("point", tags! {"place" => "city", "name" => "City", "population" => "100000"}),
     ];
-    let features: Vec<SimpleFeature> = inputs
-        .into_iter()
-        .map(|(g, t)| SimpleFeature::create(parse_geometry(g), t, "osm", None::<&str>, 1))
-        .collect();
+    let features: Vec<SimpleFeature> =
+        inputs.into_iter().map(|(g, t)| SimpleFeature::create(parse_geometry(g), t, "osm", None::<&str>, 1)).collect();
     let n = 300_000;
     let start = std::time::Instant::now();
     let mut count = 0;

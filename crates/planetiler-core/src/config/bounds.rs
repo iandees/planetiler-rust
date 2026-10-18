@@ -38,6 +38,11 @@ impl Bounds {
         self.lat_lon.unwrap_or(*geo_utils::WORLD_LAT_LON_BOUNDS)
     }
 
+    /// The explicitly-set (or inferred) lat/lon bounds, `None` if not set yet.
+    pub fn lat_lon_opt(&self) -> Option<Envelope> {
+        self.lat_lon
+    }
+
     pub fn world_bounds(&self) -> Envelope {
         self.world.unwrap_or(geo_utils::WORLD_BOUNDS)
     }
