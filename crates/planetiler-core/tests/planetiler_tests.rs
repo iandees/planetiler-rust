@@ -2,12 +2,10 @@
 //! `runWithReaderFeatures` style): SimpleFeature -> Profile -> FeatureCollector -> FeatureRenderer -> FeatureGroup ->
 //! TileArchiveWriter -> in-memory mbtiles -> decoded tiles.
 //!
-//! TODO(port): tests that need `OsmReader` (`runWithOsmElements`: testOsmPoint, testOsmPointSkipPass1,
-//! testExceptionWhileProcessingOsm, testOsmLine, testOsmLineOrPolygon, testSplitAmbiguousOsmPolygon,
-//! testSplitOsmLineWithLoop, testOsmMultipolygon, testOsmLineInRelation, testPreprocessOsmNodesAndWays,
-//! testOsmProfileFinish, testOsmProfileFinishForwardingProfile, testBadRelation, testIssue496BaseballMultipolygon,
-//! testIssue509LenaDelta, testHandleProfileException) or the `Planetiler` orchestrator (testPlanetilerRunner*,
-//! testPlanetilerMemoryCheck*, testDefaultLanguages, testReuseFeatureDb) are not ported yet.
+//! Tests that need `OsmReader` live in `tests/planetiler_osm_tests.rs`; orchestrator tests (testPlanetilerRunner*,
+//! testPlanetilerMemoryCheck*) in `tests/planetiler_runner_tests.rs` and testDefaultLanguages in `src/planetiler.rs`.
+//! TODO(port): testReuseFeatureDb, testPlanetilerRunnerShapefile/GeoPackage/Parquet/OvertureSource and the simple
+//! sources in testPlanetilerRunner wait on the simple readers being wired into the `Planetiler` runner.
 
 use std::sync::Arc;
 

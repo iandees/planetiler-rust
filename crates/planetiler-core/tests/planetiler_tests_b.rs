@@ -1,12 +1,8 @@
 //! Second batch of `PlanetilerTests.java` ports (roughly lines 1184-3410) that run in-memory with `SimpleFeature`
 //! inputs through the [`planetiler_core::testing`] harness.
 //!
-//! TODO(port): tests in this range that need `OsmReader` (`runWithOsmElements` / `processOsmFeatures`:
-//! testOsmPoint, testOsmPointSkipPass1, testExceptionWhileProcessingOsm, testOsmLine, testOsmLineOrPolygon,
-//! testSplitAmbiguousOsmPolygon, testSplitOsmLineWithLoop, testOsmMultipolygon, testOsmLineInRelation,
-//! testPreprocessOsmNodesAndWays, testOsmProfileFinish, testOsmProfileFinishForwardingProfile, testBadRelation,
-//! testIssue496BaseballMultipolygon, testIssue509LenaDelta, testHandleProfileException) or the `Planetiler`
-//! orchestrator (testPlanetilerRunner*, testPlanetilerMemoryCheck*) are not ported here.
+//! Tests in this range that need `OsmReader` are in `tests/planetiler_osm_tests.rs`, orchestrator tests
+//! (testPlanetilerRunner*, testPlanetilerMemoryCheck*) in `tests/planetiler_runner_tests.rs`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
