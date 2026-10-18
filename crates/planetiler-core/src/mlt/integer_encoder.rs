@@ -152,39 +152,8 @@ fn choose_below(values: &[i32], fast_pfor: bool, signed: bool, budget: usize) ->
     // FastPFOR when every candidate is shorter than a block (`4 + 4 * ceil(sum / 4)` bytes), i.e. fewer than 128
     // values (the RLE candidates have up to `2 * n`).
     let can_give_up = budget != usize::MAX && (!fast_pfor || n < FAST_PFOR_BLOCK / 2);
-    let (mut plain, mut delta, mut rle, mut delta_rle) = (0usize, 0usize, 0usize, 0usize);
-    let mut runs = 1usize;
-    let mut delta_runs = 1usize;
-    let mut previous_value = 0i32;
-    let mut previous_delta = 0i32;
-    let mut run = 0u32;
-    let mut delta_run = 0u32;
-    for (i, &value) in values.iter().enumerate() {
-        let d = value.wrapping_sub(previous_value);
-        plain += varint_size(transform(value, signed));
-        delta += varint_size(zigzag(d));
-        if i != 0 && value != previous_value {
-            runs += 1;
-            rle += varint_size(run) + varint_size(transform(previous_value, signed));
-            run = 0;
-        }
-        run += 1;
-        if i != 0 && d != previous_delta {
-            delta_runs += 1;
-            delta_rle += varint_size(delta_run) + varint_size(zigzag(previous_delta));
-            delta_run = 0;
-        }
-        delta_run += 1;
-        previous_value = value;
-        previous_delta = d;
-        if can_give_up && i & 31 == 31 && plain.min(delta).min(rle).min(delta_rle) >= budget {
-            return None;
-        }
-    }
-    if n > 0 {
-        rle += varint_size(run) + varint_size(transform(previous_value, signed));
-        delta_rle += varint_size(delta_run) + varint_size(zigzag(previous_delta));
-    }
+    let (plain, delta, rle, delta_rle, runs, delta_runs) =
+        if can_give_up { varint_sizes_bounded(values, signed, budget)? } else { varint_sizes(values, signed) };
     let has_rle = n / runs >= 2;
     let has_delta_rle = n / delta_runs >= 2;
     let lens = [n, n, 2 * runs, 2 * delta_runs];
@@ -216,6 +185,119 @@ fn choose_below(values: &[i32], fast_pfor: bool, signed: bool, budget: usize) ->
     };
     let kind = [Kind::Plain, Kind::Delta, Kind::Rle, Kind::DeltaRle][index];
     Some(Choice { kind, runs: runs as u32, delta_runs: delta_runs as u32, size: sizes[index] })
+}
+
+/// [`varint_size`] without branches or table lookups (vectorizes).
+#[inline(always)]
+fn varint_size_arith(v: u32) -> u32 {
+    1 + (v >= 1 << 7) as u32 + (v >= 1 << 14) as u32 + (v >= 1 << 21) as u32 + (v >= 1 << 28) as u32
+}
+
+/// The varint sizes of the plain, delta, RLE and delta-RLE candidates and the run counts (starting at 1 like Java).
+/// The RLE sizes are only computed (otherwise 0) when the candidate exists, i.e. its runs average 2+ values.
+fn varint_sizes(values: &[i32], signed: bool) -> (usize, usize, usize, usize, usize, usize) {
+    let n = values.len();
+    let (Some(&first), Some(&last)) = (values.first(), values.last()) else { return (0, 0, 0, 0, 1, 1) };
+    // pass 1 (branch-free): plain and delta sizes and the run counts
+    let mut plain = varint_size_arith(transform(first, signed)) as usize;
+    let mut delta = varint_size_arith(zigzag(first)) as usize;
+    let mut runs = 1usize;
+    let mut delta_runs = 1usize;
+    if n > 1 {
+        let d = values[1].wrapping_sub(first);
+        plain += varint_size_arith(transform(values[1], signed)) as usize;
+        delta += varint_size_arith(zigzag(d)) as usize;
+        runs += (values[1] != first) as usize;
+        // the first delta is the first value
+        delta_runs += (d != first) as usize;
+        // u32 sums per chunk so the loop vectorizes
+        let mut start = 2;
+        while start < n {
+            let end = n.min(start + (1 << 16));
+            let (mut p, mut dl, mut r, mut dr) = (0u32, 0u32, 0u32, 0u32);
+            let triples = values[start - 2..end - 2].iter().zip(&values[start - 1..end - 1]).zip(&values[start..end]);
+            for ((&pp, &prev), &v) in triples {
+                let d = v.wrapping_sub(prev);
+                p += varint_size_arith(transform(v, signed));
+                dl += varint_size_arith(zigzag(d));
+                r += (v != prev) as u32;
+                dr += (d != prev.wrapping_sub(pp)) as u32;
+            }
+            plain += p as usize;
+            delta += dl as usize;
+            runs += r as usize;
+            delta_runs += dr as usize;
+            start = end;
+        }
+    }
+    // pass 2, only for RLE candidates that exist
+    let (want_rle, want_delta_rle) = (n / runs >= 2, n / delta_runs >= 2);
+    let (mut rle, mut delta_rle) = (0usize, 0usize);
+    if want_rle || want_delta_rle {
+        let mut run = 1u32;
+        let mut delta_run = 1u32;
+        let mut previous_delta = first;
+        for (&previous, &value) in values.iter().zip(&values[1..]) {
+            let d = value.wrapping_sub(previous);
+            if value != previous {
+                rle += varint_size(run) + varint_size(transform(previous, signed));
+                run = 0;
+            }
+            run += 1;
+            if d != previous_delta {
+                delta_rle += varint_size(delta_run) + varint_size(zigzag(previous_delta));
+                delta_run = 0;
+            }
+            delta_run += 1;
+            previous_delta = d;
+        }
+        rle += varint_size(run) + varint_size(transform(last, signed));
+        delta_rle += varint_size(delta_run) + varint_size(zigzag(previous_delta));
+    }
+    (plain, delta, rle, delta_rle, runs, delta_runs)
+}
+
+/// [`varint_sizes`] in one pass, giving up (`None`) once every candidate's partial size reaches `budget`.
+fn varint_sizes_bounded(
+    values: &[i32],
+    signed: bool,
+    budget: usize,
+) -> Option<(usize, usize, usize, usize, usize, usize)> {
+    let n = values.len();
+    let (mut plain, mut delta, mut rle, mut delta_rle) = (0usize, 0usize, 0usize, 0usize);
+    let mut runs = 1usize;
+    let mut delta_runs = 1usize;
+    let mut previous_value = 0i32;
+    let mut previous_delta = 0i32;
+    let mut run = 0u32;
+    let mut delta_run = 0u32;
+    for (i, &value) in values.iter().enumerate() {
+        let d = value.wrapping_sub(previous_value);
+        plain += varint_size(transform(value, signed));
+        delta += varint_size(zigzag(d));
+        if i != 0 && value != previous_value {
+            runs += 1;
+            rle += varint_size(run) + varint_size(transform(previous_value, signed));
+            run = 0;
+        }
+        run += 1;
+        if i != 0 && d != previous_delta {
+            delta_runs += 1;
+            delta_rle += varint_size(delta_run) + varint_size(zigzag(previous_delta));
+            delta_run = 0;
+        }
+        delta_run += 1;
+        previous_value = value;
+        previous_delta = d;
+        if i & 31 == 31 && plain.min(delta).min(rle).min(delta_rle) >= budget {
+            return None;
+        }
+    }
+    if n > 0 {
+        rle += varint_size(run) + varint_size(transform(previous_value, signed));
+        delta_rle += varint_size(delta_run) + varint_size(zigzag(previous_delta));
+    }
+    Some((plain, delta, rle, delta_rle, runs, delta_runs))
 }
 
 /// Appends the chosen encoding of `values`.

@@ -110,7 +110,13 @@ impl Default for ConversionConfig {
 
 /// Java `String.compareTo`: compares UTF-16 code units.
 fn java_string_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    if a.is_ascii() && b.is_ascii() { a.cmp(b) } else { a.encode_utf16().cmp(b.encode_utf16()) }
+    // UTF-8 byte order is code point order, which only differs from UTF-16 order between supplementary characters
+    // and U+E000..U+FFFF; both are non-ASCII, so the bytes decide unless both differ with a non-ASCII byte.
+    match a.bytes().zip(b.bytes()).position(|(x, y)| x != y) {
+        None => a.len().cmp(&b.len()),
+        Some(i) if a.as_bytes()[i] < 0x80 || b.as_bytes()[i] < 0x80 => a.as_bytes()[i].cmp(&b.as_bytes()[i]),
+        Some(_) => a.encode_utf16().cmp(b.encode_utf16()),
+    }
 }
 
 /// `MltConverter.getScalarType`.
@@ -424,6 +430,31 @@ pub fn convert_mvt<F: MltFeature>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_string_order() {
+        let strings = [
+            "",
+            "a",
+            "ab",
+            "b",
+            "Z",
+            "é",
+            "e\u{301}",
+            "\u{FFFD}",
+            "\u{E000}",
+            "\u{10000}",
+            "\u{1F600}x",
+            "aé",
+            "a\u{10000}",
+        ];
+        for a in strings {
+            for b in strings {
+                let expected = a.encode_utf16().cmp(b.encode_utf16());
+                assert_eq!(expected, java_string_cmp(a, b), "{a:?} {b:?}");
+            }
+        }
+    }
 
     #[test]
     fn column_mapping_matches() {
