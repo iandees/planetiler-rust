@@ -1687,7 +1687,9 @@ dependencies = [
  "indexmap",
  "libc",
  "planetiler-core",
+ "tempfile",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
