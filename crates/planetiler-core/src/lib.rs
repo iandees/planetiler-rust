@@ -19,6 +19,7 @@ pub mod reader;
 pub mod render;
 pub mod stats;
 pub mod stream;
+pub mod testing;
 pub mod util;
 pub mod validator;
 pub mod value;

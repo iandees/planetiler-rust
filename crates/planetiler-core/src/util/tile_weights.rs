@@ -121,6 +121,20 @@ impl TileWeights {
     }
 }
 
+impl crate::util::tileset_summary_statistics::TileWeightSource for TileWeights {
+    fn get_weight(&self, coord: &TileCoord) -> i64 {
+        TileWeights::get_weight(self, *coord)
+    }
+
+    fn get_zoom_weight(&self, zoom: u32) -> i64 {
+        TileWeights::get_zoom_weight(self, zoom)
+    }
+
+    fn is_empty(&self) -> bool {
+        TileWeights::is_empty(self)
+    }
+}
+
 impl fmt::Debug for TileWeights {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "TileWeights{{")?;
