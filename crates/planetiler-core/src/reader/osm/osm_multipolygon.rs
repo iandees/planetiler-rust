@@ -18,15 +18,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use geo::{Area, PreparedGeometry, Relate};
-use geo_types::{Coord, Geometry, LineString, MultiPolygon, Polygon};
+use geo::{Area, Intersects, PreparedGeometry, Relate};
+use geo_types::{Coord, Geometry, Line, LineString, MultiPolygon, Polygon};
 use indexmap::IndexSet;
+use rstar::primitives::{GeomWithData, Rectangle};
+use rstar::{AABB, RTree};
 
 use crate::collection::long_long_map::{LongLongMap, MISSING_VALUE};
 use crate::geo::envelope::Envelope;
 use crate::geo::geo_utils;
 use crate::geo::geometry_exception::{GeometryException, GeometryResult};
-use crate::geo::is_valid::{Location, locate_in_ring};
+use crate::geo::is_valid::{Location, is_valid_polygons, locate_in_ring};
 
 /// Gap (in world coordinates) below which an almost-closed ring gets closed: 10cm at the equator.
 pub const MIN_CLOSE_RING_GAP: f64 = 0.1 / geo_utils::WORLD_CIRCUMFERENCE_METERS;
@@ -77,7 +79,10 @@ struct Ring {
 impl Ring {
     fn new(geom: Polygon<f64>) -> Ring {
         let area = geom.unsigned_area();
-        let envelope = Envelope::of_geometry(&Geometry::Polygon(geom.clone()));
+        let mut envelope = Envelope::null();
+        for c in geom.exterior().0.iter().chain(geom.interiors().iter().flat_map(|r| r.0.iter())) {
+            envelope.expand_to_include(c.x, c.y);
+        }
         Ring { geom, area, envelope, contained_by: None, holes: IndexSet::new() }
     }
 }
@@ -265,12 +270,73 @@ fn add_polygon_rings(polygons: &mut Vec<Ring>, geom: Geometry<f64>) {
     }
 }
 
-/// Port of JTS `PreparedPolygon.contains` with cheap envelope/point rejections first. The prepared geometry (an
-/// R-tree over the outer ring's edges) is only built once a candidate passes the cheap checks.
+/// Index over the edges of a valid outer ring without holes, to answer containment of rings whose boundary does not
+/// touch it without a full DE-9IM relate.
+struct ShellIndex {
+    edges: RTree<GeomWithData<Rectangle<[f64; 2]>, usize>>,
+}
+
+impl ShellIndex {
+    /// Returns an index for `outer` if the fast path applies to it: a polygon without holes with non-zero area that is
+    /// valid (a simple ring), so its interior is exactly the points inside the ring.
+    fn new(outer: &Ring) -> Option<ShellIndex> {
+        if !outer.geom.interiors().is_empty()
+            || outer.area.is_nan()
+            || outer.area <= 0.0
+            || !is_valid_polygons(std::slice::from_ref(&outer.geom))
+        {
+            return None;
+        }
+        let shell = &outer.geom.exterior().0;
+        let edges = shell
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| {
+                GeomWithData::new(
+                    Rectangle::from_corners(
+                        [w[0].x.min(w[1].x), w[0].y.min(w[1].y)],
+                        [w[0].x.max(w[1].x), w[0].y.max(w[1].y)],
+                    ),
+                    i,
+                )
+            })
+            .collect();
+        Some(ShellIndex { edges: RTree::bulk_load(edges) })
+    }
+
+    /// `Some(contains)` if no edge of valid ring `inner` intersects or touches the shell of `outer` (then `inner` is
+    /// either entirely inside or entirely outside of it), `None` if the boundaries meet.
+    fn contains_disjoint(&self, outer: &Ring, inner: &Ring) -> Option<bool> {
+        let shell = &outer.geom.exterior().0;
+        let ring = &inner.geom.exterior().0;
+        for w in ring.windows(2) {
+            let segment = Line::new(w[0], w[1]);
+            let envelope =
+                AABB::from_corners([w[0].x.min(w[1].x), w[0].y.min(w[1].y)], [w[0].x.max(w[1].x), w[0].y.max(w[1].y)]);
+            for edge in self.edges.locate_in_envelope_intersecting(envelope) {
+                let i = edge.data;
+                if Line::new(shell[i], shell[i + 1]).intersects(&segment) {
+                    return None;
+                }
+            }
+        }
+        match locate_in_ring(*ring.first()?, shell) {
+            Location::Interior => Some(true),
+            Location::Exterior => Some(false),
+            Location::Boundary => None,
+        }
+    }
+}
+
+/// Port of JTS `PreparedPolygon.contains` with cheap envelope/point rejections first. When the outer ring is simple
+/// and the inner ring is valid and does not touch it, containment is decided by locating one vertex; otherwise the
+/// prepared geometry (an R-tree over the outer ring's edges) is built once a candidate passes the cheap checks and
+/// used for a full relate.
 fn contains<'a>(
     outer: &Ring,
     outer_geom: &'a Polygon<f64>,
     prepared: &mut Option<PreparedGeometry<'a, &'a Polygon<f64>>>,
+    shell_index: &mut Option<Option<ShellIndex>>,
     inner: &Ring,
 ) -> bool {
     if !outer.envelope.contains(&inner.envelope) {
@@ -283,6 +349,14 @@ fn contains<'a>(
         && locate_in_ring(first, shell) == Location::Exterior
     {
         return false;
+    }
+    if inner.area > 0.0
+        && inner.geom.interiors().is_empty()
+        && let Some(index) = shell_index.get_or_insert_with(|| ShellIndex::new(outer))
+        && is_valid_polygons(std::slice::from_ref(&inner.geom))
+        && let Some(result) = index.contains_disjoint(outer, inner)
+    {
+        return result;
     }
     prepared.get_or_insert_with(|| PreparedGeometry::from(outer_geom)).relate(&inner.geom).is_contains()
 }
@@ -302,9 +376,10 @@ fn group_parent_child_shells(polygons: &mut [Ring]) -> IndexSet<usize> {
         if i < num_polygons - 1 {
             let outer_geom = polygons[i].geom.clone();
             let mut prepared = None;
+            let mut shell_index = None;
             // since the rings are sorted by area descending, the inner loop is only smaller rings
             for j in i + 1..num_polygons {
-                if contains(&polygons[i], &outer_geom, &mut prepared, &polygons[j]) {
+                if contains(&polygons[i], &outer_geom, &mut prepared, &mut shell_index, &polygons[j]) {
                     // keep searching until we find the smallest ring that contains this one
                     // that one is the direct parent
                     if let Some(parent) = polygons[j].contained_by {
