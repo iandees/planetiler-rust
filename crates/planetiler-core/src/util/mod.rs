@@ -22,6 +22,7 @@ pub mod madvise;
 pub mod memory_estimator;
 pub mod merging_range_map;
 pub mod overture_stac;
+pub mod parallel_inflate;
 pub mod parse;
 pub mod resource_usage;
 pub mod sliding_window;
