@@ -105,10 +105,6 @@ pub fn write_output(
     stats: &StatsRef,
 ) -> anyhow::Result<()> {
     let timer = stats.start_stage("archive");
-    if config.tile_format == TileFormat::Mlt {
-        // TODO(port): MLT (MapLibre Tile) encoding is not ported yet.
-        bail!("MLT (MapLibre Tile) output format is not supported yet in the Rust port");
-    }
     if config.tile_compression == TileCompression::Unknown {
         bail!("cannot compress \"UNKNOWN\"");
     }
@@ -463,6 +459,7 @@ impl<'a> ArchiveWriter<'a> {
         let config = self.config;
         let skip_filled = config.skip_filled_tiles;
         let include_ids = !config.exclude_ids;
+        let mlt_options = crate::mlt::MltOptions::from_config(config);
         let mut result: Vec<TileEncodingResult> = Vec::with_capacity(tiles.len());
         let mut layer_stats_rows = Vec::new();
         let mut last: Option<&TileFeatures> = None;
@@ -488,7 +485,9 @@ impl<'a> ArchiveWriter<'a> {
                     None
                 } else {
                     let (encoded, layer_stats) = match config.tile_format {
-                        TileFormat::Mlt => bail!("MLT (MapLibre Tile) output format is not supported yet"),
+                        TileFormat::Mlt => tile
+                            .encode_mlt_with_layer_stats(include_ids, &mlt_options, Some(self.stats.as_ref()))
+                            .with_context(|| format!("error encoding {coord} as MLT"))?,
                         TileFormat::Mvt | TileFormat::Unknown => tile.encode_with_layer_stats(include_ids),
                     };
                     let encoded_len = encoded.len();

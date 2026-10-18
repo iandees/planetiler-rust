@@ -3,3 +3,5 @@
 /*.mbtiles
 /*.pmtiles
 /.claude/worktrees
+/bench/mlt-core-check/target
+/bench/mlt-core-check/Cargo.lock

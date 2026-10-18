@@ -1,7 +1,9 @@
-//! Micro-benchmark for vector tile geometry + tile encoding.
+//! Micro-benchmark for vector tile geometry + tile encoding (MVT, and MLT with default and `--mlt-advanced`
+//! options).
 //!
 //! The equivalent Java program is `bench/java/BenchmarkVectorTile.java`; both use an identical deterministic workload
-//! (1000 polygons, 1000 lines, 1000 points with a few attributes) so their results can be compared directly.
+//! (1000 polygons, 1000 lines, 1000 points with a few attributes) so their results can be compared directly. The MLT
+//! runs use a quarter of the iterations (1/20 for `--mlt-advanced`, whose FSST pass is slow).
 //!
 //! Usage: `cargo run --release -p planetiler-benchmarks --bin benchmark_vector_tile -- [iterations]`
 
@@ -14,6 +16,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use geo_types::{Coord, Geometry, LineString, Point, Polygon};
+use planetiler_core::mlt::MltOptions;
 use planetiler_core::value::{Tags, Value};
 use planetiler_core::vector_tile::{Feature, VectorTile, encode_geometry};
 
@@ -91,12 +94,40 @@ fn encode_features(input: &[(&'static str, Geometry<f64>, Tags)]) -> Vec<Feature
         .collect()
 }
 
-fn encode_tile(features: &[Feature]) -> Vec<u8> {
+fn vector_tile(features: &[Feature]) -> VectorTile {
     let mut tile = VectorTile::new();
     tile.add_layer_features("polygons", &features[0..1000]);
     tile.add_layer_features("lines", &features[1000..2000]);
     tile.add_layer_features("points", &features[2000..3000]);
-    tile.encode()
+    tile
+}
+
+fn encode_tile(features: &[Feature]) -> Vec<u8> {
+    vector_tile(features).encode()
+}
+
+/// MLT encoding like `TileArchiveWriter` with `--tile-format=mlt` (`advanced`: `--mlt-advanced`, i.e. FSST and
+/// FastPFOR).
+fn encode_mlt_tile(features: &[Feature], advanced: bool) -> Vec<u8> {
+    let options = MltOptions { fsst: advanced, fast_pfor: advanced, ..Default::default() };
+    vector_tile(features).encode_mlt(true, &options).expect("mlt encode")
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+}
+
+/// Times `iterations` MLT encodes, returning `(seconds, bytes per tile)`.
+fn time_mlt(features: &[Feature], advanced: bool, iterations: usize) -> (f64, usize) {
+    for _ in 0..(iterations / 4).max(1) {
+        black_box(encode_mlt_tile(features, advanced));
+    }
+    let start = Instant::now();
+    let mut bytes = 0;
+    for _ in 0..iterations {
+        bytes = black_box(encode_mlt_tile(features, advanced)).len();
+    }
+    (start.elapsed().as_secs_f64(), bytes)
 }
 
 fn main() {
@@ -134,7 +165,17 @@ fn main() {
         iterations as f64 / tile_secs,
         tile_secs * 1000.0 / iterations as f64
     );
-    let hash =
-        encode_tile(&features).iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
-    println!("tile fnv1a64:   {hash:016x}");
+    println!("tile fnv1a64:   {:016x}", fnv1a64(&encode_tile(&features)));
+
+    for (name, advanced, n) in
+        [("mlt encode:    ", false, (iterations / 4).max(1)), ("mlt advanced:  ", true, (iterations / 20).max(1))]
+    {
+        let (secs, bytes) = time_mlt(&features, advanced, n);
+        println!(
+            "{name} {:.0} tiles/sec ({:.3} ms per tile), {bytes} bytes/tile, {n} iterations, fnv1a64 {:016x}",
+            n as f64 / secs,
+            secs * 1000.0 / n as f64,
+            fnv1a64(&encode_mlt_tile(&features, advanced))
+        );
+    }
 }

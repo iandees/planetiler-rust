@@ -15,6 +15,9 @@ The upstream reference checkout lives at `../planetiler-ref/planetiler` (commit 
 | `planetiler-benchmarks`   | `crates/planetiler-benchmarks`     |
 | `planetiler-dist`         | `crates/planetiler` (CLI binary)   |
 
+The third-party Java MLT library Planetiler depends on (`org.maplibre:mlt:0.0.10`) is ported into
+`planetiler-core/src/mlt/` (see "MLT output notes").
+
 Inside `planetiler-core`, every Java file `com/onthegomap/planetiler/<pkg>/<Name>.java` maps to
 `src/<pkg>/<snake_name>.rs` (e.g. `reader/osm/PbfDecoder.java` -> `src/reader/osm/pbf_decoder.rs`). `Struct.java` is
 `reader/structs.rs`. Files that are pure Java plumbing (functional interfaces, `Try`, `Memoized`, stream wrappers, ...)
@@ -52,7 +55,8 @@ See the table at the bottom of this file; update it as modules are completed.
 | Area | Status |
 |------|--------|
 | Foundation types (`value`, `geo::{envelope, geometry_type, geometry_exception, tile_coord, tile_extents}`, `util::hilbert`, `stats` trait, `config` struct) | done |
-| `vector_tile` (VectorTile, VectorGeometry, VectorGeometryMerger, Feature, encode/decode), `util::{tile_size_stats, layer_attr_stats, tileset_summary_statistics}` | done (MLT encoding/stats, `TileSizeStats.main` CLI deferred: see `TODO(port)`) |
+| `vector_tile` (VectorTile, VectorGeometry, VectorGeometryMerger, Feature, encode/decode, `toMltInput` / MLT encoding), `util::{tile_size_stats (incl. `computeMltTileStats`), layer_attr_stats, tileset_summary_statistics}` | done |
+| `mlt`: port of the Java MLT library `org.maplibre:mlt:0.0.10` (MltConverter, Integer/String/Property/Geometry encoders, stream metadata, JavaFastPFOR 0.3.10 FastPFOR+VariableByte, the Java FSST encoder, earcut4j 3.0.0) + a decoder for its output; `TileFormat::Mlt` end-to-end with all `mlt_*` options | done (byte-identical to Java; see "MLT output notes") |
 | `reader::{structs, with_tags, with_geometry_type, json_conversion}` (dotted keys via `WithTags::get_tag_nested`; `get_tag` stays a direct lookup) | done (helpers use `util::parse`/`util::imposm3_parsers`; Struct has no Instant/LocalDate/UUID variants) |
 | `reader::osm::{pbf_decoder, pbf_field_decoder, osm_element, osm_header, osm_input_file, osm_block_source, poly_file_reader}` (raw/zlib/lz4/zstd, eager or mmap lazy reads; hand-written zero-copy protobuf decoder, zlib via libdeflate) | done |
 | `expression::{expression, multi_expression, data_type, simplifiable}` (input trait `ExpressionInput`) | done |
@@ -71,8 +75,8 @@ See the table at the bottom of this file; update it as modules are completed.
 | `util::{translations, language_utils, thread_local_transliterator, wikidata}` | done (`wikidata::fetch` takes a `Fn(&OsmElement) -> bool` filter; `fetch_for_profile` / `profile_filter` adapt a `Profile`) |
 | Feature pipeline spine: `profile` (`Profile`, `NullProfile`), `feature_processor`, `forwarding_profile`, `feature_collector`, `reader::{source_feature, simple_feature}`, `reader::osm::osm_relation_info` (+ `RelationMember`), `render::{feature_renderer, tiled_geometry, geometry_coordinate_sequences, rendered_feature}`, `collection::feature_group` | done (see notes below) |
 | `reader::{simple_reader, source_feature_processor, shapefile_reader, geo_package_reader, natural_earth_reader}`, `reader::geojson::*`, `reader::parquet::*` + benchmark `benchmark_simple_readers` | done as *decoders* emitting `ReaderFeature`; wiring into `SimpleFeature`/`Profile`/`FeatureGroup` is `TODO(port)` (see notes) |
-| `archive::tile_archive_writer` (`TileArchiveWriter.writeOutput`), `validator::{schema_specification, base_schema_validator, java_profile_validator}`, `testing` harness + `tests/planetiler_tests*.rs` (the `runWithReaderFeatures` subset of `PlanetilerTests`), benchmark `benchmark_tile_archive_writer` | done (MLT output errors) |
-| `planetiler` (`Planetiler.java` orchestrator) + `tests/planetiler_runner_tests.rs` (testPlanetilerRunner*, MemoryCheck*, ReuseFeatureDb) + `tests/planetiler_osm_tests.rs` (all OSM `PlanetilerTests`) + `testing::run_with_osm_elements`, `TileSizeStats.main` (`tile_size_stats::main`), `CompareArchives.main` (`compare_archives::main`) | done (see "Planetiler orchestrator notes"; deferred: csv/tsv/json/proto/MLT variants of testPlanetilerRunner, testExceptionWhileProcessingOsm is `#[ignore]`d) |
+| `archive::tile_archive_writer` (`TileArchiveWriter.writeOutput`), `validator::{schema_specification, base_schema_validator, java_profile_validator}`, `testing` harness + `tests/planetiler_tests*.rs` (the `runWithReaderFeatures` subset of `PlanetilerTests`), benchmark `benchmark_tile_archive_writer` | done |
+| `planetiler` (`Planetiler.java` orchestrator) + `tests/planetiler_runner_tests.rs` (testPlanetilerRunner*, MemoryCheck*, ReuseFeatureDb) + `tests/planetiler_osm_tests.rs` (all OSM `PlanetilerTests`) + `testing::run_with_osm_elements`, `TileSizeStats.main` (`tile_size_stats::main`), `CompareArchives.main` (`compare_archives::main`) | done (see "Planetiler orchestrator notes"; deferred: csv/tsv/json/proto/pbf variants of testPlanetilerRunner, testExceptionWhileProcessingOsm is `#[ignore]`d) |
 | `planetiler` CLI crate (`planetiler-dist` `Main.java` task dispatch) | done (`verify`/`verify-schema` run the custommap `SchemaValidator`; stubs that error: `benchmark-mapping`, `benchmark-longlongmap` (use the benchmarks crate), `top-osm-tiles` (needs xz)) |
 | `planetiler-examples` (all 9 examples incl. `ToiletsOverlayLowLevelApi`, `OvertureBasemap`) + all example tests | done |
 | `planetiler-openmaptiles`: `Generate` (generator + vendored schema), generated `OpenMapTilesSchema`/`Tables`, `OpenMapTilesProfile`, `OpenMapTilesMain` (`setup`/`configure`/`run`/`main`), all 16 layers, `OmtLanguageUtils`, `Utils`, `VerifyMonaco`, all unit tests (249), `OpenMapTilesTest` (`tests/open_map_tiles_test.rs`) | done (see notes below) |
@@ -458,10 +462,11 @@ from `FeatureGroup::parallel_iterator` when `feature_read_threads > 1`) and regi
 and counter names match Java (`archive_reader_queue`, `archive_writer_queue`, `archive_layerstats_queue`,
 `archive_tiles_written{zoom}`, `archive_memoized_tiles`, `archive_features_processed`). Each batch's result goes from
 the encoder to the writer through a one-shot channel (Java's `CompletableFuture`), so writers consume batches in
-order. Any failure aborts every queue; `MLT` tile format and `UNKNOWN` compression return an error up front.
-Encoding uses `VectorTile::encode_with_layer_stats` (same stats as `tile_size_stats::compute_tile_stats` without
-building prost structs) and `util::gzip::gzip` (thread-local libdeflate, level 6; bytes differ from Java's zlib but
-sizes are within ~0.5%). `TileWeights` implements `TileWeightSource`.
+order. Any failure aborts every queue; `UNKNOWN` compression returns an error up front. MVT encoding uses
+`VectorTile::encode_with_layer_stats` (same stats as `tile_size_stats::compute_tile_stats` without building prost
+structs), `--tile-format=mlt` uses `VectorTile::encode_mlt_with_layer_stats` (see "MLT output notes"), and tiles are
+compressed with `util::gzip::gzip` (thread-local libdeflate, level 6; bytes differ from Java's zlib but sizes are
+within ~0.5%). `TileWeights` implements `TileWeightSource`.
 
 **Testing harness** (`planetiler_core::testing`, not cfg-gated): `run_with_reader_features(&[("threads", "1")],
 vec![SimpleFeature..], |source, features| { .. })` (and `_and_post_process`, `_profile`, generic `run(args, |ctx|
@@ -474,6 +479,89 @@ closures. For OSM tests, a runner can drive the OSM reader into `ctx.feature_gro
 **Validators.** `base_schema_validator::validate(&dyn Profile, &SchemaSpecification, &config) -> ValidationResult`,
 `assert_valid(profile, &spec)` / `assert_valid_str` for tests (Java `TestUtils.validateProfile`),
 `SchemaSpecification::load(path)` / `load_str`, `java_profile_validator::ProfileValidator` (CLI + `--watch`).
+### MLT output notes (`mlt`, `--tile-format=mlt`)
+
+**Decision: port the Java encoder (`org.maplibre:mlt` 0.0.10) instead of using the `mlt-core` crate.** The official
+Rust crate `mlt-core` 0.21.0 (same repo, MIT OR Apache-2.0) was evaluated first. It can encode: FSST (the `fsst-rs`
+crate), FastPFOR (the `fastpfor` crate), shared dictionaries, earcut tessellation, Morton/Hilbert/ID sorting, and
+property type inference. Its tag `0x01` format is still compatible with Java 0.0.10: it decodes everything this
+port (and Java) writes, see below. But it is a different encoder, so it cannot produce the tiles Java Planetiler
+produces:
+
+- It is a cost-based optimizer. The encoding of each stream is chosen by its own heuristics and options are "allow"
+  flags (`EncoderConfig::with_fsst`, `with_fastpfor`, `with_shared_dict`, `Tessellation::{Off, Auto, Always}`).
+  Java's choices are fixed rules: always the smallest of plain / delta / RLE / delta-RLE, a forced RLE for constant
+  streams, plain vs. Hilbert vertex dictionary vs. Morton dictionary by encoded size, string plain vs. dictionary
+  vs. FSST dictionary, shared dictionaries only for columns Planetiler's `findStringColumns` picks. Its FSST symbol
+  tables come from a different implementation. The bytes, and so the tile sizes, would differ from Java everywhere.
+- Some Java behavior can't be expressed. Java's `COERCE` type mismatch policy turns a column with mixed types into
+  strings (`PlanetilerTests.testAttributeTypeCoercion` expects `"1"`, `"1.5"`, `"true"`), while mlt-core widens
+  ints and floats to `F64`. Java's tessellation without `--mlt-polygon-outline` writes triangles with no outline
+  topology, which mlt-core only supports in its v2 format. Java's planetiler-specific options (`mlt_reorder_features`
+  sorts by ID only when IDs are kept, `mlt_shared_dict` picks columns per tile) would need re-implementing anyway.
+- It would add about 25 crates (including the `hotpath` profiling macros, `wide`, `probabilistic-collections`,
+  `union-find`) for a format the port can produce byte-for-byte from about 3k lines of ported code.
+
+The port mirrors the rest of the project, where Java output parity is the acceptance test. Exact byte sizes
+(`TileSizeStatsTest`'s 85/41/25 and 95/50 layer bytes) and the Java tests port directly. mlt-core is used only as an
+independent decoder to check the output (`bench/mlt-core-check`, kept out of the workspace so it adds no
+dependencies). A hybrid (port the planetiler-side logic, encode with mlt-core) was rejected for the same
+byte-parity reasons.
+
+**What is ported** (`crates/planetiler-core/src/mlt/`, from maplibre-tile-spec tag `java-v0.0.10`): `MltConverter`
+(`create_tileset_metadata`, `convert_mvt`), `ConversionConfig` / `FeatureTableOptimizations` / `ColumnMapping`
+(explicit names or literal prefix + delimiter; the mapping config applies to all layers like Planetiler's
+`MATCH_ALL`), `IntegerEncoder` (`AUTO` only), `StringEncoder`, `PropertyEncoder`, `GeometryEncoder` (plain /
+dictionary / Morton vertex buffers, pre-tessellation with and without outlines), `Hilbert` / `ZOrderCurve`,
+`StreamMetadata` (+ RLE / Morton), `MltTypeMap.Tag0x01`, embedded layer metadata, byte / boolean RLE. The
+third-party codecs are ported too: `fastpfor` is JavaFastPFOR 0.3.10 `Composition(FastPFOR, VariableByte)` (block 256,
+words big-endian), `fsst` is the pure-Java `SymbolTableBuilder` (MLT uses it unless the JNI library is loaded), and
+`earcut` is earcut4j 3.0.0. Java quirks are kept on purpose because they change the bytes: the Hilbert "dictionary" is
+never deduplicated (the `last` variable is never updated), FSST symbol hashes include truncated bytes, and the FSST
+candidate order follows `java.util.HashMap` iteration and `PriorityQueue` heap order. `fsst` emulates both; bins that
+Java would convert to trees (8+ colliding keys in a 64+ bucket table) are counted in `fsst::TREEIFIED_BINS` but
+their order isn't emulated. That never happened on Switzerland. `mlt::encode_tile` is Java `TileArchiveWriter`'s MLT
+branch (`findStringColumns`, `COERCE`, per-layer optimizations, Morton on, `ALL` outlines), and
+`VectorTile::{to_mlt_input, encode_mlt, encode_mlt_with_layer_stats}` are `toMltInput` + encode +
+`TileSizeStats.computeMltTileStats`. Archive metadata `format` is `application/vnd.maplibre-tile`, and PMTiles tile
+type 6 (both already ported).
+
+**Decoder.** `mlt::decoder` decodes what the encoder writes (like `MltDecoder.decodeMlTile`). It is used by the test
+harness (`testing::get_tile_map_with_format`, MLT geometries scaled by 256 / extent like Java `TestUtils`),
+`tile_size_stats::compute_mlt_tile_stats` (`consume_column` is Java's stream-skipping logic) and `compare`, which now
+also compares MLT archives (converted to MVT protobufs, then the same normalized comparison; Java's
+`CompareArchives` reads MVT only). Polygons tessellated without outlines can't be decoded. Java's decoder and
+mlt-core can't decode them either (mlt-core: "v1 triangles without outline topology").
+
+**Not ported / differences**: `IntegerEncodingOption`s other than `AUTO`, layer filter patterns, the remote
+tessellation service, and geometry sorting with ID regeneration (`SortSettings.isSortable`, never set by
+Planetiler: it needs `mlt_reorder_features` with IDs excluded but only sorts when IDs are included; requesting it
+returns an error). List / map / bytes attribute values become strings, as MVT does (Java's encoder throws).
+`TileSizeStats.main` (`stats`) still reads MVT only, like Java.
+
+**Verification.**
+- Unit tests: round-trip encode/decode over all option combinations (`mlt::tests`), the ported `TileSizeStatsTest`
+  MLT cases with Java's exact byte counts plus the `fastpfor.mlt` fixture Java wrote, and `PlanetilerTests`
+  (`testSinglePoint` MLT variants, `testAttributeTypeCoercion`, `testPlanetilerRunner` with `--tile-format=mlt`, all
+  `mlt_*` options, pmtiles and files outputs).
+- Byte identity with Java. `bench/java/MltReference.java encode` runs Java's exact `TileArchiveWriter` MLT code on
+  every tile of an MVT mbtiles, and `mlt_reference encode` (planetiler-benchmarks) does the same in Rust.
+  `mlt_reference compare` diffs the two. On the Java OpenMapTiles outputs for Monaco (23 tiles, 5,357 features) and
+  Switzerland (23,922 tiles, 5.6M features), every tile is **byte-identical** for: default, `exclude_ids`,
+  `fastpfor`, `fsst`, `fsst`+`fastpfor` (`mlt_advanced`), `shared_dict`, `reorder_features`, `tessellate`,
+  `tessellate`+`outline`, `fsst`+`fastpfor`+`shared_dict`, and everything at once. `mlt_reference encode` also
+  checks that decoding each tile gives back the MVT features.
+- End to end, Monaco with Java `planetiler-dist` vs Rust `planetiler`, `--tile_format=mlt` and also
+  `--mlt_advanced=true`: `planetiler compare` finds equivalent normalized content in all 23 tiles. 3 of 23 are
+  byte-identical (uncompressed). The other 20 differ only because the two pipelines' *MVT-level* tiles already
+  differ in ways `compare` normalizes away (ring start points, tag order; MVT bytes differ in all 23 tiles).
+  Each side's e2e MLT is byte-identical to that side's MVT output re-encoded by `mlt_reference`. Sizes
+  (uncompressed / gzipped): default Java 431,652 / 218,054 vs Rust 431,640 / 216,549 bytes; advanced Java
+  391,862 / 262,729 vs Rust 391,881 / 262,076. Gzip differences are libdeflate vs zlib.
+- Decoders. Java's `MltDecoder` and `mlt::decoder` give identical features (WKT, IDs, typed properties) on the Rust
+  outputs. mlt-core 0.21 decodes every Monaco variant (except tessellated-without-outline) to the same features as
+  `mlt::decoder` (`bench/mlt-core-check`).
+
 ### planetiler-openmaptiles notes
 
 **Generated code.** `Generate.java` -> `planetiler_openmaptiles::generate` (parsing/expression/emit functions, ported
@@ -620,8 +708,12 @@ came from equivalent Python scripts; current Switzerland numbers are in `docs/sw
 - `feature_merge::buffer_geometry`: near-collinear mitre vertices are now removed (Monaco z13 buildings within ~1.5%
   of Java's vertex count); exact parity would need a port of the JTS offset-curve builder.
 - Port `TopOsmTiles.main` (xz), `OpenMapTilesMapping` benchmark; in-memory stream
-  archive readers for the csv/tsv/json/proto `testPlanetilerRunner` variants.
-- MLT tile format (MapLibre Tile) encoder.
+  archive readers for the csv/tsv/json/proto/pbf `testPlanetilerRunner` variants (including their MLT variants).
+- MLT encoding speed: the port keeps Java's algorithm (every geometry column computes the plain, Hilbert dictionary
+  and Morton dictionary encodings, each integer stream tries 4 logical encodings, and FSST builds its symbol table
+  6 times), so it is several times slower than MVT encoding. A quiet benchmark pass (`benchmark_vector_tile` now
+  includes MLT) should measure it against Java before optimizing; any optimization must keep the output identical
+  (check with `mlt_reference` on Switzerland).
 ### custommap notes (`crates/planetiler-custommap`)
 
 **Loading.** `SchemaConfig::load(path)` / `load_str(yaml)` go through `util::yaml` (anchors, aliases, `<<` merge keys)

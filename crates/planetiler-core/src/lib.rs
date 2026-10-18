@@ -11,6 +11,7 @@ pub mod files;
 pub mod forwarding_profile;
 pub mod geo;
 pub mod mbtiles;
+pub mod mlt;
 pub mod planetiler;
 pub mod pmtiles;
 pub mod profile;

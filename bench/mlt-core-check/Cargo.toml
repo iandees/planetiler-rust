@@ -1,0 +1,18 @@
+[package]
+name = "mltcore-check"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mlt-core = "=0.21.0"
+geo-types = "0.7"
+planetiler-core = { path = "../../crates/planetiler-core" }
+anyhow = "1"
+
+[workspace]
+
+[patch.crates-io]
+i_float = { path = "../../vendor/i_float" }
+
+[profile.release]
+debug = 0

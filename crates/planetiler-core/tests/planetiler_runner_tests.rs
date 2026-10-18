@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use planetiler_core::archive::readable_tile_archive::ReadableTileArchive;
 
 use planetiler_core::archive::tile_compression::TileCompression;
+use planetiler_core::archive::tile_format::TileFormat;
 use planetiler_core::config::arguments::Arguments;
 use planetiler_core::feature_collector::FeatureCollector;
 use planetiler_core::files::readable_files_archive::ReadableFilesArchive;
@@ -16,7 +17,7 @@ use planetiler_core::planetiler::Planetiler;
 use planetiler_core::pmtiles::readable_pmtiles::ReadablePmtiles;
 use planetiler_core::profile::Profile;
 use planetiler_core::reader::source_feature::SourceFeature;
-use planetiler_core::testing::{ComparableFeature, get_tile_map_with_compression};
+use planetiler_core::testing::{ComparableFeature, get_tile_map_with_compression, get_tile_map_with_format};
 use planetiler_core::util::gzip::gunzip;
 use planetiler_core::value::Value;
 
@@ -47,6 +48,7 @@ fn read_tiles(
     format: &str,
     output: &Path,
     compression: TileCompression,
+    tile_format: TileFormat,
 ) -> (TileMap, Option<indexmap::IndexMap<String, String>>) {
     let archive: Box<dyn ReadableTileArchive> = match format {
         "mbtiles" => Box::new(Mbtiles::new_read_only_database(output).unwrap()),
@@ -54,15 +56,15 @@ fn read_tiles(
         "files" => Box::new(ReadableFilesArchive::new_reader(output, &Arguments::of()).unwrap()),
         other => panic!("unsupported {other}"),
     };
-    let tiles = get_tile_map_with_compression(archive.as_ref(), compression).unwrap();
+    let tiles = get_tile_map_with_format(archive.as_ref(), compression, tile_format).unwrap();
     let metadata = archive.metadata().unwrap().map(|m| m.to_map());
     (tiles, metadata)
 }
 
 /// `testPlanetilerRunner`.
 ///
-/// TODO(port): the csv/tsv/json/proto output format variants need an in-memory stream archive reader (Java
-/// `InMemoryStreamArchive`); MLT variants need MLT encoding.
+/// TODO(port): the csv/tsv/json/proto/pbf output format variants need an in-memory stream archive reader (Java
+/// `InMemoryStreamArchive`).
 fn run_osm(args: &str) {
     let temp = tempfile::tempdir().unwrap();
     let temp_dir = temp.path();
@@ -72,6 +74,7 @@ fn run_osm(args: &str) {
     std::fs::copy(original_osm, &temp_osm).unwrap();
     let compression =
         if args.contains("tile-compression=none") { TileCompression::None } else { TileCompression::Gzip };
+    let tile_format = if args.contains("tile-format=mlt") { TileFormat::Mlt } else { TileFormat::Mvt };
     let format = arg_parsed.get_string("output-format", "", "mbtiles");
     let (output_path, output_uri) = if format == "files" {
         let p = temp_dir.join("output");
@@ -105,7 +108,7 @@ fn run_osm(args: &str) {
         assert!(!temp_osm.exists());
     }
 
-    let (tiles, metadata) = read_tiles(&format, &output_path, compression);
+    let (tiles, metadata) = read_tiles(&format, &output_path, compression, tile_format);
     let mut features = 0;
     let mut features_with_ids = 0;
     let mut monaco_points = 0;
@@ -129,7 +132,11 @@ fn run_osm(args: &str) {
     assert_eq!(expected_ids, features_with_ids);
 
     if let Some(metadata) = metadata.filter(|_| format != "files") {
-        assert_eq!(Some("pbf"), metadata.get("format").map(String::as_str));
+        let expected_format = match tile_format {
+            TileFormat::Mlt => "application/vnd.maplibre-tile",
+            TileFormat::Mvt | TileFormat::Unknown => "pbf",
+        };
+        assert_eq!(Some(expected_format), metadata.get("format").map(String::as_str));
         assert_eq!(
             Some(env!("CARGO_PKG_VERSION")),
             metadata.get("planetiler:version").map(String::as_str),
@@ -204,6 +211,29 @@ fn test_planetiler_runner_compress_temp() {
 #[test]
 fn test_planetiler_runner_parse_node_bounds() {
     run_osm("--osm-parse-node-bounds");
+}
+
+#[test]
+fn test_planetiler_runner_mlt() {
+    run_osm("--tile-format=mlt");
+}
+
+#[test]
+fn test_planetiler_runner_mlt_all_options() {
+    run_osm(
+        "--tile-format=mlt --mlt-fastpfor --mlt-fsst --mlt-reorder-features --mlt-shared-dict --exclude-ids \
+         --mlt-tessellate-polygons --mlt-polygon-outline",
+    );
+}
+
+#[test]
+fn test_planetiler_runner_pmtiles_mlt() {
+    run_osm("--output-format=pmtiles --tile-format=mlt");
+}
+
+#[test]
+fn test_planetiler_runner_files_mlt() {
+    run_osm("--output-format=files --tile-format=mlt");
 }
 
 #[test]

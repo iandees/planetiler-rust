@@ -10,6 +10,9 @@ A Rust port of [Planetiler](https://github.com/onthegomap/planetiler), the tool 
 - the **example profiles** (toilets, bike routes, OSM QA tiles, Overture, ...),
 - the core library: OSM `.osm.pbf`, shapefile, GeoPackage, Natural Earth, GeoJSON and (Geo)Parquet readers, the
   feature pipeline, external merge sort, and MBTiles / PMTiles / files / CSV / TSV / JSON / protobuf output archives,
+- Mapbox Vector Tile (MVT) and [MapLibre Tile](https://github.com/maplibre/maplibre-tile-spec) (MLT,
+  `--tile-format=mlt` with all the `--mlt-*` options) output; the MLT encoder is a port of the Java MLT library and
+  writes byte-identical tiles,
 - the `planetiler` CLI with the same task names and `--key=value` arguments as `planetiler.jar`.
 
 The code mirrors the Java layout file by file (see [PORTING.md](PORTING.md)), so the upstream docs apply.
@@ -110,9 +113,9 @@ the `Profile` trait and running it with `planetiler_core::planetiler::Planetiler
 
 Logging uses `RUST_LOG` (for example `RUST_LOG=debug`).
 
-`compare` decodes tiles whose bytes differ and reports a diff only when the decoded contents differ: layers are
-paired by name, feature tags are compared as decoded key/value pairs, and geometries are compared by their decoded
-value. Tiles that differ only in encoding (key/value table order, layer order) are counted separately as
+`compare` decodes tiles (MVT or MLT) whose bytes differ and reports a diff only when the decoded contents differ:
+layers are paired by name, feature tags are compared as decoded key/value pairs, and geometries are compared by their
+decoded value. Tiles that differ only in encoding (key/value table order, layer order) are counted separately as
 "equivalent". This makes it useful for comparing Java and Rust output.
 
 Benchmarks are separate binaries in `crates/planetiler-benchmarks` (`cargo run --release -p planetiler-benchmarks
@@ -130,7 +133,8 @@ Benchmarks are separate binaries in `crates/planetiler-benchmarks` (`cargo run -
   checker (type errors show up at runtime), `1 == 1.0` is true, and `replaceRegex` uses Rust `regex` syntax (no
   look-around or backreferences).
 - **Parquet/struct values.** Temporal and UUID columns become their Java `toString()` strings.
-- **`compare`** only reports real content differences (see above). Java also counts tiles whose bytes differ.
+- **`compare`** only reports real content differences (see above), and can also compare MLT archives. Java also
+  counts tiles whose bytes differ.
 - **Logging.** There's no `[stage]` prefix on log lines, and data-error debug logs print WKB as hex rather than base64.
 
 ## Known gaps
@@ -138,8 +142,6 @@ Benchmarks are separate binaries in `crates/planetiler-benchmarks` (`cargo run -
 From [PORTING.md](PORTING.md) and the `TODO(port)` triage in
 [docs/review-unsafe-and-todos.md](docs/review-unsafe-and-todos.md):
 
-- **MLT (MapLibre Tile) output** is not supported (`--tile-format=mlt` is an error). MVT is the default and fully
-  supported.
 - **OpenMapTiles country boundaries.** `adm0_l`/`adm0_r` are computed from merged boundary lines rather than a JTS
   `Polygonizer`, so rings that only close through a node shared by 3 or more ways are dropped.
 - **Snap rounding.** `reduce_precision` adds hot pixels for vertices but not for segment intersections, and lines are

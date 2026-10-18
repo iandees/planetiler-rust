@@ -49,7 +49,6 @@ fn lat_lon(x: f64, y: f64) -> (f64, f64) {
 }
 
 #[test]
-#[ignore = "TODO(port): MLT tile format is not supported yet (attribute type coercion is an MLT encoder feature)"]
 fn test_attribute_type_coercion() {
     let (lng, lat) = lat_lon(0.5 + Z14_WIDTH / 4.0, 0.5 + Z14_WIDTH / 4.0);
     let results = run_with_reader_features(

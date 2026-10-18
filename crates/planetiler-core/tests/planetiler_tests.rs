@@ -101,13 +101,13 @@ fn test_override_metadata() {
 
 #[test]
 fn test_single_point() {
-    for any_geom in [false, true] {
+    for (any_geom, tile_type) in [(false, "mvt"), (true, "mvt"), (false, "mlt"), (true, "mlt")] {
         let x = 0.5 + Z15_WIDTH / 4.0;
         let y = 0.5 + Z15_WIDTH / 4.0;
         let lat = get_world_lat(y);
         let lng = get_world_lon(x);
         let results = run_with_reader_features(
-            &[("threads", "1"), ("maxzoom", "16"), ("tile-format", "mvt")],
+            &[("threads", "1"), ("maxzoom", "16"), ("tile-format", tile_type)],
             vec![new_reader_feature(new_point(lng, lat), tags! {"attr" => "value"})],
             move |_, features| {
                 let f = if any_geom { features.any_geometry("layer") } else { features.point("layer") };
@@ -130,19 +130,6 @@ fn test_single_point() {
             results.metadata.get("vector_layers"),
         );
     }
-}
-
-#[test]
-fn test_single_point_mlt_unsupported() {
-    // TODO(port): MLT output is not supported yet; Java runs testSinglePoint with tile-format=mlt too.
-    let result = run_with_reader_features(
-        &[("threads", "1"), ("tile-format", "mlt")],
-        vec![new_reader_feature(new_point(0.0, 0.0), tags! {})],
-        |_, features| {
-            features.point("layer");
-        },
-    );
-    assert!(result.is_err());
 }
 
 #[test]

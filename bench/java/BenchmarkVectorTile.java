@@ -1,5 +1,11 @@
 import com.onthegomap.planetiler.VectorTile;
 import java.util.ArrayList;
+import java.util.stream.Collectors;
+import org.maplibre.mlt.converter.ConversionConfig;
+import org.maplibre.mlt.converter.FeatureTableOptimizations;
+import org.maplibre.mlt.converter.MltConverter;
+import org.maplibre.mlt.converter.mvt.ColumnMappingConfig;
+import org.maplibre.mlt.data.Layer;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -9,8 +15,9 @@ import org.locationtech.jts.geom.Geometry;
 import org.locationtech.jts.geom.GeometryFactory;
 
 /**
- * Micro-benchmark for vector tile geometry + tile encoding, equivalent to the Rust
- * crates/planetiler-benchmarks/src/bin/benchmark_vector_tile.rs (identical deterministic workload).
+ * Micro-benchmark for vector tile geometry + tile encoding (MVT, and MLT with default and {@code --mlt-advanced}
+ * options), equivalent to the Rust crates/planetiler-benchmarks/src/bin/benchmark_vector_tile.rs (identical
+ * deterministic workload). The MLT runs use a quarter of the iterations (1/20 for {@code --mlt-advanced}).
  * <p>
  * Usage: {@code java -cp planetiler.jar bench/java/BenchmarkVectorTile.java [iterations]}
  */
@@ -98,12 +105,46 @@ public class BenchmarkVectorTile {
     return result;
   }
 
-  static byte[] encodeTile(List<VectorTile.Feature> features) {
+  static VectorTile vectorTile(List<VectorTile.Feature> features) {
     return new VectorTile()
       .addLayerFeatures("polygons", features.subList(0, 1000))
       .addLayerFeatures("lines", features.subList(1000, 2000))
-      .addLayerFeatures("points", features.subList(2000, 3000))
-      .encode();
+      .addLayerFeatures("points", features.subList(2000, 3000));
+  }
+
+  static byte[] encodeTile(List<VectorTile.Feature> features) {
+    return vectorTile(features).encode();
+  }
+
+  /** MLT encoding like TileArchiveWriter with --tile-format=mlt (advanced: --mlt-advanced, FSST and FastPFOR). */
+  static byte[] encodeMltTile(List<VectorTile.Feature> features, boolean advanced) {
+    try {
+      var mltInput = vectorTile(features).toMltInput();
+      var tilesetMetadata =
+        MltConverter.createTilesetMetadata(mltInput, new ColumnMappingConfig(), true, true, false);
+      var conversionConfig = ConversionConfig.builder()
+        .includeIds(true)
+        .useFastPFOR(advanced)
+        .useFSST(advanced)
+        .mismatchPolicy(ConversionConfig.TypeMismatchPolicy.COERCE)
+        .optimizations(mltInput.layers().stream().collect(Collectors.toMap(Layer::name,
+          layer -> new FeatureTableOptimizations(false, false, null))))
+        .preTessellatePolygons(false)
+        .outlineFeatureTableNames(null)
+        .useMortonEncoding(true)
+        .build();
+      return MltConverter.convertMvt(mltInput, tilesetMetadata, conversionConfig, null);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  static long fnv1a64(byte[] bytes) {
+    long hash = 0xcbf29ce484222325L;
+    for (byte b : bytes) {
+      hash = (hash ^ (b & 0xff)) * 0x100000001b3L;
+    }
+    return hash;
   }
 
   static volatile Object sink;
@@ -142,10 +183,23 @@ public class BenchmarkVectorTile {
       iterations * (double) input.size() / geomSecs, geomSecs * 1000 / iterations);
     System.out.printf("tile encode:    %.0f tiles/sec (%.3f ms per tile), %d bytes/tile%n",
       iterations / tileSecs, tileSecs * 1000 / iterations, bytes);
-    long hash = 0xcbf29ce484222325L;
-    for (byte b : encodeTile(features)) {
-      hash = (hash ^ (b & 0xff)) * 0x100000001b3L;
+    System.out.printf("tile fnv1a64:   %016x%n", fnv1a64(encodeTile(features)));
+
+    for (boolean advanced : new boolean[]{false, true}) {
+      int n = Math.max(1, advanced ? iterations / 20 : iterations / 4);
+      for (int i = 0; i < Math.max(1, n / 4); i++) {
+        sink = encodeMltTile(features, advanced);
+      }
+      start = System.nanoTime();
+      for (int i = 0; i < n; i++) {
+        byte[] encoded = encodeMltTile(features, advanced);
+        sink = encoded;
+        bytes = encoded.length;
+      }
+      double secs = (System.nanoTime() - start) / 1e9;
+      System.out.printf("%s %.0f tiles/sec (%.3f ms per tile), %d bytes/tile, %d iterations, fnv1a64 %016x%n",
+        advanced ? "mlt advanced:  " : "mlt encode:    ", n / secs, secs * 1000 / n, bytes, n,
+        fnv1a64(encodeMltTile(features, advanced)));
     }
-    System.out.printf("tile fnv1a64:   %016x%n", hash);
   }
 }

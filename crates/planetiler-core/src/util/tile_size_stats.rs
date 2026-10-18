@@ -17,8 +17,6 @@ use crate::geo::tile_coord::TileCoord;
 use crate::proto::vector_tile as pb;
 use crate::vector_tile;
 
-// TODO(port): `computeMltTileStats` depends on the MLT decoder (org.maplibre.mlt) which is not ported yet.
-
 const COLUMNS: [&str; 12] = [
     "z",
     "x",
@@ -148,6 +146,63 @@ pub fn compute_tile_stats(proto: &pb::Tile) -> Vec<LayerStats> {
     }
     result.sort();
     result
+}
+
+/// Returns the size and statistics for each layer of the MLT tile `output` encoded from `input` (Java
+/// `computeMltTileStats`), in `input` layer order. Key and value counts come from `vtile` (0 without one).
+pub fn compute_mlt_tile_stats(
+    vtile: Option<&vector_tile::VectorTile>,
+    input: &crate::mlt::MapboxVectorTile,
+    output: &[u8],
+) -> anyhow::Result<Vec<LayerStats>> {
+    use crate::mlt::decoder::{consume_column, layer_blocks};
+    use crate::mlt::encoding::varint_size;
+    use crate::mlt::metadata::FeatureTable;
+
+    let mut encoded_layer_sizes: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut encoded_layer_attribute_sizes: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for block in layer_blocks(output) {
+        let (tag, body) = block?;
+        if tag == 1 {
+            let length = varint_size(tag) + body.len();
+            let mut offset = 0;
+            let (metadata, _) = FeatureTable::parse_embedded(body, &mut offset)?;
+            let tile = &body[offset..];
+            let mut tile_offset = 0;
+            let mut attr_bytes = 0;
+            for column in &metadata.columns {
+                attr_bytes += consume_column(column, tile, &mut tile_offset)?;
+            }
+            encoded_layer_sizes.insert(metadata.name.clone(), length as i64);
+            encoded_layer_attribute_sizes.insert(metadata.name, attr_bytes as i64);
+        }
+    }
+    Ok(input
+        .layers
+        .iter()
+        .map(|layer| LayerStats {
+            layer: layer.name.clone(),
+            layer_bytes: encoded_layer_sizes.get(&layer.name).copied().unwrap_or(-1),
+            layer_features: layer.features.len() as i64,
+            layer_geometries: layer.features.iter().map(|f| count_mlt_geometries(&f.geometry)).sum::<usize>() as i64,
+            layer_attr_bytes: encoded_layer_attribute_sizes.get(&layer.name).copied().unwrap_or(-1),
+            layer_attr_keys: vtile.and_then(|t| t.get_num_keys(&layer.name)).unwrap_or(0) as i64,
+            layer_attr_values: vtile.and_then(|t| t.get_num_values(&layer.name)).unwrap_or(0) as i64,
+        })
+        .collect())
+}
+
+/// Number of geometries in `geometry`, counting each part of a multi-geometry or collection (JTS
+/// `GeometryCollection`s).
+fn count_mlt_geometries(geometry: &geo_types::Geometry<f64>) -> usize {
+    use geo_types::Geometry;
+    match geometry {
+        Geometry::MultiPoint(g) => g.0.len(),
+        Geometry::MultiLineString(g) => g.0.len(),
+        Geometry::MultiPolygon(g) => g.0.len(),
+        Geometry::GeometryCollection(g) => g.0.iter().map(count_mlt_geometries).sum(),
+        _ => 1,
+    }
 }
 
 /// Quote a TSV field the way Jackson's CSV writer does when it contains special characters.
@@ -362,6 +417,134 @@ mod tests {
              3\t1\t2\t34\t999\tb\t19\t1\t1\t0\t0\t0",
             (header_row() + &formatted.join("")).trim()
         );
+    }
+
+    fn two_layer_tile() -> VectorTile {
+        let mut tile = VectorTile::new();
+        tile.add_layer_features("b", &[Feature::new("b", 1, encode_geometry(&new_point(0.0, 0.0)), Tags::default())])
+            .add_layer_features(
+                "a",
+                &[
+                    Feature::new(
+                        "a",
+                        1,
+                        encode_geometry(&new_point(0.0, 0.0)),
+                        tags! {"key1" => "value1", "key2" => 2},
+                    ),
+                    Feature::new(
+                        "a",
+                        2,
+                        encode_geometry(&new_point(1.0, 1.0)),
+                        tags! {"key1" => "value1", "key2" => 3},
+                    ),
+                ],
+            );
+        tile
+    }
+
+    #[test]
+    fn compute_stats_2_features_mlt() {
+        use crate::mlt::{ConversionConfig, TypeMismatchPolicy, convert_mvt, create_tileset_metadata};
+        let vector_tile = two_layer_tile();
+        let mlt_input = vector_tile.to_mlt_input(None);
+        let tileset_metadata = create_tileset_metadata(&mlt_input, TypeMismatchPolicy::Fail, &[], true).unwrap();
+        let config =
+            ConversionConfig { include_ids: true, use_fsst: false, use_fast_pfor: false, ..Default::default() };
+        let mlt = convert_mvt(&mlt_input, &tileset_metadata, &config).unwrap();
+        let stats = compute_mlt_tile_stats(Some(&vector_tile), &mlt_input, &mlt).unwrap();
+        assert_eq!(2, stats.len());
+        let entry1 = &stats[0];
+        assert_eq!("a", entry1.layer);
+        assert_eq!(2, entry1.layer_features);
+        assert_eq!(85, entry1.layer_bytes);
+        assert_eq!(41, entry1.layer_attr_bytes);
+        assert_eq!(2, entry1.layer_attr_keys);
+        assert_eq!(3, entry1.layer_attr_values);
+        let entry2 = &stats[1];
+        assert_eq!("b", entry2.layer);
+        assert_eq!(1, entry2.layer_features);
+
+        let formatted = new_thread_local_serializer().format_output_rows(TileCoord::of_xyz(1, 2, 3), 999, &stats);
+        assert_eq!(
+            "z\tx\ty\thilbert\tarchived_tile_bytes\tlayer\tlayer_bytes\tlayer_features\tlayer_geometries\tlayer_attr_bytes\tlayer_attr_keys\tlayer_attr_values\n\
+             3\t1\t2\t34\t999\ta\t85\t2\t2\t41\t2\t3\n\
+             3\t1\t2\t34\t999\tb\t25\t1\t1\t0\t0\t0",
+            (header_row() + &formatted.join("")).trim()
+        );
+    }
+
+    #[test]
+    fn issue1470_compute_mlt_fast_pfor_stats() {
+        let bytes = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/resources/fastpfor.mlt")).unwrap();
+        let mlt = crate::mlt::decoder::decode(&bytes).unwrap();
+        let stats = compute_mlt_tile_stats(None, &mlt, &bytes).unwrap();
+        assert_eq!(mlt.layers.len(), stats.len());
+        assert!(stats.iter().all(|s| s.layer_bytes > 0 && s.layer_attr_bytes >= 0));
+    }
+
+    #[test]
+    fn compute_stats_2_features_nested() {
+        use crate::mlt::{
+            ColumnMapping, ConversionConfig, FeatureTableOptimizations, TypeMismatchPolicy, convert_mvt,
+            create_tileset_metadata,
+        };
+        let mut vector_tile = VectorTile::new();
+        vector_tile.add_layer_features(
+            "a",
+            &[
+                Feature::new(
+                    "a",
+                    1,
+                    encode_geometry(&new_point(0.0, 0.0)),
+                    tags! {"key:1" => "value1", "key:2" => "value2"},
+                ),
+                Feature::new(
+                    "a",
+                    2,
+                    encode_geometry(&new_point(1.0, 1.0)),
+                    tags! {"key:1" => "value2", "key:2" => "value1"},
+                ),
+            ],
+        );
+        let mlt_input = vector_tile.to_mlt_input(None);
+        let mappings = vec![ColumnMapping::of_prefix("key", ":", true)];
+        let tileset_metadata = create_tileset_metadata(&mlt_input, TypeMismatchPolicy::Fail, &mappings, true).unwrap();
+        let config = ConversionConfig {
+            include_ids: true,
+            use_fsst: true,
+            use_fast_pfor: false,
+            optimizations: [(
+                "a".to_string(),
+                FeatureTableOptimizations {
+                    allow_sorting: false,
+                    allow_id_regeneration: false,
+                    column_mappings: mappings.clone(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let mlt = convert_mvt(&mlt_input, &tileset_metadata, &config).unwrap();
+        let stats = compute_mlt_tile_stats(Some(&vector_tile), &mlt_input, &mlt).unwrap();
+        assert_eq!(1, stats.len());
+        let entry1 = &stats[0];
+        assert_eq!("a", entry1.layer);
+        assert_eq!(2, entry1.layer_features);
+        assert_eq!(95, entry1.layer_bytes);
+        assert_eq!(50, entry1.layer_attr_bytes);
+        assert_eq!(2, entry1.layer_attr_keys);
+        assert_eq!(2, entry1.layer_attr_values);
+
+        let formatted = new_thread_local_serializer().format_output_rows(TileCoord::of_xyz(1, 2, 3), 999, &stats);
+        assert_eq!(
+            "z\tx\ty\thilbert\tarchived_tile_bytes\tlayer\tlayer_bytes\tlayer_features\tlayer_geometries\tlayer_attr_bytes\tlayer_attr_keys\tlayer_attr_values\n\
+             3\t1\t2\t34\t999\ta\t95\t2\t2\t50\t2\t2",
+            (header_row() + &formatted.join("")).trim()
+        );
+        // and it decodes back to the flat properties
+        let decoded = crate::mlt::decoder::decode(&mlt).unwrap();
+        assert_eq!(tags! {"key:1" => "value1", "key:2" => "value2"}, decoded.layers[0].features[0].properties);
     }
 
     #[test]

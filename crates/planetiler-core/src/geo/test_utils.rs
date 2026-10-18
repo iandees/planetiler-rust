@@ -207,14 +207,16 @@ fn validate_geometry_recursive(g: &Geometry<f64>) {
     }
 }
 
-/// Assert 2 lists contain the same elements in any order (compares the `Debug` representations).
+/// Assert 2 lists contain the same elements in any order (sorted by their `Debug` representations, then compared).
 #[track_caller]
-pub fn assert_lists_contain_same_elements<T: std::fmt::Debug>(expected: &[T], actual: &[T]) {
-    let mut e: Vec<String> = expected.iter().map(|x| format!("{x:?}")).collect();
-    let mut a: Vec<String> = actual.iter().map(|x| format!("{x:?}")).collect();
-    e.sort();
-    a.sort();
-    assert_eq!(e, a);
+pub fn assert_lists_contain_same_elements<T: std::fmt::Debug + PartialEq>(expected: &[T], actual: &[T]) {
+    // like Java: sort both by their string representation, then compare with equals
+    fn sorted<T: std::fmt::Debug>(items: &[T]) -> Vec<&T> {
+        let mut v: Vec<(String, &T)> = items.iter().map(|x| (format!("{x:?}"), x)).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v.into_iter().map(|(_, x)| x).collect()
+    }
+    assert_eq!(sorted(expected), sorted(actual));
 }
 
 /// Geometries rendered into each tile (Java's `Map<TileCoord, Collection<Geometry>>` in renderer tests).

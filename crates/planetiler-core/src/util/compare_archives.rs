@@ -22,6 +22,9 @@
 //! - feature IDs are part of the key unless `--ignore-ids`; differing features that match once the ID is dropped are
 //!   reported separately as "id only".
 //!
+//! MLT (MapLibre Tile) archives (`format=application/vnd.maplibre-tile` in the metadata) are decoded with
+//! [`crate::mlt::decoder`] and compared the same way (Java's `CompareArchives` only reads MVT).
+//!
 //! The result reports, per layer, how many features are only in archive 1 / only in archive 2, per zoom, plus a few
 //! examples. Tiles whose bytes differ but whose normalized contents are equal are counted in
 //! [`CompareResult::equivalent_tiles`].
@@ -41,6 +44,7 @@ use crate::archive::tile::Tile;
 use crate::archive::tile_archive_config::{Format, TileArchiveConfig};
 use crate::archive::tile_archives;
 use crate::archive::tile_compression::TileCompression;
+use crate::archive::tile_format::TileFormat;
 use crate::config::planetiler_config::PlanetilerConfig;
 use crate::geo::tile_coord::TileCoord;
 use crate::pmtiles::readable_pmtiles::ReadablePmtiles;
@@ -248,14 +252,149 @@ fn decompress(bytes: &[u8], compression: TileCompression) -> anyhow::Result<Vec<
     }
 }
 
-fn decode(decompressed: &[u8]) -> anyhow::Result<vt::Tile> {
-    Ok(vt::Tile::decode(decompressed)?)
+fn decode(decompressed: &[u8], format: TileFormat) -> anyhow::Result<vt::Tile> {
+    match format {
+        TileFormat::Mlt => Ok(mlt_to_proto(&crate::mlt::decoder::decode(decompressed)?)),
+        TileFormat::Mvt | TileFormat::Unknown => Ok(vt::Tile::decode(decompressed)?),
+    }
+}
+
+/// Converts a decoded MLT tile to the equivalent MVT protobuf so it can be compared like one (rings are written
+/// without their closing point, followed by `ClosePath`).
+fn mlt_to_proto(tile: &crate::mlt::MapboxVectorTile) -> vt::Tile {
+    use geo_types::{Geometry, LineString};
+
+    struct Commands {
+        out: Vec<u32>,
+        x: i64,
+        y: i64,
+    }
+    impl Commands {
+        fn command(&mut self, id: u32, count: usize) {
+            self.out.push(id | ((count as u32) << 3));
+        }
+        fn point(&mut self, x: f64, y: f64) {
+            let (x, y) = (x as i64, y as i64);
+            let zigzag = |d: i64| (((d as i32) << 1) ^ ((d as i32) >> 31)) as u32;
+            self.out.push(zigzag(x - self.x));
+            self.out.push(zigzag(y - self.y));
+            self.x = x;
+            self.y = y;
+        }
+        fn line(&mut self, line: &LineString<f64>, ring: bool) {
+            let coords = if ring && line.0.len() > 1 && line.0.first() == line.0.last() {
+                &line.0[..line.0.len() - 1]
+            } else {
+                &line.0[..]
+            };
+            let Some(first) = coords.first() else { return };
+            self.command(1, 1);
+            self.point(first.x, first.y);
+            if coords.len() > 1 {
+                self.command(2, coords.len() - 1);
+                for c in &coords[1..] {
+                    self.point(c.x, c.y);
+                }
+            }
+            if ring {
+                self.command(7, 1);
+            }
+        }
+    }
+
+    let layers = tile
+        .layers
+        .iter()
+        .map(|layer| {
+            let mut keys: indexmap::IndexSet<String> = indexmap::IndexSet::new();
+            let mut values: Vec<vt::tile::Value> = Vec::new();
+            let features = layer
+                .features
+                .iter()
+                .map(|f| {
+                    let mut tags = Vec::with_capacity(f.properties.len() * 2);
+                    for (k, v) in &f.properties {
+                        let mut value = vt::tile::Value::default();
+                        match v {
+                            crate::value::Value::String(s) => value.string_value = Some(s.to_string()),
+                            crate::value::Value::Int(i) => value.sint_value = Some(*i),
+                            crate::value::Value::Float(x) => value.float_value = Some(*x),
+                            crate::value::Value::Double(x) => value.double_value = Some(*x),
+                            crate::value::Value::Bool(b) => value.bool_value = Some(*b),
+                            other => value.string_value = Some(other.to_string()),
+                        }
+                        tags.push(keys.insert_full(k.clone()).0 as u32);
+                        let index = values.iter().position(|v| *v == value).unwrap_or_else(|| {
+                            values.push(value);
+                            values.len() - 1
+                        });
+                        tags.push(index as u32);
+                    }
+                    let mut c = Commands { out: Vec::new(), x: 0, y: 0 };
+                    let geom_type = match &f.geometry {
+                        Geometry::Point(p) => {
+                            c.command(1, 1);
+                            c.point(p.x(), p.y());
+                            vt::tile::GeomType::Point
+                        }
+                        Geometry::MultiPoint(mp) => {
+                            c.command(1, mp.0.len());
+                            for p in &mp.0 {
+                                c.point(p.x(), p.y());
+                            }
+                            vt::tile::GeomType::Point
+                        }
+                        Geometry::LineString(l) => {
+                            c.line(l, false);
+                            vt::tile::GeomType::Linestring
+                        }
+                        Geometry::MultiLineString(ml) => {
+                            for l in &ml.0 {
+                                c.line(l, false);
+                            }
+                            vt::tile::GeomType::Linestring
+                        }
+                        Geometry::Polygon(p) => {
+                            for r in std::iter::once(p.exterior()).chain(p.interiors()) {
+                                c.line(r, true);
+                            }
+                            vt::tile::GeomType::Polygon
+                        }
+                        Geometry::MultiPolygon(mp) => {
+                            for p in &mp.0 {
+                                for r in std::iter::once(p.exterior()).chain(p.interiors()) {
+                                    c.line(r, true);
+                                }
+                            }
+                            vt::tile::GeomType::Polygon
+                        }
+                        _ => vt::tile::GeomType::Unknown,
+                    };
+                    vt::tile::Feature {
+                        id: f.id.map(|id| id as u64),
+                        tags,
+                        r#type: Some(geom_type as i32),
+                        geometry: c.out,
+                    }
+                })
+                .collect();
+            vt::tile::Layer {
+                version: 2,
+                name: layer.name.clone(),
+                features,
+                keys: keys.into_iter().collect(),
+                values,
+                extent: Some(layer.extent),
+            }
+        })
+        .collect();
+    vt::Tile { layers }
 }
 
 impl CompareArchives<'_> {
     fn get_result(&self, config: &PlanetilerConfig) -> anyhow::Result<CompareResult> {
         self.compare_archive("format", &self.input1.format, &self.input2.format);
-        let (compression1, compression2) = {
+        let (compression1, compression2, format1, format2) = {
             let reader1 = tile_archives::new_reader(self.input1, config)?;
             let reader2 = tile_archives::new_reader(self.input2, config)?;
             let metadata1 = reader1.metadata()?;
@@ -266,12 +405,14 @@ impl CompareArchives<'_> {
                 let header2 = ReadablePmtiles::new_read_from_file(&self.local_path(self.input2)?)?.header().clone();
                 self.compare_archive("pmtiles header", &header1, &header2);
             }
+            let f1 = metadata1.as_ref().and_then(|m| m.format).unwrap_or(TileFormat::Mvt);
+            let f2 = metadata2.as_ref().and_then(|m| m.format).unwrap_or(TileFormat::Mvt);
             let c1 = metadata1.and_then(|m| m.tile_compression).unwrap_or(TileCompression::Unknown);
             let c2 = metadata2.and_then(|m| m.tile_compression).unwrap_or(TileCompression::Unknown);
             if !self.compare_archive("tile compression", &c1, &c2) {
                 warn!("Will compare decompressed tile contents instead");
             }
-            (c1, c2)
+            (c1, c2, f1, f2)
         };
 
         let order = self.input1.format.preferred_order();
@@ -353,8 +494,8 @@ impl CompareArchives<'_> {
                                             }
                                             (
                                                 "different contents",
-                                                decode(&decompress(&a.bytes, compression1)?)?,
-                                                decode(&decompress(&b.bytes, compression2)?)?,
+                                                decode(&decompress(&a.bytes, compression1)?, format1)?,
+                                                decode(&decompress(&b.bytes, compression2)?, format2)?,
                                             )
                                         } else {
                                             let decompressed1 = decompress(&a.bytes, compression1)?;
@@ -364,8 +505,8 @@ impl CompareArchives<'_> {
                                             }
                                             (
                                                 "different decompressed contents",
-                                                decode(&decompressed1)?,
-                                                decode(&decompressed2)?,
+                                                decode(&decompressed1, format1)?,
+                                                decode(&decompressed2, format2)?,
                                             )
                                         };
                                         let issues = compare_tiles(&tile1, &tile2, self.options.ignore_ids);
@@ -916,6 +1057,50 @@ mod tests {
     use crate::geo::tile_order::TileOrder;
     use crate::pmtiles::writeable_pmtiles::WriteablePmtiles;
     use crate::util::gzip::gzip_zlib as gzip;
+
+    #[test]
+    fn mlt_tiles_compare_like_their_mvt() {
+        use crate::value::Value;
+        use crate::vector_tile::{Feature, VectorTile, encode_geometry};
+        use geo_types::{Geometry, LineString, Point, Polygon};
+        let square = |x: f64, s: f64| LineString::from(vec![(x, x), (x + s, x), (x + s, x + s), (x, x + s), (x, x)]);
+        let mut tile = VectorTile::new();
+        let mut tags = crate::value::Tags::default();
+        tags.insert("name".into(), Value::str("a"));
+        tags.insert("rank".into(), Value::Int(3));
+        tags.insert("height".into(), Value::Double(2.5));
+        tile.add_layer_features(
+            "layer",
+            &[
+                Feature::new("layer", 1, encode_geometry(&Geometry::Point(Point::new(1.0, 2.0))), tags.clone()),
+                Feature::new(
+                    "layer",
+                    2,
+                    encode_geometry(&Geometry::Polygon(Polygon::new(square(10.0, 50.0), vec![square(20.0, 5.0)]))),
+                    tags.clone(),
+                ),
+                Feature::new(
+                    "layer",
+                    3,
+                    encode_geometry(&Geometry::LineString(LineString::from(vec![(0.0, 0.0), (5.0, 9.0)]))),
+                    crate::value::Tags::default(),
+                ),
+            ],
+        );
+        let mvt = tile.to_proto(true);
+        let mlt = tile.encode_mlt(true, &crate::mlt::MltOptions::default()).unwrap();
+        let converted = decode(&mlt, TileFormat::Mlt).unwrap();
+        assert!(compare_tiles(&mvt, &converted, false).is_empty());
+        // a different attribute shows up as a difference
+        let mut other = VectorTile::new();
+        tags.insert("rank".into(), Value::Int(4));
+        other.add_layer_features(
+            "layer",
+            &[Feature::new("layer", 1, encode_geometry(&Geometry::Point(Point::new(1.0, 2.0))), tags)],
+        );
+        let other_mlt = other.encode_mlt(true, &crate::mlt::MltOptions::default()).unwrap();
+        assert!(!compare_tiles(&mvt, &decode(&other_mlt, TileFormat::Mlt).unwrap(), false).is_empty());
+    }
 
     fn metadata(compression: TileCompression) -> TileArchiveMetadata {
         let bounds = *crate::geo::geo_utils::WORLD_LAT_LON_BOUNDS;

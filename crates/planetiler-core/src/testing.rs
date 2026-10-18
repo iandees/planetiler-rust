@@ -36,6 +36,7 @@ use crate::archive::readable_tile_archive::ReadableTileArchive;
 use crate::archive::tile_archive_metadata::TileArchiveMetadata;
 use crate::archive::tile_archive_writer;
 use crate::archive::tile_compression::TileCompression;
+use crate::archive::tile_format::TileFormat;
 use crate::collection::feature_group::FeatureGroup;
 use crate::collection::long_long_map;
 use crate::config::arguments::Arguments;
@@ -378,10 +379,23 @@ pub fn get_tile_map(db: &dyn ReadableTileArchive) -> anyhow::Result<BTreeMap<Til
     get_tile_map_with_compression(db, TileCompression::Gzip)
 }
 
-/// Decodes every tile in `db` compressed with `compression`.
+/// Decodes every tile in `db` compressed with `compression`, in the tile format from the archive metadata (MVT if
+/// there is none).
 pub fn get_tile_map_with_compression(
     db: &dyn ReadableTileArchive,
     compression: TileCompression,
+) -> anyhow::Result<BTreeMap<TileCoord, Vec<ComparableFeature>>> {
+    let format = db.metadata()?.and_then(|m| m.format).unwrap_or(TileFormat::Mvt);
+    get_tile_map_with_format(db, compression, format)
+}
+
+/// Decodes every tile in `db` compressed with `compression` and encoded as `format` (Java
+/// `TestUtils.getTileMap(db, tileCompression, tileFormat)`). MLT geometries are scaled from the layer extent to
+/// 0-256 like MVT ones.
+pub fn get_tile_map_with_format(
+    db: &dyn ReadableTileArchive,
+    compression: TileCompression,
+    format: TileFormat,
 ) -> anyhow::Result<BTreeMap<TileCoord, Vec<ComparableFeature>>> {
     let mut tiles = BTreeMap::new();
     for tile in db.get_all_tiles()? {
@@ -391,17 +405,36 @@ pub fn get_tile_map_with_compression(
             TileCompression::None => tile.bytes,
             TileCompression::Unknown => anyhow::bail!("cannot decompress \"UNKNOWN\""),
         };
-        let decoded = vector_tile::decode(&bytes)?
-            .into_iter()
-            .map(|f| {
-                ComparableFeature::new(
-                    GeometryComparison::Norm(test_utils::decode_silently(&f.geometry)),
-                    Some(f.layer),
-                    f.tags,
-                    Some(f.id),
-                )
-            })
-            .collect();
+        let decoded = match format {
+            TileFormat::Mlt => {
+                use geo::MapCoords;
+                let mut features = Vec::new();
+                for layer in crate::mlt::decoder::decode(&bytes)?.layers {
+                    let scale = 256.0 / layer.extent as f64;
+                    for f in layer.features {
+                        let geometry = f.geometry.map_coords(|c| geo_types::Coord { x: c.x * scale, y: c.y * scale });
+                        features.push(ComparableFeature::new(
+                            GeometryComparison::Norm(geometry),
+                            Some(layer.name.clone()),
+                            f.properties,
+                            f.id,
+                        ));
+                    }
+                }
+                features
+            }
+            TileFormat::Mvt | TileFormat::Unknown => vector_tile::decode(&bytes)?
+                .into_iter()
+                .map(|f| {
+                    ComparableFeature::new(
+                        GeometryComparison::Norm(test_utils::decode_silently(&f.geometry)),
+                        Some(f.layer),
+                        f.tags,
+                        Some(f.id),
+                    )
+                })
+                .collect(),
+        };
         tiles.insert(tile.coord, decoded);
     }
     Ok(tiles)

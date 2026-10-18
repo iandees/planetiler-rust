@@ -771,11 +771,66 @@ impl VectorTile {
         self.layers.is_empty()
     }
 
-    /// Converts this tile to the input of the MapLibre Tile (MLT) encoder.
-    // TODO(port): Java delegates to `org.maplibre.mlt` (`toMltInput` -> `MapboxVectorTile`, then
-    // `MltConverter.convertMvt`). MLT encoding is not ported yet.
-    pub fn encode_mlt(&self) -> anyhow::Result<Vec<u8>> {
-        anyhow::bail!("MLT (MapLibre Tile) output format is not supported yet in the Rust port")
+    /// Converts this tile to the input of the MapLibre Tile (MLT) encoder (Java `toMltInput`): the non-empty layers
+    /// with their features decoded to tile extent coordinates. Features whose geometry fails to decode are dropped
+    /// and logged to `stats` as `mlt_feature_*` data errors.
+    ///
+    /// Attribute values that MVT encodes as strings (lists, maps, bytes) become strings here too (Java's MLT encoder
+    /// would reject them).
+    pub fn to_mlt_input(&self, stats: Option<&dyn crate::stats::stats::Stats>) -> crate::mlt::MapboxVectorTile {
+        let layers = self
+            .non_empty_layers()
+            .map(|(name, layer)| {
+                let features = layer
+                    .encoded_features
+                    .iter()
+                    .filter_map(|feature| {
+                        let tags = layer.tags_of(feature);
+                        let mut properties = crate::value::tags_with_capacity(tags.len() / 2);
+                        for pair in tags.as_chunks::<2>().0 {
+                            let value = &layer.values[pair[1] as usize];
+                            let value = match value {
+                                Value::List(_) | Value::Map(_) | Value::Bytes(_) => Value::str(value.to_string()),
+                                other => other.clone(),
+                            };
+                            properties.insert(layer.keys[pair[0] as usize].clone(), value);
+                        }
+                        match feature.geometry.decode_to_extent() {
+                            Ok(geometry) => Some(crate::mlt::Feature { id: Some(feature.id), geometry, properties }),
+                            Err(e) => {
+                                let message = format!("Error converting to MLT {properties:?}");
+                                match stats {
+                                    Some(stats) => e.log_with_stats(stats, "mlt_feature", &message),
+                                    None => e.log(&message),
+                                }
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+                crate::mlt::Layer { name: name.clone(), features, extent: EXTENT as u32 }
+            })
+            .collect();
+        crate::mlt::MapboxVectorTile { layers }
+    }
+
+    /// Encodes this tile as a MapLibre Tile the way Java `TileArchiveWriter` does with `--tile-format=mlt`.
+    pub fn encode_mlt(&self, include_ids: bool, options: &crate::mlt::MltOptions) -> anyhow::Result<Vec<u8>> {
+        crate::mlt::encode_tile(&self.to_mlt_input(None), include_ids, options)
+    }
+
+    /// Like [`VectorTile::encode_mlt`], but also returns the per-layer stats of the encoded tile (Java
+    /// `TileSizeStats.computeMltTileStats`).
+    pub fn encode_mlt_with_layer_stats(
+        &self,
+        include_ids: bool,
+        options: &crate::mlt::MltOptions,
+        stats: Option<&dyn crate::stats::stats::Stats>,
+    ) -> anyhow::Result<(Vec<u8>, Vec<LayerStats>)> {
+        let input = self.to_mlt_input(stats);
+        let encoded = crate::mlt::encode_tile(&input, include_ids, options)?;
+        let layer_stats = crate::util::tile_size_stats::compute_mlt_tile_stats(Some(self), &input, &encoded)?;
+        Ok((encoded, layer_stats))
     }
 
     /// Number of distinct keys in `layer`, or `None` if the layer does not exist.
@@ -2479,7 +2534,11 @@ mod tests {
         assert_eq!(None, tile.get_num_keys("other"));
         // ids excluded
         assert!(tile.to_proto(false).layers.iter().all(|l| l.features.iter().all(|f| f.id.is_none())));
-        assert!(tile.encode_mlt().is_err());
+        let mlt = tile.encode_mlt(true, &crate::mlt::MltOptions::default()).unwrap();
+        let decoded = crate::mlt::decoder::decode(&mlt).unwrap();
+        assert_eq!(vec!["poi", "water"], decoded.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>());
+        assert_eq!(Some(2), decoded.layers[0].features[0].id);
+        assert_eq!(tags! {"a" => 1, "b" => 1}, decoded.layers[0].features[0].properties);
     }
 
     #[test]
