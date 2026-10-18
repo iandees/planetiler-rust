@@ -189,7 +189,8 @@ impl<R: Read> JsonParser<R> {
         (self.token_line, self.token_column)
     }
 
-    /// Name of the current field, when the current token is a field name.
+    /// The current token.
+    #[cfg(test)]
     pub(crate) fn current_token(&self) -> Option<&Token> {
         self.current.as_ref()
     }
@@ -264,19 +265,10 @@ impl<R: Read> JsonParser<R> {
     fn read_token(&mut self) -> Result<Option<Token>> {
         let mut b = self.skip_whitespace()?;
         // separators
-        match self.stack.last().copied() {
-            Some(Context::ObjectValue) => {
-                if b != Some(b':') {
-                    // value after field name must be preceded by ':', checked when reading the field name
-                }
-            }
-            Some(Context::ObjectKey) | Some(Context::Array) => {
-                if b == Some(b',') {
-                    self.next_byte()?;
-                    b = self.skip_whitespace()?;
-                }
-            }
-            None => {}
+        // (the ':' after a field name is consumed when reading the field name)
+        if matches!(self.stack.last(), Some(Context::ObjectKey | Context::Array)) && b == Some(b',') {
+            self.next_byte()?;
+            b = self.skip_whitespace()?;
         }
         self.token_line = self.line;
         self.token_column = self.column;
@@ -621,10 +613,10 @@ impl<R: Read> GeoJsonFeatureIterator<R> {
     }
 
     fn consume_properties(&mut self) -> Result<()> {
-        if self.consume(|t| *t == Token::StartObject, "START_OBJECT")? {
-            if let Json::Object(entries) = self.parser.read_value()? {
-                self.properties = Some(into_tags(entries));
-            }
+        if self.consume(|t| *t == Token::StartObject, "START_OBJECT")?
+            && let Json::Object(entries) = self.parser.read_value()?
+        {
+            self.properties = Some(into_tags(entries));
         }
         Ok(())
     }

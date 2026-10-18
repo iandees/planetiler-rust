@@ -521,7 +521,7 @@ fn read_dbf_header(input: &Input, charset: Charset) -> Result<DbfHeader> {
         reader.read_exact(&mut rest).context("reading dbf field descriptors")?;
         let mut fields = vec![];
         let mut offset = 1; // deletion flag
-        for descriptor in rest.chunks_exact(32) {
+        for descriptor in rest.as_chunks::<32>().0 {
             if descriptor[0] == 0x0D {
                 break;
             }
@@ -577,10 +577,11 @@ fn decode_dbf_value(field: &DbfField, bytes: &[u8], charset: Charset) -> Value {
                 return Value::Null;
             }
             let Ok(s) = std::str::from_utf8(trimmed) else { return Value::Null };
-            if field.kind == b'N' && field.decimals == 0 {
-                if let Ok(i) = s.parse::<i64>() {
-                    return Value::Int(i);
-                }
+            if field.kind == b'N'
+                && field.decimals == 0
+                && let Ok(i) = s.parse::<i64>()
+            {
+                return Value::Int(i);
             }
             s.parse::<f64>().map_or(Value::Null, Value::Double)
         }
@@ -642,7 +643,7 @@ impl Cursor<'_> {
         let bytes = self.data.get(self.pos..self.pos + n * 16).ok_or_else(|| anyhow!("truncated shapefile record"))?;
         self.pos += n * 16;
         let mut result = Vec::with_capacity(n);
-        for chunk in bytes.chunks_exact(16) {
+        for chunk in bytes.as_chunks::<16>().0 {
             let x = f64::from_le_bytes(chunk[0..8].try_into().unwrap());
             let y = f64::from_le_bytes(chunk[8..16].try_into().unwrap());
             result.push(Coord { x, y });
