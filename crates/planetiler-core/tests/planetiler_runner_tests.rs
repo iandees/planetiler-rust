@@ -57,10 +57,10 @@ fn read_tiles(
     (tiles, metadata)
 }
 
-/// `testPlanetilerRunner` with only the OSM source.
+/// `testPlanetilerRunner`.
 ///
-/// TODO(port): add the natural earth, shapefile, geopackage and geojson sources once the simple readers are wired
-/// into the runner, and the csv/tsv/json/proto output formats once an in-memory stream archive reader is ported.
+/// TODO(port): the csv/tsv/json/proto output format variants need an in-memory stream archive reader (Java
+/// `InMemoryStreamArchive`); MLT variants need MLT encoding.
 fn run_osm(args: &str) {
     let temp = tempfile::tempdir().unwrap();
     let temp_dir = temp.path();
@@ -86,6 +86,14 @@ fn run_osm(args: &str) {
     planetiler
         .set_profile(BuildingsAndPlaces)
         .add_osm_source("osm", &temp_osm)
+        .unwrap()
+        .add_natural_earth_source("ne", resource("natural_earth_vector.sqlite.zip"), None)
+        .unwrap()
+        .add_shapefile_source("shapefile", resource("shapefile.zip"))
+        .unwrap()
+        .add_geopackage_source(None, "geopackage", resource("geopackage.gpkg.zip"), None)
+        .unwrap()
+        .add_geojson_source("geojson", resource("featurecollection.geojson"), None)
         .unwrap()
         .set_output(&output_uri)
         .unwrap();
@@ -254,8 +262,7 @@ impl Profile for HugeEstimates {
     }
 }
 
-/// `runWithProfile` (TODO(port): also add the natural earth, shapefile and geopackage sources like Java once the
-/// simple readers are wired into the runner).
+/// `runWithProfile`.
 fn run_with_profile(temp_dir: &Path, profile: HugeEstimates, force: bool) -> anyhow::Result<()> {
     let mut planetiler = Planetiler::create(Arguments::of_pairs([
         ("tmpdir", temp_dir.display().to_string()),
@@ -264,6 +271,9 @@ fn run_with_profile(temp_dir: &Path, profile: HugeEstimates, force: bool) -> any
     planetiler
         .set_profile(profile)
         .add_osm_source("osm", resource("monaco-latest.osm.pbf"))?
+        .add_natural_earth_source("ne", resource("natural_earth_vector.sqlite.zip"), None)?
+        .add_shapefile_source("shapefile", resource("shapefile.zip"))?
+        .add_geopackage_source(None, "geopackage", resource("geopackage.gpkg.zip"), None)?
         .set_output(temp_dir.join("output.mbtiles"))?;
     planetiler.run()
 }
@@ -295,4 +305,236 @@ fn test_output_exists_without_force_fails() {
     planetiler.set_output(&output).unwrap();
     let err = planetiler.run().unwrap_err().to_string();
     assert!(err.contains("already exists"), "{err}");
+}
+
+/// A profile built from a closure.
+struct FnProfile<F: Fn(&dyn SourceFeature, &mut FeatureCollector<'_>) + Send + Sync>(F);
+
+impl<F: Fn(&dyn SourceFeature, &mut FeatureCollector<'_>) + Send + Sync> Profile for FnProfile<F> {
+    fn process_feature(&self, source: &dyn SourceFeature, features: &mut FeatureCollector<'_>) {
+        (self.0)(source, features)
+    }
+}
+
+fn mbtiles_tiles(path: &Path) -> BTreeMap<TileCoord, Vec<ComparableFeature>> {
+    let db = Mbtiles::new_read_only_database(path).unwrap();
+    get_tile_map_with_compression(&db, TileCompression::Gzip).unwrap()
+}
+
+fn tmpdir_arg(dir: &Path) -> String {
+    format!("--tmpdir={}", dir.join("data").display())
+}
+
+fn str_attr(feature: &ComparableFeature, key: &str) -> String {
+    feature.attrs.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+}
+
+#[test]
+fn test_planetiler_runner_shapefile() {
+    let temp = tempfile::tempdir().unwrap();
+    let mbtiles = temp.path().join("output.mbtiles");
+    let resource_dir = resource("");
+    let mut planetiler = Planetiler::create(Arguments::from_args(&[tmpdir_arg(temp.path())])).unwrap();
+    planetiler
+        .set_profile(FnProfile(|source, features| {
+            features
+                .point("stations")
+                .set_zoom_range(0, 14)
+                .set_attr("source", source.source().map(|s| s.to_string()).unwrap_or_default())
+                .set_attr("layer", source.source_layer().map(|s| s.to_string()).unwrap_or_default());
+        }))
+        // Match *.shp within [shapefile.zip, shapefile-copy.zip]
+        .add_shapefile_glob_source(None, "shapefile-glob", &resource_dir, "shape*.zip", None)
+        .unwrap()
+        // Match *.shp within shapefile.zip
+        .add_shapefile_glob_source(None, "shapefile-glob-zip", resource_dir.join("shapefile.zip"), "*.shp", None)
+        .unwrap()
+        .add_shapefile_source("shapefile", resource_dir.join("shapefile.zip"))
+        .unwrap()
+        .set_output(&mbtiles)
+        .unwrap();
+    planetiler.run().unwrap();
+
+    let (mut file_count, mut glob_count, mut glob_zip_count) = (0, 0, 0);
+    for tile in mbtiles_tiles(&mbtiles).values() {
+        for feature in tile {
+            assert_eq!("stations", str_attr(feature, "layer"));
+            match str_attr(feature, "source").as_str() {
+                "shapefile" => file_count += 1,
+                "shapefile-glob" => glob_count += 1,
+                "shapefile-glob-zip" => glob_zip_count += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(file_count > 0);
+    assert_eq!(file_count, glob_zip_count);
+    assert_eq!(2 * file_count, glob_count);
+}
+
+fn run_geopackage(args: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let mbtiles = temp.path().join("output.mbtiles");
+    let input_file = Arguments::from_args(&split_args(args)).get_string("input-file", "", "geopackage.gpkg.zip");
+    let mut all_args = split_args(args);
+    all_args.push(tmpdir_arg(temp.path()));
+    let mut planetiler = Planetiler::create(Arguments::from_args(&all_args)).unwrap();
+    planetiler
+        .set_profile(FnProfile(|source, features| {
+            let name = source.get_string("name");
+            features.point("stations").set_zoom_range(0, 14).set_attr("name", name);
+        }))
+        .add_geopackage_source(None, "geopackage", resource(&input_file), None)
+        .unwrap()
+        .set_output(&mbtiles)
+        .unwrap();
+    planetiler.run().unwrap();
+
+    let mut names = std::collections::HashSet::new();
+    let mut count = 0;
+    for tile in mbtiles_tiles(&mbtiles).values() {
+        for feature in tile {
+            count += 1;
+            names.insert(str_attr(feature, "name"));
+        }
+    }
+    assert!(count > 0);
+    assert_eq!(86, names.len());
+    assert!(names.contains("Van Dörn Street"));
+}
+
+#[test]
+fn test_planetiler_runner_geopackage() {
+    run_geopackage("");
+}
+
+#[test]
+fn test_planetiler_runner_geopackage_threads() {
+    run_geopackage("--write-threads=2 --process-threads=2 --feature-read-threads=2 --threads=4");
+}
+
+#[test]
+fn test_planetiler_runner_geopackage_unzipped() {
+    run_geopackage("--input-file=geopackage.gpkg");
+}
+
+fn buildings_profile() -> impl Profile {
+    FnProfile(|source, features| {
+        let id = source.get_string("id");
+        features.polygon("buildings").set_zoom_range(0, 14).set_min_pixel_size(0.0).set_attr("id", id);
+    })
+}
+
+fn check_boston(mbtiles: &Path) {
+    let tiles = mbtiles_tiles(mbtiles);
+    for z in (11..=14).rev() {
+        let coord = TileCoord::around_lng_lat(-71.07448, 42.35626, z);
+        assert!(tiles.contains_key(&coord), "contain {coord:?}");
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut count = 0;
+    for tile in tiles.values() {
+        for feature in tile {
+            count += 1;
+            ids.insert(str_attr(feature, "id"));
+        }
+    }
+    assert!(count > 0);
+    assert_eq!(3, ids.len());
+}
+
+fn run_parquet(args: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let mbtiles = temp.path().join("output.mbtiles");
+    let mut all_args = split_args(args);
+    all_args.push(tmpdir_arg(temp.path()));
+    let mut planetiler = Planetiler::create(Arguments::from_args(&all_args)).unwrap();
+    planetiler
+        .set_profile(buildings_profile())
+        .add_parquet_source("parquet", vec![resource("parquet").join("boston.parquet")], false, None, None)
+        .unwrap()
+        .set_output(&mbtiles)
+        .unwrap();
+    planetiler.run().unwrap();
+    check_boston(&mbtiles);
+}
+
+#[test]
+fn test_planetiler_runner_parquet() {
+    run_parquet("");
+}
+
+#[test]
+fn test_planetiler_runner_parquet_threads() {
+    run_parquet("--write-threads=2 --process-threads=2 --feature-read-threads=2 --threads=4");
+}
+
+#[test]
+fn test_planetiler_runner_overture_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let mbtiles = temp.path().join("output.mbtiles");
+    let overture_dir = temp.path().join("overture-buildings");
+    let dest = overture_dir.join("theme=buildings").join("type=building").join("part-00000.parquet");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::copy(resource("parquet").join("boston.parquet"), &dest).unwrap();
+    let mut planetiler = Planetiler::create(Arguments::from_args(&[
+        tmpdir_arg(temp.path()),
+        format!("overture-buildings_path={}", overture_dir.display()),
+    ]))
+    .unwrap();
+    planetiler
+        .set_profile(buildings_profile())
+        .add_overture_source("overture-buildings", "buildings", "building", &overture_dir)
+        .unwrap()
+        .set_output(&mbtiles)
+        .unwrap();
+    planetiler.run().unwrap();
+    assert!(mbtiles_tiles(&mbtiles).values().map(Vec::len).sum::<usize>() > 0);
+}
+
+fn source_points_profile() -> impl Profile {
+    FnProfile(|source, features| {
+        features
+            .point("points")
+            .set_zoom_range(0, 14)
+            .set_attr("source", source.source().map(|s| s.to_string()).unwrap_or_default());
+    })
+}
+
+#[test]
+fn test_reuse_feature_db() {
+    let temp = tempfile::tempdir().unwrap();
+    let mbtiles = temp.path().join("output.mbtiles");
+    let mbtiles2 = temp.path().join("output2.mbtiles");
+    let tmp_data = temp.path().join("data");
+    let tmpdir = format!("--tmpdir={}", tmp_data.display());
+
+    // first run: build feature DB and tiles
+    let mut planetiler =
+        Planetiler::create(Arguments::from_args(&[tmpdir.clone(), "--reuse_featuredb=true".into()])).unwrap();
+    planetiler
+        .set_profile(source_points_profile())
+        .add_geojson_source("geojson", resource("featurecollection.geojson"), None)
+        .unwrap()
+        .set_output(&mbtiles)
+        .unwrap();
+    planetiler.run().unwrap();
+
+    // second run: reuse feature DB, write to a different output
+    let missing_source = tmp_data.join("missing.geojson");
+    let mut planetiler =
+        Planetiler::create(Arguments::from_args(&[tmpdir, "--reuse_featuredb=true".into(), "--force=true".into()]))
+            .unwrap();
+    planetiler
+        .set_profile(source_points_profile())
+        .add_geojson_source("geojson", &missing_source, None)
+        .unwrap()
+        .set_output(&mbtiles2)
+        .unwrap();
+    planetiler.run().unwrap();
+
+    let tiles1 = mbtiles_tiles(&mbtiles);
+    assert!(!tiles1.is_empty());
+    assert_eq!(tiles1, mbtiles_tiles(&mbtiles2));
+    assert_eq!(std::fs::read(&mbtiles).unwrap(), std::fs::read(&mbtiles2).unwrap());
 }

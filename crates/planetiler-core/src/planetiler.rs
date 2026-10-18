@@ -54,6 +54,8 @@ use crate::profile::Profile;
 use crate::reader::osm::osm_input_file::OsmInputFile;
 use crate::reader::osm::osm_node_bounds_provider::OsmNodeBoundsProvider;
 use crate::reader::osm::osm_reader::OsmReader;
+use crate::reader::parquet::parquet_input_file::IdGenerator;
+use crate::reader::parquet::parquet_reader::{LayerGenerator, ParquetReader};
 use crate::stats::process_info;
 use crate::stats::stats::StatsRef;
 use crate::stats::timers::Finishable;
@@ -61,12 +63,13 @@ use crate::util::build_info::BuildInfo;
 use crate::util::downloader::Downloader;
 use crate::util::file_utils::{self, DiskBacked};
 use crate::util::format;
+use crate::util::overture_stac::OvertureStac;
 use crate::util::resource_usage::ResourceUsage;
 use crate::util::translations::{TranslationProvider, Translations};
 use crate::util::wikidata::{self, WikidataTranslations};
 use crate::util::{ansi_colors, tile_size_stats, top_osm_tiles};
 use crate::validator::java_profile_validator;
-use crate::value::Tags;
+use crate::value::{Tags, Value};
 
 /// The most common OSM languages.
 pub const DEFAULT_LANGUAGES: &[&str] =
@@ -437,6 +440,109 @@ impl Planetiler {
             let unzip_dir = if keep_unzipped { unzipped_sibling(&path) } else { ctx.tmp_dir.to_path_buf() };
             simple_sources::process_natural_earth(&path, &unzip_dir, keep_unzipped, ctx)
         })
+    }
+
+    /// Adds a new [geoparquet](https://github.com/opengeospatial/geoparquet) source that will be processed when
+    /// [`Planetiler::run`] is called.
+    ///
+    /// - `hive_partitioning`: parse extra feature tags from the file path, for example `{theme="buildings",
+    ///   type="part"}` from `base/theme=buildings/type=part/file.parquet`
+    /// - `get_id`: extracts a unique vector tile feature ID from each input feature (strings/binary are hashed)
+    /// - `get_layer`: extracts the source layer from the properties of each input feature
+    pub fn add_parquet_source(
+        &mut self,
+        name: &str,
+        paths: Vec<PathBuf>,
+        hive_partitioning: bool,
+        get_id: Option<IdGenerator>,
+        get_layer: Option<LayerGenerator>,
+    ) -> anyhow::Result<&mut Self> {
+        let resolved = paths.clone();
+        self.add_parquet_source_lazy(name, paths, move || Ok(resolved), hive_partitioning, get_id, get_layer)
+    }
+
+    fn add_parquet_source_lazy(
+        &mut self,
+        name: &str,
+        base: Vec<PathBuf>,
+        paths: impl FnOnce() -> anyhow::Result<Vec<PathBuf>> + 'static,
+        hive_partitioning: bool,
+        get_id: Option<IdGenerator>,
+        get_layer: Option<LayerGenerator>,
+    ) -> anyhow::Result<&mut Self> {
+        let free_after_reading = self.arguments.get_boolean(
+            &format!("free_{name}_after_read"),
+            &format!("delete {name} input file after reading to make space for output (reduces peak disk usage)"),
+            false,
+        );
+        let prefix = common_parent_prefix(&base);
+        for path in base {
+            self.input_paths.push(InputPath { id: name.to_string(), path, free_after_reading });
+        }
+        let source_name = name.to_string();
+        self.add_source_stage(name, &format!("Process features in {prefix}"), move |ctx| {
+            let paths = paths()?;
+            ParquetReader::with_options(&source_name, ctx.stats.clone(), get_id, get_layer, hive_partitioning).process(
+                &paths,
+                ctx.feature_group,
+                ctx.config,
+                ctx.profile,
+            )
+        })
+    }
+
+    /// Adds a new [Overture Maps](https://overturemaps.org/) source that reads from a mirror of overture data on disk
+    /// under `root_path/theme=<theme>/type=<type>/*.parquet` (override with `<name>_path`), downloading the files
+    /// from the STAC catalog first when `--download` or `--refresh_<name>` is set.
+    pub fn add_overture_source(
+        &mut self,
+        name: &str,
+        theme: &str,
+        type_: &str,
+        root_path: impl Into<PathBuf>,
+    ) -> anyhow::Result<&mut Self> {
+        let download_dir =
+            self.arguments.file(&format!("{name}_path"), &format!("{name} overture download directory"), root_path);
+        let refresh = self.arguments.get_boolean(
+            &format!("refresh_{name}"),
+            &format!("Download new version of {name} if changed"),
+            self.refresh_sources,
+        );
+        let type_dir = download_dir.join(format!("theme={theme}")).join(format!("type={type_}"));
+        if self.download_sources || refresh {
+            // Kick off catalog traversal in the background; download() will wait for the result before running.
+            file_utils::create_directory(&type_dir)?;
+            let stac = OvertureStac::create(&self.config);
+            let (theme, type_, dir, bounds) =
+                (theme.to_string(), type_.to_string(), type_dir.clone(), self.config.bounds.clone());
+            self.add_lazy_download(name, move || {
+                let urls = stac.get_parquet_urls(&theme, &type_, &bounds)?;
+                Ok(urls
+                    .into_iter()
+                    .map(|url| {
+                        let file = url.rsplit('/').next().unwrap_or(&url).to_string();
+                        (url, dir.join(file))
+                    })
+                    .filter(|(_, path)| refresh || !path.exists())
+                    .collect())
+            })?;
+        }
+        let find_dir = type_dir.clone();
+        let id: IdGenerator = Arc::new(|tags: &Tags| tags.get("id").cloned().unwrap_or(Value::Null));
+        let layer: LayerGenerator = Arc::new(|tags: &Tags| tags.get("type").cloned().unwrap_or(Value::Null));
+        self.add_parquet_source_lazy(
+            name,
+            vec![type_dir],
+            move || {
+                if !find_dir.is_dir() {
+                    return Ok(vec![]);
+                }
+                file_utils::walk_path_with_pattern(&find_dir, "*.parquet")
+            },
+            true,
+            Some(id),
+            Some(layer),
+        )
     }
 
     /// Adds a new stage that will be invoked when [`Planetiler::run`] is called.
@@ -1106,6 +1212,22 @@ impl Planetiler {
     }
 }
 
+/// Java's `StringUtils.getCommonPrefix(paths)` with the trailing partial path segment removed.
+fn common_parent_prefix(paths: &[PathBuf]) -> String {
+    let strings: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    let Some(first) = strings.first() else { return String::new() };
+    let mut len = first.len();
+    for s in &strings[1..] {
+        len = first.bytes().zip(s.bytes()).take(len).take_while(|(a, b)| a == b).count();
+    }
+    let mut prefix = first[..len].to_string();
+    let sep = std::path::MAIN_SEPARATOR;
+    if let Some(idx) = prefix.rfind(sep) {
+        prefix.truncate(idx);
+    }
+    prefix
+}
+
 /// `path.resolveSibling(path.getFileName() + "-unzipped")`.
 fn unzipped_sibling(path: &Path) -> PathBuf {
     let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
@@ -1117,41 +1239,68 @@ fn unzipped_sibling(path: &Path) -> PathBuf {
 mod simple_sources {
     use std::path::{Path, PathBuf};
 
-    use anyhow::bail;
-
     use super::StageContext;
+    use crate::reader::geo_package_reader::GeoPackageReader;
+    use crate::reader::geojson::geo_json_reader::GeoJsonReader;
+    use crate::reader::natural_earth_reader::NaturalEarthReader;
+    use crate::reader::shapefile_reader::ShapefileReader;
 
-    // TODO(port): wire to the reader entry points (`ShapefileReader.processWithProjection`, `GeoPackageReader.process`,
-    // `NaturalEarthReader.process`, `GeoJsonReader.process`) once the simple-reader integration lands.
     pub fn process_shapefiles(
-        _projection: Option<&str>,
-        _paths: &[PathBuf],
+        projection: Option<&str>,
+        paths: &[PathBuf],
         ctx: &mut StageContext<'_>,
     ) -> anyhow::Result<()> {
-        bail!("TODO(port): shapefile sources are not wired into the runner yet ({})", ctx.name)
+        ShapefileReader::process_with_projection(
+            projection,
+            ctx.name,
+            paths.to_vec(),
+            ctx.feature_group,
+            ctx.config,
+            ctx.profile,
+            ctx.stats.clone(),
+        )
     }
 
     pub fn process_geopackages(
-        _projection: Option<&str>,
-        _paths: &[PathBuf],
-        _unzip_dir: &Path,
-        _keep_unzipped: bool,
+        projection: Option<&str>,
+        paths: &[PathBuf],
+        unzip_dir: &Path,
+        keep_unzipped: bool,
         ctx: &mut StageContext<'_>,
     ) -> anyhow::Result<()> {
-        bail!("TODO(port): geopackage sources are not wired into the runner yet ({})", ctx.name)
+        GeoPackageReader::process(
+            projection,
+            ctx.name,
+            paths.to_vec(),
+            unzip_dir,
+            ctx.feature_group,
+            ctx.config,
+            ctx.profile,
+            ctx.stats.clone(),
+            keep_unzipped,
+        )
     }
 
-    pub fn process_geojson(_paths: &[PathBuf], ctx: &mut StageContext<'_>) -> anyhow::Result<()> {
-        bail!("TODO(port): geojson sources are not wired into the runner yet ({})", ctx.name)
+    pub fn process_geojson(paths: &[PathBuf], ctx: &mut StageContext<'_>) -> anyhow::Result<()> {
+        GeoJsonReader::process(ctx.name, paths.to_vec(), ctx.feature_group, ctx.config, ctx.profile, ctx.stats.clone())
     }
 
     pub fn process_natural_earth(
-        _path: &Path,
-        _unzip_dir: &Path,
-        _keep_unzipped: bool,
+        path: &Path,
+        unzip_dir: &Path,
+        keep_unzipped: bool,
         ctx: &mut StageContext<'_>,
     ) -> anyhow::Result<()> {
-        bail!("TODO(port): natural earth sources are not wired into the runner yet ({})", ctx.name)
+        NaturalEarthReader::process(
+            ctx.name,
+            path,
+            unzip_dir,
+            ctx.feature_group,
+            ctx.config,
+            ctx.profile,
+            ctx.stats.clone(),
+            keep_unzipped,
+        )
     }
 }
 
