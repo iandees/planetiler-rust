@@ -95,16 +95,21 @@ impl Symbol {
         self.hash == other.hash && self.len == other.len && self.word() == other.word()
     }
 
+    /// Mask of the low `len` bytes of a little-endian word.
+    #[inline]
+    fn byte_mask(len: usize) -> u64 {
+        if len >= 8 { u64::MAX } else { (1u64 << (8 * len)) - 1 }
+    }
+
     /// `Symbol.compareTo`: lexicographic (unsigned) except longer symbols sort before their prefixes.
+    #[inline]
     fn compare(&self, other: &Symbol) -> std::cmp::Ordering {
-        let a = self.as_slice();
-        let b = other.as_slice();
-        for (x, y) in a.iter().zip(b) {
-            if x != y {
-                return x.cmp(y);
-            }
-        }
-        b.len().cmp(&a.len())
+        // the common length's bytes compared as big-endian words is the lexicographic comparison
+        let common = self.len().min(other.len());
+        let mask = Self::byte_mask(common);
+        let a = (self.word() & mask).swap_bytes();
+        let b = (other.word() & mask).swap_bytes();
+        a.cmp(&b).then_with(|| other.len().cmp(&self.len()))
     }
 
     /// `Symbol.match`: true if this symbol appears at `offset` in `text`, skipping the first `ignore` bytes.
@@ -114,7 +119,20 @@ impl Symbol {
         if text.len() < offset + len {
             return false;
         }
-        text[offset + ignore..offset + len] == self.bytes[ignore..len]
+        if ignore != 2 || len < 2 {
+            return text[offset + ignore..offset + len] == self.bytes[ignore..len];
+        }
+        // Only called with `ignore` = 2 for symbols whose first two bytes are known to match (see
+        // `find_longest_symbol`), so comparing all `len` bytes at once gives the same answer.
+        let word = match text.get(offset..offset + 8) {
+            Some(bytes) => u64::from_le_bytes(bytes.try_into().expect("8 bytes")),
+            None => {
+                let mut buf = [0u8; 8];
+                buf[..text.len() - offset].copy_from_slice(&text[offset..]);
+                u64::from_le_bytes(buf)
+            }
+        };
+        (word ^ self.word()) & Self::byte_mask(len) == 0
     }
 }
 

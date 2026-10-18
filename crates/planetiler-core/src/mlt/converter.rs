@@ -9,7 +9,7 @@ use super::encoding::put_varint;
 use super::geometry_encoder::{encode_geometry_column, encode_pretessellated_geometry_column};
 use super::metadata::{Column, ColumnType, FeatureTable, ScalarType, TileSetMetadata};
 use super::property_encoder::{encode_property_columns, encode_scalar_property_column};
-use super::{Feature, MapboxVectorTile};
+use super::{MapboxVectorTile, MltFeature};
 use crate::value::Value;
 
 /// `ConversionConfig.TypeMismatchPolicy`.
@@ -136,8 +136,8 @@ type ColumnSchemas = IndexMap<String, Column, crate::value::TagsHasher>;
 
 /// `MltConverter.createTilesetMetadata`: infers the column schema of each layer. `column_mappings` apply to every
 /// layer (Java `ColumnMappingConfig.of(Pattern.compile(".*"), columnMappings)`).
-pub fn create_tileset_metadata(
-    tile: &MapboxVectorTile,
+pub fn create_tileset_metadata<F: MltFeature>(
+    tile: &MapboxVectorTile<F>,
     policy: TypeMismatchPolicy,
     column_mappings: &[ColumnMapping],
     include_id_if_present: bool,
@@ -150,10 +150,10 @@ pub fn create_tileset_metadata(
         let mut has_id = false;
         let mut has_long_id = false;
         let mut has_null_id = false;
-        let mut sorted: Vec<(&String, &Value)> = Vec::new();
+        let mut sorted: Vec<(&str, &Value)> = Vec::new();
         for (feature_index, feature) in layer.features.iter().enumerate() {
             sorted.clear();
-            sorted.extend(feature.properties.iter());
+            sorted.extend(feature.properties());
             sorted.sort_by(|a, b| java_string_cmp(a.0, b.0));
             for &(name, value) in &sorted {
                 resolve_column_type(
@@ -168,7 +168,7 @@ pub fn create_tileset_metadata(
                 )?;
             }
             if include_id_if_present {
-                match feature.id {
+                match feature.id() {
                     Some(id) => {
                         has_id = true;
                         if (!has_long_id && id > i32::MAX as i64) || id < i32::MIN as i64 {
@@ -297,9 +297,71 @@ fn resolve_complex_column_mapping(children: &mut [Column]) -> String {
     prefix
 }
 
+/// A feature with a regenerated ID (its position).
+struct RegeneratedId<'a, F> {
+    id: i64,
+    feature: &'a F,
+}
+
+impl<F: MltFeature> MltFeature for RegeneratedId<'_, F> {
+    fn id(&self) -> Option<i64> {
+        Some(self.id)
+    }
+
+    fn geometry(&self) -> &geo_types::Geometry<f64> {
+        self.feature.geometry()
+    }
+
+    fn property(&self, name: &str) -> Option<&Value> {
+        self.feature.property(name)
+    }
+
+    fn properties(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.feature.properties()
+    }
+}
+
+struct BodyConfig<'a> {
+    config: &'a ConversionConfig,
+    layer_metadata: &'a FeatureTable,
+    layer_name: &'a str,
+    optimizations: Option<&'a FeatureTableOptimizations>,
+    coerce: bool,
+}
+
+/// The ID column, the geometry column and the property columns of a layer.
+fn encode_layer_body<F: MltFeature>(
+    body: &mut Vec<u8>,
+    c: &BodyConfig,
+    sorted: &[&F],
+    geometry_column: &super::geometry_encoder::EncodedGeometryColumn,
+) -> anyhow::Result<()> {
+    let config = c.config;
+    let fast_pfor = config.use_fast_pfor;
+    if config.include_ids {
+        let id_metadata = c
+            .layer_metadata
+            .columns
+            .iter()
+            .find(|c| c.is_id())
+            .ok_or_else(|| anyhow::anyhow!("No ID column in layer {}", c.layer_name))?;
+        let ColumnType::Id { long } = id_metadata.column_type else { unreachable!("is_id") };
+        // Write ID as a 32- or 64-bit scalar; the decoding assumes unsigned (no zigzag)
+        let id_column =
+            Column::scalar("id", id_metadata.nullable, if long { ScalarType::Uint64 } else { ScalarType::Uint32 });
+        encode_scalar_property_column(body, &id_column, true, sorted, fast_pfor, config.use_fsst, c.coerce)?;
+    }
+    put_varint(body, geometry_column.num_streams);
+    body.extend_from_slice(&geometry_column.encoded);
+    let property_columns: Vec<&Column> =
+        c.layer_metadata.columns.iter().filter(|c| !c.is_id() && !c.is_geometry()).collect();
+    let column_mappings: &[ColumnMapping] = c.optimizations.map_or(&[], |o| &o.column_mappings);
+    encode_property_columns(body, &property_columns, sorted, fast_pfor, config.use_fsst, c.coerce, column_mappings)
+}
+
 /// `MltConverter.convertMvt`: encodes `mvt` with the schema in `tileset_metadata`.
-pub fn convert_mvt(
-    mvt: &MapboxVectorTile,
+pub fn convert_mvt<F: MltFeature>(
+    mvt: &MapboxVectorTile<F>,
     tileset_metadata: &TileSetMetadata,
     config: &ConversionConfig,
 ) -> anyhow::Result<Vec<u8>> {
@@ -323,60 +385,29 @@ pub fn convert_mvt(
         // sortFeaturesAndEncodeGeometryColumn
         let is_column_sortable = config.include_ids && optimizations.is_some_and(|o| o.allow_sorting);
         let allow_id_regeneration = optimizations.is_some_and(|o| o.allow_id_regeneration);
-        let mut sorted: Vec<&Feature> = layer.features.iter().collect();
+        let mut sorted: Vec<&F> = layer.features.iter().collect();
         if is_column_sortable && !allow_id_regeneration {
-            sorted.sort_by_key(|f| (f.id.is_some(), f.id.unwrap_or(0)));
+            sorted.sort_by_key(|f| (f.id().is_some(), f.id().unwrap_or(0)));
         }
         if is_column_sortable && allow_id_regeneration {
             anyhow::bail!("Sorting geometries with regenerated ids is not supported");
         }
-        let geometries: Vec<&geo_types::Geometry<f64>> = sorted.iter().map(|f| &f.geometry).collect();
+        let geometries: Vec<&geo_types::Geometry<f64>> = sorted.iter().map(|f| f.geometry()).collect();
         let geometry_column = if config.pre_tessellate_polygons {
             encode_pretessellated_geometry_column(&geometries, fast_pfor, create_polygon_outline)?
         } else {
             encode_geometry_column(&geometries, fast_pfor, config.use_morton_encoding)?
         };
-        let regenerated: Vec<Feature>;
-        if config.include_ids && allow_id_regeneration {
-            regenerated = sorted
-                .iter()
-                .enumerate()
-                .map(|(i, f)| Feature {
-                    id: Some(i as i64),
-                    geometry: f.geometry.clone(),
-                    properties: f.properties.clone(),
-                })
-                .collect();
-            sorted = regenerated.iter().collect();
-        }
-
         let mut body = Vec::new();
-        if config.include_ids {
-            let id_metadata = layer_metadata
-                .columns
-                .iter()
-                .find(|c| c.is_id())
-                .ok_or_else(|| anyhow::anyhow!("No ID column in layer {}", layer.name))?;
-            let ColumnType::Id { long } = id_metadata.column_type else { unreachable!("is_id") };
-            // Write ID as a 32- or 64-bit scalar; the decoding assumes unsigned (no zigzag)
-            let id_column =
-                Column::scalar("id", id_metadata.nullable, if long { ScalarType::Uint64 } else { ScalarType::Uint32 });
-            encode_scalar_property_column(&mut body, &id_column, true, &sorted, fast_pfor, config.use_fsst, coerce)?;
+        let body_config = BodyConfig { config, layer_metadata, layer_name: &layer.name, optimizations, coerce };
+        if config.include_ids && allow_id_regeneration {
+            let regenerated: Vec<RegeneratedId<F>> =
+                sorted.iter().enumerate().map(|(i, &feature)| RegeneratedId { id: i as i64, feature }).collect();
+            let regenerated: Vec<&RegeneratedId<F>> = regenerated.iter().collect();
+            encode_layer_body(&mut body, &body_config, &regenerated, &geometry_column)?;
+        } else {
+            encode_layer_body(&mut body, &body_config, &sorted, &geometry_column)?;
         }
-        put_varint(&mut body, geometry_column.num_streams);
-        body.extend_from_slice(&geometry_column.encoded);
-        let property_columns: Vec<&Column> =
-            layer_metadata.columns.iter().filter(|c| !c.is_id() && !c.is_geometry()).collect();
-        let column_mappings: &[ColumnMapping] = optimizations.map_or(&[], |o| &o.column_mappings);
-        encode_property_columns(
-            &mut body,
-            &property_columns,
-            &sorted,
-            fast_pfor,
-            config.use_fsst,
-            coerce,
-            column_mappings,
-        )?;
 
         let mut metadata_buffer = Vec::new();
         layer_metadata.encode_embedded(layer.extent, &mut metadata_buffer)?;

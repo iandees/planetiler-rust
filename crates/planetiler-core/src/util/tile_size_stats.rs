@@ -150,9 +150,9 @@ pub fn compute_tile_stats(proto: &pb::Tile) -> Vec<LayerStats> {
 
 /// Returns the size and statistics for each layer of the MLT tile `output` encoded from `input` (Java
 /// `computeMltTileStats`), in `input` layer order. Key and value counts come from `vtile` (0 without one).
-pub fn compute_mlt_tile_stats(
+pub fn compute_mlt_tile_stats<F: crate::mlt::MltFeature>(
     vtile: Option<&vector_tile::VectorTile>,
-    input: &crate::mlt::MapboxVectorTile,
+    input: &crate::mlt::MapboxVectorTile<F>,
     output: &[u8],
 ) -> anyhow::Result<Vec<LayerStats>> {
     use crate::mlt::decoder::{consume_column, layer_blocks};
@@ -184,7 +184,7 @@ pub fn compute_mlt_tile_stats(
             layer: layer.name.clone(),
             layer_bytes: encoded_layer_sizes.get(&layer.name).copied().unwrap_or(-1),
             layer_features: layer.features.len() as i64,
-            layer_geometries: layer.features.iter().map(|f| count_mlt_geometries(&f.geometry)).sum::<usize>() as i64,
+            layer_geometries: layer.features.iter().map(|f| count_mlt_geometries(f.geometry())).sum::<usize>() as i64,
             layer_attr_bytes: encoded_layer_attribute_sizes.get(&layer.name).copied().unwrap_or(-1),
             layer_attr_keys: vtile.and_then(|t| t.get_num_keys(&layer.name)).unwrap_or(0) as i64,
             layer_attr_values: vtile.and_then(|t| t.get_num_values(&layer.name)).unwrap_or(0) as i64,

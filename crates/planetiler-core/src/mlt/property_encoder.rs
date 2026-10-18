@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 
-use super::Feature;
+use super::MltFeature;
 use super::converter::ColumnMapping;
 use super::encoding::{
     LogicalLevelTechnique, PhysicalLevelTechnique, PhysicalStreamType, StreamMetadata, encode_boolean_rle,
@@ -15,10 +15,10 @@ use super::string_encoder;
 use crate::value::Value;
 
 /// `PropertyEncoder.encodePropertyColumns`.
-pub fn encode_property_columns(
+pub fn encode_property_columns<F: MltFeature>(
     out: &mut Vec<u8>,
     property_columns: &[&Column],
-    features: &[&Feature],
+    features: &[&F],
     fast_pfor: bool,
     use_fsst: bool,
     coerce_property_values: bool,
@@ -29,7 +29,7 @@ pub fn encode_property_columns(
         match &column.column_type {
             ColumnType::Scalar(_) => {
                 // Indicate a missing property column in the tile with a zero for the number of streams
-                if column.has_stream_count() && features.iter().all(|f| !f.properties.contains_key(&column.name)) {
+                if column.has_stream_count() && features.iter().all(|f| f.property(&column.name).is_none()) {
                     out.push(0);
                     continue;
                 }
@@ -56,9 +56,9 @@ pub fn encode_property_columns(
     Ok(())
 }
 
-fn encode_struct_property_column(
+fn encode_struct_property_column<F: MltFeature>(
     out: &mut Vec<u8>,
-    features: &[&Feature],
+    features: &[&F],
     use_fsst: bool,
     root_name: &str,
     children: &[Column],
@@ -77,7 +77,7 @@ fn encode_struct_property_column(
         shared_dictionary.push(
             features
                 .iter()
-                .map(|f| match f.properties.get(&property_name) {
+                .map(|f| match f.property(&property_name) {
                     Some(Value::String(s)) => Some(&**s),
                     Some(_) | None => None,
                 })
@@ -174,11 +174,11 @@ fn string_value<'a>(v: Option<&'a Value>, coerce: bool) -> Option<Cow<'a, str>> 
 }
 
 /// `PropertyEncoder.encodeScalarPropertyColumn` (the public overload, also used for the ID column).
-pub fn encode_scalar_property_column(
+pub fn encode_scalar_property_column<F: MltFeature>(
     out: &mut Vec<u8>,
     column: &Column,
     is_id: bool,
-    features: &[&Feature],
+    features: &[&F],
     fast_pfor: bool,
     use_fsst: bool,
     coerce_property_values: bool,
@@ -193,7 +193,7 @@ pub fn encode_scalar_property_column(
             let mut present = Vec::with_capacity(features.len());
             for f in features {
                 // Force ID values to integer for this column.
-                let v = if is_id { f.id.map(|id| id as i32) } else { int_value(f.properties.get(name)) };
+                let v = if is_id { f.id().map(|id| id as i32) } else { int_value(f.property(name)) };
                 present.push(v.is_some());
                 if let Some(v) = v {
                     values.push(v);
@@ -209,7 +209,7 @@ pub fn encode_scalar_property_column(
             let mut values = Vec::with_capacity(features.len());
             let mut present = Vec::with_capacity(features.len());
             for f in features {
-                let v = if is_id { f.id } else { long_value(f.properties.get(name)) };
+                let v = if is_id { f.id() } else { long_value(f.property(name)) };
                 present.push(v.is_some());
                 if let Some(v) = v {
                     values.push(v);
@@ -225,7 +225,7 @@ pub fn encode_scalar_property_column(
             let mut present = Vec::with_capacity(features.len());
             let mut count = 0;
             for f in features {
-                let v = float_value(f.properties.get(name));
+                let v = float_value(f.property(name));
                 present.push(v.is_some());
                 if let Some(v) = v {
                     bytes.extend_from_slice(&v.to_le_bytes());
@@ -242,7 +242,7 @@ pub fn encode_scalar_property_column(
             let mut present = Vec::with_capacity(features.len());
             let mut count = 0;
             for f in features {
-                let v = double_value(f.properties.get(name));
+                let v = double_value(f.property(name));
                 present.push(v.is_some());
                 if let Some(v) = v {
                     bytes.extend_from_slice(&v.to_le_bytes());
@@ -256,7 +256,7 @@ pub fn encode_scalar_property_column(
         }
         ScalarType::String => {
             let raw: Vec<Option<Cow<'_, str>>> =
-                features.iter().map(|f| string_value(f.properties.get(name), coerce_property_values)).collect();
+                features.iter().map(|f| string_value(f.property(name), coerce_property_values)).collect();
             let values: Vec<&str> = raw.iter().filter_map(|v| v.as_deref()).collect();
             let (num_streams, encoded) = string_encoder::encode(&values, fast_pfor, use_fsst);
             let mut present_stream = Vec::new();
@@ -288,11 +288,11 @@ fn write_raw_data_stream(out: &mut Vec<u8>, count: usize, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn encode_boolean_column(out: &mut Vec<u8>, features: &[&Feature], column: &Column) {
+fn encode_boolean_column<F: MltFeature>(out: &mut Vec<u8>, features: &[&F], column: &Column) {
     let mut data = Vec::with_capacity(features.len());
     let mut present = Vec::with_capacity(features.len());
     for f in features {
-        let v = bool_value(f.properties.get(&column.name));
+        let v = bool_value(f.property(&column.name));
         present.push(v.is_some());
         if let Some(v) = v {
             data.push(v);

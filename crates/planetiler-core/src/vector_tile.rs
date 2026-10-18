@@ -822,9 +822,75 @@ impl VectorTile {
         crate::mlt::MapboxVectorTile { layers }
     }
 
+    /// Calls `f` with the same features as [`VectorTile::to_mlt_input`], but with properties that borrow this tile's
+    /// keys and values instead of copying them into new maps.
+    fn with_borrowed_mlt_input<R>(
+        &self,
+        stats: Option<&dyn crate::stats::stats::Stats>,
+        f: impl FnOnce(&crate::mlt::MapboxVectorTile<crate::mlt::BorrowedFeature<'_>>) -> R,
+    ) -> R {
+        let needs_string = |value: &Value| matches!(value, Value::List(_) | Value::Map(_) | Value::Bytes(_));
+        // the values MVT encodes as strings, converted once per layer
+        let converted: Vec<Option<Vec<Value>>> = self
+            .non_empty_layers()
+            .map(|(_, layer)| {
+                layer.values.iter().any(needs_string).then(|| {
+                    layer
+                        .values
+                        .iter()
+                        .map(|v| if needs_string(v) { Value::str(v.to_string()) } else { v.clone() })
+                        .collect()
+                })
+            })
+            .collect();
+        let layers = self
+            .non_empty_layers()
+            .zip(&converted)
+            .map(|((name, layer), converted)| {
+                let features = layer
+                    .encoded_features
+                    .iter()
+                    .filter_map(|feature| {
+                        let tags = layer.tags_of(feature);
+                        let mut properties: Vec<(&str, &Value)> = Vec::with_capacity(tags.len() / 2);
+                        for pair in tags.as_chunks::<2>().0 {
+                            let key = layer.keys[pair[0] as usize].as_str();
+                            let value = match converted {
+                                Some(converted) => &converted[pair[1] as usize],
+                                None => &layer.values[pair[1] as usize],
+                            };
+                            // like inserting into a map: a repeated key keeps its position and takes the new value
+                            match properties.iter_mut().find(|(k, _)| *k == key) {
+                                Some(existing) => existing.1 = value,
+                                None => properties.push((key, value)),
+                            }
+                        }
+                        match feature.geometry.decode_to_extent() {
+                            Ok(geometry) => {
+                                Some(crate::mlt::BorrowedFeature { id: Some(feature.id), geometry, properties })
+                            }
+                            Err(e) => {
+                                let mut tags = crate::value::tags_with_capacity(properties.len());
+                                tags.extend(properties.iter().map(|&(k, v)| (k.to_string(), v.clone())));
+                                let message = format!("Error converting to MLT {tags:?}");
+                                match stats {
+                                    Some(stats) => e.log_with_stats(stats, "mlt_feature", &message),
+                                    None => e.log(&message),
+                                }
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+                crate::mlt::Layer { name: name.clone(), features, extent: EXTENT as u32 }
+            })
+            .collect();
+        f(&crate::mlt::MapboxVectorTile { layers })
+    }
+
     /// Encodes this tile as a MapLibre Tile the way Java `TileArchiveWriter` does with `--tile-format=mlt`.
     pub fn encode_mlt(&self, include_ids: bool, options: &crate::mlt::MltOptions) -> anyhow::Result<Vec<u8>> {
-        crate::mlt::encode_tile(&self.to_mlt_input(None), include_ids, options)
+        self.with_borrowed_mlt_input(None, |input| crate::mlt::encode_tile(input, include_ids, options))
     }
 
     /// Like [`VectorTile::encode_mlt`], but also returns the per-layer stats of the encoded tile (Java
@@ -835,10 +901,11 @@ impl VectorTile {
         options: &crate::mlt::MltOptions,
         stats: Option<&dyn crate::stats::stats::Stats>,
     ) -> anyhow::Result<(Vec<u8>, Vec<LayerStats>)> {
-        let input = self.to_mlt_input(stats);
-        let encoded = crate::mlt::encode_tile(&input, include_ids, options)?;
-        let layer_stats = crate::util::tile_size_stats::compute_mlt_tile_stats(Some(self), &input, &encoded)?;
-        Ok((encoded, layer_stats))
+        self.with_borrowed_mlt_input(stats, |input| {
+            let encoded = crate::mlt::encode_tile(input, include_ids, options)?;
+            let layer_stats = crate::util::tile_size_stats::compute_mlt_tile_stats(Some(self), input, &encoded)?;
+            Ok((encoded, layer_stats))
+        })
     }
 
     /// Number of distinct keys in `layer`, or `None` if the layer does not exist.

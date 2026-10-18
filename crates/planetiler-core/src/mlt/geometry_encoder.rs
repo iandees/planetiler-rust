@@ -47,6 +47,11 @@ impl CurveParams {
     pub fn morton(&self, x: i32, y: i32) -> i32 {
         let sx = x.wrapping_add(self.coordinate_shift);
         let sy = y.wrapping_add(self.coordinate_shift);
+        if self.num_bits <= 16 {
+            // the same bits, interleaved with masks instead of one bit at a time
+            let mask = (1u32 << self.num_bits) - 1;
+            return (interleave(sx as u32 & mask) | (interleave(sy as u32 & mask) << 1)) as i32;
+        }
         let mut code = 0i32;
         for i in 0..self.num_bits {
             let bit = 1i32.wrapping_shl(i);
@@ -294,6 +299,15 @@ fn length_stream(out: &mut Vec<u8>, values: &[i32], fast_pfor: bool, length_type
     );
 }
 
+/// The curve codes of `vertices`, computed in a separate (vectorizable) loop.
+fn curve_codes(vertices: &[(i32, i32)], code: impl Fn(i32, i32) -> i32) -> std::vec::IntoIter<i32> {
+    let mut codes = vec![0i32; vertices.len()];
+    for (c, &(x, y)) in codes.iter_mut().zip(vertices) {
+        *c = code(x, y);
+    }
+    codes.into_iter()
+}
+
 /// `code << 32 | position` with the (signed) code's order preserved.
 #[inline]
 fn sort_key(code: i32, position: usize) -> u64 {
@@ -303,7 +317,8 @@ fn sort_key(code: i32, position: usize) -> u64 {
 /// Sorts keys made by [`sort_key`] in position order (the same order as `keys.sort_unstable()`, since positions
 /// are unique): a stable LSD radix sort on the code bits that vary, or a comparison sort for short inputs.
 fn sort_keys(keys: &mut Vec<u64>) {
-    const DIGIT_BITS: u32 = 8;
+    const MAX_DIGIT_BITS: u32 = 11;
+    const MAX_PASSES: usize = 32usize.div_ceil(MAX_DIGIT_BITS as usize);
     if keys.len() < 256 {
         keys.sort_unstable();
         return;
@@ -315,28 +330,38 @@ fn sort_keys(keys: &mut Vec<u64>) {
         max = max.max(code);
     }
     let bits = 32 - (max - min).leading_zeros();
+    if bits == 0 {
+        // all codes equal: already in position order
+        return;
+    }
+    let passes = bits.div_ceil(MAX_DIGIT_BITS);
+    let digit_bits = bits.div_ceil(passes);
+    let mask = (1u32 << digit_bits) - 1;
+    // the histograms of all passes in one read
+    let mut counts = vec![[0u32; 1 << MAX_DIGIT_BITS]; passes as usize];
+    for &k in keys.iter() {
+        let code = (k >> 32) as u32 - min;
+        for (pass, histogram) in counts.iter_mut().enumerate() {
+            histogram[((code >> (pass as u32 * digit_bits)) & mask) as usize] += 1;
+        }
+    }
+    debug_assert!(counts.len() <= MAX_PASSES);
     let mut from = std::mem::take(keys);
     let mut to = vec![0u64; from.len()];
-    let mut shift = 0;
-    while shift < bits {
-        let digit = |k: u64| ((((k >> 32) as u32 - min) >> shift) & ((1 << DIGIT_BITS) - 1)) as usize;
-        let mut counts = [0usize; 1 << DIGIT_BITS];
-        for &k in &from {
-            counts[digit(k)] += 1;
-        }
+    for (pass, histogram) in counts.iter_mut().enumerate() {
+        let shift = pass as u32 * digit_bits;
         let mut sum = 0;
-        for c in counts.iter_mut() {
+        for c in histogram[..=mask as usize].iter_mut() {
             let count = *c;
             *c = sum;
             sum += count;
         }
         for &k in &from {
-            let d = digit(k);
-            to[counts[d]] = k;
-            counts[d] += 1;
+            let d = ((((k >> 32) as u32 - min) >> shift) & mask) as usize;
+            to[histogram[d] as usize] = k;
+            histogram[d] += 1;
         }
         std::mem::swap(&mut from, &mut to);
-        shift += DIGIT_BITS;
     }
     *keys = from;
 }
@@ -404,7 +429,7 @@ impl<'a> Dictionaries<'a> {
         self.hilbert.get_or_insert_with(|| {
             let (vertices, curve) = (self.vertices, self.curve);
             let mut keys: Vec<u64> = Vec::with_capacity(vertices.len());
-            keys.extend(vertices.iter().enumerate().map(|(i, &(x, y))| sort_key(curve.hilbert(x, y), i)));
+            keys.extend(curve_codes(vertices, |x, y| curve.hilbert(x, y)).enumerate().map(|(i, c)| sort_key(c, i)));
             sort_keys(&mut keys);
             let dictionary_vertices: Vec<(i32, i32)> =
                 keys.iter().map(|&k| vertices[(k & 0xFFFF_FFFF) as usize]).collect();
@@ -441,7 +466,7 @@ impl<'a> Dictionaries<'a> {
         self.morton.get_or_insert_with(|| {
             let (vertices, curve) = (self.vertices, self.curve);
             let mut keys: Vec<u64> = Vec::with_capacity(vertices.len());
-            keys.extend(vertices.iter().enumerate().map(|(i, &(x, y))| sort_key(curve.morton(x, y), i)));
+            keys.extend(curve_codes(vertices, |x, y| curve.morton(x, y)).enumerate().map(|(i, c)| sort_key(c, i)));
             sort_keys(&mut keys);
             let codes: Vec<i32> = keys.iter().map(|&k| (k >> 32) as u32 as i32 ^ i32::MIN).collect();
             let size = encoded_morton_codes_size(&codes, self.fast_pfor);
@@ -590,7 +615,9 @@ mod tests {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (state >> 33) as i32
         };
-        for (len, range) in [(10, 100), (255, 1 << 20), (256, 7), (300, 1 << 26), (5000, 1000), (70_000, i32::MAX)] {
+        for (len, range) in
+            [(10, 100), (255, 1 << 20), (256, 7), (300, 1 << 26), (400, 1), (5000, 1000), (70_000, i32::MAX)]
+        {
             let codes: Vec<i32> = (0..len).map(|i| if i % 5 == 0 { -next() % range } else { next() % range }).collect();
             let mut keys: Vec<u64> = codes.iter().enumerate().map(|(i, &c)| sort_key(c, i)).collect();
             let mut expected = keys.clone();
@@ -610,6 +637,28 @@ mod tests {
         assert_eq!(13, c.num_bits);
         assert_eq!(CurveParams::new(0, 4095).num_bits, 12);
         assert_eq!(CurveParams::new(0, 0).num_bits, 0);
+    }
+
+    #[test]
+    fn morton_matches_bit_loop() {
+        let slow = |c: &CurveParams, x: i32, y: i32| {
+            let sx = x.wrapping_add(c.coordinate_shift);
+            let sy = y.wrapping_add(c.coordinate_shift);
+            let mut code = 0i32;
+            for i in 0..c.num_bits {
+                let bit = 1i32.wrapping_shl(i);
+                code |= (sx & bit).wrapping_shl(i) | (sy & bit).wrapping_shl(i + 1);
+            }
+            code
+        };
+        for (min, max) in [(0, 0), (0, 1), (0, 4095), (0, 4096), (-128, 4223), (-1000, 70_000), (0, 65_535)] {
+            let c = CurveParams::new(min, max);
+            for x in (min..=max).step_by(((max - min) as usize / 300).max(1)) {
+                for y in [min, max, (min + max) / 2, x, max - (x - min)] {
+                    assert_eq!(slow(&c, x, y), c.morton(x, y), "{min} {max} {x} {y}");
+                }
+            }
+        }
     }
 
     #[test]

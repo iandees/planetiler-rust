@@ -49,18 +49,81 @@ pub struct Feature {
     pub properties: Tags,
 }
 
+/// What the encoder reads from a feature: a [`Feature`], or a [`BorrowedFeature`] that refers to the attributes of
+/// a vector tile layer instead of copying them.
+pub trait MltFeature {
+    /// `None` if the feature has no ID.
+    fn id(&self) -> Option<i64>;
+    /// In tile extent coordinates.
+    fn geometry(&self) -> &Geometry<f64>;
+    fn property(&self, name: &str) -> Option<&Value>;
+    /// The properties in insertion order.
+    fn properties(&self) -> impl Iterator<Item = (&str, &Value)>;
+}
+
+impl MltFeature for Feature {
+    fn id(&self) -> Option<i64> {
+        self.id
+    }
+
+    fn geometry(&self) -> &Geometry<f64> {
+        &self.geometry
+    }
+
+    fn property(&self, name: &str) -> Option<&Value> {
+        self.properties.get(name)
+    }
+
+    fn properties(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.properties.iter().map(|(k, v)| (k.as_str(), v))
+    }
+}
+
+/// A [`Feature`] whose properties borrow the keys and values of a vector tile layer (distinct keys, in order).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BorrowedFeature<'a> {
+    pub id: Option<i64>,
+    pub geometry: Geometry<f64>,
+    pub properties: Vec<(&'a str, &'a Value)>,
+}
+
+impl MltFeature for BorrowedFeature<'_> {
+    fn id(&self) -> Option<i64> {
+        self.id
+    }
+
+    fn geometry(&self) -> &Geometry<f64> {
+        &self.geometry
+    }
+
+    #[inline]
+    fn property(&self, name: &str) -> Option<&Value> {
+        self.properties.iter().find(|(k, _)| *k == name).map(|&(_, v)| v)
+    }
+
+    fn properties(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.properties.iter().copied()
+    }
+}
+
 /// `org.maplibre.mlt.data.Layer`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Layer {
+pub struct Layer<F = Feature> {
     pub name: String,
-    pub features: Vec<Feature>,
+    pub features: Vec<F>,
     pub extent: u32,
 }
 
 /// `org.maplibre.mlt.converter.mvt.MapboxVectorTile`: the input of the MLT encoder.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct MapboxVectorTile {
-    pub layers: Vec<Layer>,
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapboxVectorTile<F = Feature> {
+    pub layers: Vec<Layer<F>>,
+}
+
+impl<F> Default for MapboxVectorTile<F> {
+    fn default() -> Self {
+        MapboxVectorTile { layers: Vec::new() }
+    }
 }
 
 /// The `mlt_*` options of [`PlanetilerConfig`](crate::config::planetiler_config::PlanetilerConfig).
@@ -89,7 +152,7 @@ impl MltOptions {
 
 /// `TileArchiveWriter.findStringColumns`: when the tile has enough repeated string values for a shared dictionary to
 /// pay off, returns the properties that only ever hold strings, overall and per layer.
-fn find_string_columns(input: &MapboxVectorTile) -> (HashSet<&str>, HashMap<&str, HashSet<&str>>) {
+fn find_string_columns<F: MltFeature>(input: &MapboxVectorTile<F>) -> (HashSet<&str>, HashMap<&str, HashSet<&str>>) {
     let mut value_counts: HashMap<&str, u32> = HashMap::new();
     let mut string_columns: HashSet<&str> = HashSet::new();
     let mut string_columns_by_layer: HashMap<&str, HashSet<&str>> = HashMap::new();
@@ -98,7 +161,7 @@ fn find_string_columns(input: &MapboxVectorTile) -> (HashSet<&str>, HashMap<&str
     let mut have_enough_repeated_values = false;
     for layer in &input.layers {
         for feature in &layer.features {
-            for (key, value) in &feature.properties {
+            for (key, value) in feature.properties() {
                 if let Value::String(value) = value {
                     if !have_enough_repeated_values {
                         let count = value_counts.entry(value).or_insert(0);
@@ -133,7 +196,11 @@ fn find_string_columns(input: &MapboxVectorTile) -> (HashSet<&str>, HashMap<&str
 }
 
 /// Encodes `input` the way Java `TileArchiveWriter` does for `--tile-format=mlt`.
-pub fn encode_tile(input: &MapboxVectorTile, include_ids: bool, options: &MltOptions) -> anyhow::Result<Vec<u8>> {
+pub fn encode_tile<F: MltFeature>(
+    input: &MapboxVectorTile<F>,
+    include_ids: bool,
+    options: &MltOptions,
+) -> anyhow::Result<Vec<u8>> {
     let (string_columns, string_columns_by_layer) =
         if options.shared_dictionaries { find_string_columns(input) } else { (HashSet::new(), HashMap::new()) };
     let column_mappings: Vec<ColumnMapping> = if string_columns.is_empty() {

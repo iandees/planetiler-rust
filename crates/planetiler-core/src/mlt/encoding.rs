@@ -284,8 +284,18 @@ pub fn put_varlong(out: &mut Vec<u8>, v: u64) {
 /// Number of bytes [`put_varint`] writes for `v`.
 #[inline]
 pub fn varint_size(v: u32) -> usize {
-    let bits = 32 - v.leading_zeros() as usize;
-    bits.div_ceil(7).max(1)
+    // by number of leading zeros
+    const SIZES: [u8; 33] = {
+        let mut sizes = [0u8; 33];
+        let mut lz = 0;
+        while lz <= 32 {
+            let bits = 32 - lz;
+            sizes[lz] = if bits == 0 { 1 } else { bits.div_ceil(7) as u8 };
+            lz += 1;
+        }
+        sizes
+    };
+    SIZES[v.leading_zeros() as usize] as usize
 }
 
 /// Number of bytes [`put_varlong`] writes for `v`.

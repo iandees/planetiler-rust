@@ -336,9 +336,15 @@ pub fn encoded_size(values: &[u32]) -> usize {
 /// `getBestBFromData` with caller-provided frequency counts.
 #[inline]
 fn best_b(freqs: &mut [i32; 33], block: &[u32; BLOCK_SIZE]) -> (usize, usize, usize) {
-    *freqs = [0; 33];
-    for &v in block {
-        freqs[bits(v)] += 1;
+    // four interleaved histograms so consecutive values with the same bit width don't serialize on one counter
+    let mut partial = [[0i32; 33]; 4];
+    for chunk in block.as_chunks::<4>().0 {
+        for (histogram, &v) in partial.iter_mut().zip(chunk) {
+            histogram[bits(v)] += 1;
+        }
+    }
+    for (b, freq) in freqs.iter_mut().enumerate() {
+        *freq = partial[0][b] + partial[1][b] + partial[2][b] + partial[3][b];
     }
     let mut bestb = 32usize;
     while freqs[bestb] == 0 {
