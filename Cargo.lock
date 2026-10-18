@@ -2049,6 +2049,7 @@ name = "planetiler-benchmarks"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "crossbeam-channel",
  "flate2",
  "geo",
@@ -2056,6 +2057,7 @@ dependencies = [
  "indexmap",
  "libc",
  "mimalloc",
+ "parquet",
  "planetiler-core",
  "tempfile",
  "tracing",

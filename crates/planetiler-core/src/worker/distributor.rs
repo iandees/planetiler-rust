@@ -18,18 +18,29 @@
 //!    thread)
 //! 3. When the thread is done processing input elements, then process items off of the work queue until it is empty
 //!    and all other workers are finished
+//!
+//! Difference from Java: a draining thread waits on the queue in 100ms polls like Java, but the worker whose
+//! [`ForThread::finish`] brings the number of working threads to zero also wakes every draining thread, so they
+//! exit as soon as the work runs out instead of up to 100ms later.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, Sender};
+
+/// How long a draining thread waits for an item before re-checking whether all workers are done (Java's
+/// `pending.poll(100, TimeUnit.MILLISECONDS)`).
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 struct Inner<T> {
     done: AtomicI32,
     working: AtomicI32,
     sender: Sender<T>,
     receiver: Receiver<T>,
+    /// One token per finished thread is sent when the last working thread finishes, to wake up draining threads.
+    wake_sender: Sender<()>,
+    wake_receiver: Receiver<()>,
 }
 
 /// Shares work between threads when some finish early. Clones share the same state.
@@ -47,7 +58,17 @@ impl<T> Distributor<T> {
     /// Returns a new `Distributor` that can hold up to `capacity` pending elements.
     pub fn create_with_capacity(capacity: usize) -> Distributor<T> {
         let (sender, receiver) = crossbeam_channel::bounded(capacity.max(1));
-        Distributor { inner: Arc::new(Inner { done: AtomicI32::new(0), working: AtomicI32::new(0), sender, receiver }) }
+        let (wake_sender, wake_receiver) = crossbeam_channel::unbounded();
+        Distributor {
+            inner: Arc::new(Inner {
+                done: AtomicI32::new(0),
+                working: AtomicI32::new(0),
+                sender,
+                receiver,
+                wake_sender,
+                wake_receiver,
+            }),
+        }
     }
 
     /// Returns a handle for a worker thread to offer new items to, which calls `consumer` on each item.
@@ -83,33 +104,37 @@ impl<T, F: FnMut(T)> ForThread<T, F> {
     /// Marks this thread as done processing its own input.
     pub fn finish(&mut self) {
         if !self.finished {
-            self.inner.done.fetch_add(1, Ordering::SeqCst);
-            self.inner.working.fetch_sub(1, Ordering::SeqCst);
+            let done = self.inner.done.fetch_add(1, Ordering::SeqCst) + 1;
+            let working = self.inner.working.fetch_sub(1, Ordering::SeqCst) - 1;
             self.finished = true;
+            if working <= 0 {
+                // wake up threads waiting in drain(); a stale token left over only causes one extra re-check
+                for _ in 0..done {
+                    let _ = self.inner.wake_sender.send(());
+                }
+            }
         }
     }
 
     /// Processes items handed off from other threads until they are all finished.
     pub fn drain(&mut self) {
+        let inner = &*self.inner;
         loop {
-            let item = match self.inner.receiver.try_recv() {
-                Ok(item) => Some(item),
-                Err(_) if self.inner.working.load(Ordering::SeqCst) > 0 => {
-                    match self.inner.receiver.recv_timeout(Duration::from_millis(100)) {
-                        Ok(item) => Some(item),
-                        Err(RecvTimeoutError::Timeout) => {
-                            if self.inner.working.load(Ordering::SeqCst) <= 0 {
-                                break;
-                            }
-                            None
-                        }
-                        Err(RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-                Err(_) => break,
-            };
-            if let Some(item) = item {
+            if let Ok(item) = inner.receiver.try_recv() {
                 (self.consumer)(item);
+                continue;
+            }
+            // nothing is enqueued after the last worker finishes, so once the queue is empty we are done
+            if inner.working.load(Ordering::SeqCst) <= 0 {
+                break;
+            }
+            crossbeam_channel::select! {
+                recv(inner.receiver) -> item => match item {
+                    Ok(item) => (self.consumer)(item),
+                    Err(_) => break,
+                },
+                recv(inner.wake_receiver) -> _ => {}
+                default(POLL_INTERVAL) => {}
             }
         }
     }
@@ -229,5 +254,67 @@ mod tests {
         thread1.join().unwrap();
         thread2.join().unwrap();
         assert_eq!(vec![1, 2, 3, 4, 6, 5], *processed.lock());
+    }
+
+    /// A draining thread returns as soon as the last worker finishes, rather than after the next 100ms poll.
+    #[test]
+    fn drain_wakes_up_when_last_worker_finishes() {
+        let distributor = Distributor::<i32>::create_with_capacity(10);
+        let mut worker = distributor.for_thread(|_| {});
+        let started = Arc::new(Barrier::new(2));
+        let drainer = {
+            let (distributor, started) = (distributor.clone(), started.clone());
+            std::thread::spawn(move || {
+                let mut this = distributor.for_thread(|_| {});
+                this.finish();
+                started.wait();
+                let start = std::time::Instant::now();
+                this.drain();
+                start.elapsed()
+            })
+        };
+        started.wait();
+        std::thread::sleep(Duration::from_millis(30));
+        worker.close();
+        let waited = drainer.join().unwrap();
+        assert!(waited >= Duration::from_millis(25) && waited < Duration::from_millis(90), "{waited:?}");
+    }
+
+    /// Every item is processed exactly once when workers with very different amounts of input hand work off to each
+    /// other, and threads that finish early process some of the work of the busy one.
+    #[test]
+    fn uneven_workers_process_every_item_once() {
+        let distributor = Distributor::<u32>::create_with_capacity(16);
+        let threads = 6;
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let distributor = distributor.clone();
+                std::thread::spawn(move || {
+                    let mut seen = vec![];
+                    let mut this = distributor.for_thread(|i: u32| {
+                        seen.push(i);
+                        std::hint::black_box((0..200).sum::<u32>());
+                    });
+                    let n = if t == 0 { 200_000 } else { 10 };
+                    for i in 0..n {
+                        this.accept(t << 24 | i);
+                    }
+                    this.close();
+                    drop(this);
+                    seen
+                })
+            })
+            .collect();
+        let results: Vec<Vec<u32>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let mut all: Vec<u32> = results.iter().flatten().copied().collect();
+        all.sort_unstable();
+        let mut expected: Vec<u32> = (0..200_000).collect();
+        for t in 1..threads {
+            expected.extend((0..10).map(|i| t << 24 | i));
+        }
+        expected.sort_unstable();
+        assert_eq!(expected, all);
+        let helped = results[1..].iter().map(|r| r.iter().filter(|i| *i >> 24 == 0).count()).sum::<usize>();
+        assert!(helped > 0, "idle threads did not help");
     }
 }

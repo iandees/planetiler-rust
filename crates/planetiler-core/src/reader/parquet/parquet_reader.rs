@@ -9,9 +9,14 @@
 //! renders into a `FeatureGroup`; [`ParquetReader::process_with`] hands features to caller-provided per-thread
 //! closures instead.
 //!
-//! TODO(port): Java hands features from each block to a `Distributor` so threads that finish early help with large
-//! row groups; here each thread processes whole blocks.
+//! Like Java, each processing thread reads whole blocks but passes its work through a shared [`Distributor`] so
+//! threads that run out of blocks help with the others' (for example one stuck on a huge row group). While every
+//! thread is busy, work stays on the thread that read it. Each thread keeps its own profile processor and
+//! `FeatureGroup` encoder/sink, so the only shared state in the hot path is the distributor's `done` counter (and
+//! its bounded queue once some threads are idle). Difference from Java: the unit of work handed off is a chunk of up
+//! to 256 decoded arrow rows ([`RowChunk`]), not a built feature; see `Progress::process_blocks`.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,7 +31,7 @@ use crate::config::planetiler_config::PlanetilerConfig;
 use crate::expression::expression::PartialInput;
 use crate::profile::Profile;
 use crate::reader::parquet::parquet_feature::ParquetFeature;
-use crate::reader::parquet::parquet_input_file::{Block, IdGenerator, ParquetInputFile};
+use crate::reader::parquet::parquet_input_file::{Block, IdGenerator, ParquetInputFile, RowChunk};
 use crate::reader::source_feature_processor::{finish_source, process_and_write_with_profile};
 use crate::stats::counter::{Counter, ThreadCounter};
 use crate::stats::progress_loggers::ProgressLoggers;
@@ -34,9 +39,19 @@ use crate::stats::stats::StatsRef;
 use crate::util::file_utils::DiskBacked;
 use crate::util::format;
 use crate::value::{Tags, Value};
+use crate::worker::distributor::Distributor;
 use crate::worker::worker_pipeline::{Builder, WorkerPipeline};
 
 pub const DEFAULT_LAYER: &str = "features";
+
+/// Maximum number of rows in one unit of work handed to another thread: big enough that the handoff (a queue
+/// operation and often a thread wake-up) is negligible next to processing the rows, small enough to balance the end of
+/// the stage finely.
+const CHUNK_ROWS: usize = 256;
+
+/// Maximum number of chunks waiting in the [`Distributor`] queue for an idle thread (about 16k rows; Java queues up to
+/// 1,000 features).
+const DISTRIBUTOR_CAPACITY: usize = 64;
 
 /// Computes the layer name for a file from its hive partition fields.
 pub type LayerGenerator = Arc<dyn Fn(&Tags) -> Value + Send + Sync>;
@@ -54,13 +69,12 @@ struct Progress {
 }
 
 impl Progress {
-    /// Reads every feature in `block` into `f`, updating the counters.
+    /// Decodes `block` into row chunks passed to `f`, updating the block counters.
     fn read_block(
         &self,
         block: &Block,
         blocks: &ThreadCounter,
-        elements: &ThreadCounter,
-        f: &mut dyn FnMut(ParquetFeature) -> Result<()>,
+        f: &mut dyn FnMut(RowChunk) -> Result<()>,
     ) -> Result<()> {
         let layer = block.layer();
         {
@@ -72,16 +86,76 @@ impl Progress {
                 }
             }
         }
-        block.read(&mut |feature| {
-            f(feature)?;
-            elements.inc();
-            Ok(())
-        })?;
+        block.read_chunks(CHUNK_ROWS, f)?;
         blocks.inc();
         if let Some(count) = self.working_on.lock().get_mut(layer) {
             *count -= 1;
         }
         Ok(())
+    }
+
+    /// The body of one processing thread: reads every block from `blocks_in` and passes each feature to `process`.
+    ///
+    /// With a `distributor` (Java's `Distributor<ParquetFeature>`), the decoded rows go through it in chunks of
+    /// [`CHUNK_ROWS`]: while every thread is busy this thread converts and processes them itself, once some threads
+    /// have run out of blocks they take chunks from this one; when this thread runs out of blocks it processes
+    /// chunks from the others until they are all done (Java's `consumer.close()`). Difference from Java: Java hands
+    /// off individual features after the reading thread has built them. Here the unit is a chunk of decoded arrow
+    /// rows, so building each feature's tags and ID (about as much work as running a simple profile on it) also moves
+    /// to the idle threads instead of staying serial on the thread that reads a big row group, and one handoff covers
+    /// many cheap features.
+    ///
+    /// The first `process` error stops reading and is returned; chunks handed to this thread after that are
+    /// dropped (the pipeline is failing anyway).
+    fn process_blocks(
+        &self,
+        blocks_in: impl IntoIterator<Item = Block>,
+        distributor: Option<&Distributor<RowChunk>>,
+        process: &mut dyn FnMut(ParquetFeature) -> Result<()>,
+    ) -> Result<()> {
+        // avoid contention trying to get the thread-local counters by getting them once when thread starts
+        let (blocks, elements) = (self.blocks.counter_for_thread(), self.features.counter_for_thread());
+        let error = RefCell::new(None);
+        let mut consume = |chunk: RowChunk| {
+            if error.borrow().is_some() {
+                return;
+            }
+            let result = chunk.read(&mut |feature| {
+                let result = process(feature);
+                elements.inc();
+                result
+            });
+            if let Err(e) = result {
+                *error.borrow_mut() = Some(e);
+            }
+        };
+        // stops reading after an error; the error itself stays in `error` (so later chunks are skipped) until the end
+        let check = || {
+            if error.borrow().is_some() { Err(anyhow::anyhow!("processing a parquet feature failed")) } else { Ok(()) }
+        };
+        let read_all = |accept: &mut dyn FnMut(RowChunk)| -> Result<()> {
+            for block in blocks_in {
+                self.read_block(&block, &blocks, &mut |chunk| {
+                    accept(chunk);
+                    check()
+                })?;
+            }
+            Ok(())
+        };
+        let result = match distributor {
+            None => read_all(&mut consume),
+            Some(distributor) => {
+                let mut consumer = distributor.for_thread(consume);
+                let result = read_all(&mut |chunk| consumer.accept(chunk));
+                // do work for other threads that are still processing blocks (or just discard it after an error)
+                consumer.close();
+                result
+            }
+        };
+        match error.into_inner() {
+            Some(e) => Err(e),
+            None => result,
+        }
     }
 }
 
@@ -91,6 +165,7 @@ pub struct ParquetReader {
     id_generator: Option<IdGenerator>,
     layer_generator: Option<LayerGenerator>,
     hive_partitioning: bool,
+    load_balancing: bool,
     stats: StatsRef,
 }
 
@@ -128,8 +203,20 @@ impl ParquetReader {
             id_generator: get_id,
             layer_generator: get_layer,
             hive_partitioning,
+            load_balancing: true,
             stats,
         }
+    }
+
+    /// Sets whether features from large blocks are handed off to processing threads that have run out of blocks of
+    /// their own (the default, like Java). With `false`, each thread processes the features of the blocks it reads.
+    pub fn with_load_balancing(mut self, load_balancing: bool) -> ParquetReader {
+        self.load_balancing = load_balancing;
+        self
+    }
+
+    fn new_distributor(&self) -> Option<Distributor<RowChunk>> {
+        self.load_balancing.then(|| Distributor::create_with_capacity(DISTRIBUTOR_CAPACITY))
     }
 
     fn get_layer_name(&self, path: &Path) -> String {
@@ -197,13 +284,10 @@ impl ParquetReader {
         }
         let cares_about = |input: &PartialInput| profile.cares_about(input);
         let stats = self.stats.clone();
+        let distributor = self.new_distributor();
         self.run(source_paths, config, &cares_about, Some(writer), |builder, progress| {
             process_and_write_with_profile(builder, writer, config, profile, &stats, move |prev, process| {
-                let (blocks, elements) = (progress.blocks.counter_for_thread(), progress.features.counter_for_thread());
-                for block in prev {
-                    progress.read_block(&block, &blocks, &elements, &mut |feature| process(&feature))?;
-                }
-                Ok(())
+                progress.process_blocks(prev, distributor.as_ref(), &mut |feature| process(&feature))
             })
         })?;
         // hook for profile to do any post-processing after this source is read
@@ -224,20 +308,17 @@ impl ParquetReader {
         P: Fn() -> ParquetProcessFn + Send + Sync + 'static,
     {
         let process_threads = config.feature_process_threads.max(1);
+        let distributor = self.new_distributor();
         self.run(source_paths, config, cares_about, None, |builder, progress| {
             builder.sink_to("process", process_threads, move |prev| {
-                let (blocks, elements) = (progress.blocks.counter_for_thread(), progress.features.counter_for_thread());
                 let mut process = processor_factory();
-                for block in prev {
-                    progress.read_block(&block, &blocks, &elements, &mut |feature| {
-                        let id = feature.id();
-                        if let Err(e) = process(feature) {
-                            error!("Error processing parquet feature {id}: {e:#}");
-                        }
-                        Ok(())
-                    })?;
-                }
-                Ok(())
+                progress.process_blocks(prev, distributor.as_ref(), &mut |feature| {
+                    let id = feature.id();
+                    if let Err(e) = process(feature) {
+                        error!("Error processing parquet feature {id}: {e:#}");
+                    }
+                    Ok(())
+                })
             })
         })
     }
@@ -352,6 +433,7 @@ mod tests {
     use geo::Centroid;
 
     use super::*;
+    use crate::geo::geo_utils;
     use crate::reader::with_tags::WithTags;
     use crate::stats::stats::InMemoryStats;
     use crate::tags;
@@ -484,6 +566,183 @@ mod tests {
             ParquetReader::new("source", stats).process(&bostons(), group, config, profile)
         });
         assert!(output.is_empty());
+    }
+
+    /// Writes a WKB GeoParquet file with one row group per entry of `row_groups` (its number of rows); row `i` of the
+    /// file gets `id = first_id + i` and a small square polygon whose position depends on the id.
+    fn write_geoparquet(path: &Path, first_id: i64, row_groups: &[usize]) {
+        use arrow::array::{BinaryArray, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("geometry", DataType::Binary, false),
+        ]));
+        let geo = r#"{"version": "1.0.0", "primary_column": "geometry", "columns": {"geometry": {"encoding": "WKB", "geometry_types": ["Polygon"]}}}"#;
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new("geo".to_string(), geo.to_string())]))
+            .set_max_row_group_row_count(None)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema.clone(), Some(props)).unwrap();
+        let mut id = first_id;
+        for &rows in row_groups {
+            let ids: Vec<i64> = (id..id + rows as i64).collect();
+            id += rows as i64;
+            let names: Vec<Option<String>> = ids.iter().map(|i| (i % 3 != 0).then(|| format!("name {i}"))).collect();
+            let geoms: Vec<Vec<u8>> = ids
+                .iter()
+                .map(|i| {
+                    let (x, y) = ((i % 97) as f64 * 0.5 - 24.0, (i % 89) as f64 * 0.4 - 17.0);
+                    let ring = vec![(x, y), (x + 0.3, y), (x + 0.3, y + 0.3), (x, y + 0.3), (x, y)];
+                    geo_utils::write_wkb(&geo_types::Polygon::new(ring.into(), vec![]).into()).unwrap()
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(names)),
+                    Arc::new(BinaryArray::from_iter_values(geoms.iter())),
+                ],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+    }
+
+    /// One huge row group and many tiny ones: the output must not depend on whether features get handed off between
+    /// threads, or on the number of threads; with load balancing, idle threads must take over part of the big block.
+    #[test]
+    fn uneven_row_groups_same_output_with_and_without_load_balancing() {
+        use std::collections::HashSet;
+        use std::thread::ThreadId;
+
+        use crate::feature_collector::FeatureCollector;
+        use crate::reader::source_feature::SourceFeature;
+        use crate::reader::source_feature_processor::test_support::{config, run_with_group};
+
+        // bigger than one 4,096-row arrow batch, so the big row group is decoded as more than one batch
+        const BIG: usize = 5_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.parquet"), dir.path().join("b.parquet"));
+        let mut groups_a = vec![3, BIG];
+        groups_a.extend(std::iter::repeat_n(5, 20));
+        write_geoparquet(&a, 0, &groups_a);
+        write_geoparquet(&b, 1_000_000, &[7; 40]);
+        assert_eq!(22, ParquetInputFile::new("s", "l", &a).unwrap().block_count());
+
+        /// Emits each feature's polygon (z2-4) and centroid (z0-1); features from the big row group are slow to
+        /// process, and the threads that processed them are recorded.
+        #[derive(Default)]
+        struct SlowBigBlock {
+            big_threads: Mutex<HashSet<ThreadId>>,
+            /// `(id tag, feature id)` of every feature
+            seen: Mutex<Vec<(i64, i64)>>,
+        }
+        impl Profile for SlowBigBlock {
+            fn process_feature(&self, source_feature: &dyn SourceFeature, features: &mut FeatureCollector<'_>) {
+                let id = source_feature.get_long("id");
+                self.seen.lock().push((id, source_feature.id()));
+                if (3..3 + BIG as i64).contains(&id) {
+                    self.big_threads.lock().insert(std::thread::current().id());
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < std::time::Duration::from_micros(40) {
+                        std::hint::spin_loop();
+                    }
+                }
+                features
+                    .polygon("polygons")
+                    .set_zoom_range(2, 4)
+                    .set_min_pixel_size(0.0)
+                    .set_attr("id", id)
+                    .inherit_attr_from_source("name");
+                features.centroid("points").set_zoom_range(0, 1).set_attr("id", id);
+            }
+        }
+
+        let run = |threads: usize, write_threads: bool, load_balancing: bool| {
+            let profile = Arc::new(SlowBigBlock::default());
+            let mut config = config(write_threads);
+            config.feature_process_threads = threads;
+            let paths = vec![a.clone(), b.clone()];
+            let mut output = run_with_group(config, profile.clone(), |group, config, dyn_profile, stats| {
+                ParquetReader::new("source", stats).with_load_balancing(load_balancing).process(
+                    &paths,
+                    group,
+                    config,
+                    dyn_profile,
+                )
+            });
+            output.sort_by_cached_key(|f| format!("{f:?}"));
+            let mut seen = profile.seen.lock().clone();
+            seen.sort_unstable();
+            let big_threads = profile.big_threads.lock().len();
+            (output, seen, big_threads)
+        };
+
+        // feature IDs (no ID generator) hash the file, row group index and 1-based row index within the row group
+        let mut ids = vec![];
+        for (path, first_id, groups) in [(&a, 0, &groups_a[..]), (&b, 1_000_000, &[7; 40][..])] {
+            let file_hash = crate::util::hashing::fnv1a64(path.to_string_lossy().as_bytes());
+            let mut id = first_id;
+            for (index, &rows) in groups.iter().enumerate() {
+                let block_hash = crate::util::hashing::fnv1a64_with_init(file_hash, &(index as i32).to_be_bytes());
+                for row in 1..=rows as i64 {
+                    ids.push((id, crate::util::hashing::fnv1a64_with_init(block_hash, &row.to_be_bytes()) as i64));
+                    id += 1;
+                }
+            }
+        }
+        ids.sort_unstable();
+        let (expected, expected_seen, _) = run(1, false, false);
+        assert_eq!(ids, expected_seen);
+        // every feature has a centroid at z0 and z1 and a polygon in at least one tile at z2-4
+        assert!(expected.len() >= ids.len() * 5, "{}", expected.len());
+        for (threads, write_threads, load_balancing) in
+            [(1, false, true), (1, true, true), (6, false, false), (6, false, true), (6, true, true)]
+        {
+            let (output, seen, big_threads) = run(threads, write_threads, load_balancing);
+            let case = format!("threads={threads} write_threads={write_threads} load_balancing={load_balancing}");
+            assert_eq!(expected_seen, seen, "{case}");
+            assert!(expected == output, "{case}: output differs");
+            if load_balancing && threads > 1 {
+                assert!(big_threads > 1, "{case}: big block was processed by {big_threads} thread(s)");
+            } else if !load_balancing {
+                assert_eq!(1, big_threads, "{case}");
+            }
+        }
+    }
+
+    /// The first error from processing a feature is returned, and nothing is processed after it.
+    #[test]
+    fn process_blocks_stops_at_first_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.parquet");
+        write_geoparquet(&path, 0, &[300, 300, 300]);
+        for load_balancing in [false, true] {
+            let progress = Progress {
+                blocks: Counter::new_multi_thread_counter(),
+                features: Counter::new_multi_thread_counter(),
+                working_on: Arc::new(Mutex::new(BTreeMap::new())),
+            };
+            let blocks = ParquetInputFile::new("source", "layer", &path).unwrap().get();
+            let distributor = load_balancing.then(|| Distributor::create_with_capacity(DISTRIBUTOR_CAPACITY));
+            let mut calls = 0;
+            let result = progress.process_blocks(blocks, distributor.as_ref(), &mut |_| {
+                calls += 1;
+                if calls == 10 { Err(anyhow::anyhow!("boom")) } else { Ok(()) }
+            });
+            assert_eq!("boom", result.unwrap_err().to_string(), "load_balancing={load_balancing}");
+            assert_eq!(10, calls, "load_balancing={load_balancing}");
+        }
     }
 
     #[test]

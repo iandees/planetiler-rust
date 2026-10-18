@@ -212,7 +212,7 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 | #1-#13 (a1) | **Done** as described, with these details: #2 points both pmtiles helpers at `util::gzip` (`gzip_zlib`, and `util::gzip::gunzip` now uses `MultiGzDecoder`); #5 keeps thin `Geometry`-returning wrappers over `geo::test_utils`; #6 adds `imposm3_parsers::bool_str`; #12 also moved `FieldType::of` into the archive type. |
 | #14 custommap `SchemaValidator` | **Done.** `planetiler_custommap::validator::{validate, SchemaValidator, main}` on top of `BaseSchemaValidator` (embedded or referenced examples, `--watch`, `verify schema.yml` shortcut, "Malformed expression"/"Malformed yaml input" messages). `planetiler verify`/`verify-custom`/`verify-schema` run it. `tests/schema_tests.rs` uses the core validator (the ~300-line reimplementation is gone) and checks the CLI output like Java's `SchemaValidatorTest`. |
 | #15 `benchmark_osm_read` | **Done.** Runs `OsmReader::pass1` with `NullProfile` and noop node/multipolygon storage. |
-| #16 parquet `Distributor` | Not done: a performance change (S-M) that needs measuring on Overture inputs; out of scope for this cleanup. |
+| #16 parquet `Distributor` | **Done** (row removed from the a2 table). `ParquetReader` passes chunks of up to 256 decoded rows through a `Distributor` so idle threads help with big row groups; on a synthetic Overture-like input with one 1.5M-row row group the read stage went from 2.9s to 1.2s (see `bench/RESULTS.md` History). |
 | #17 `feature_sort` `Worker`, #18 `external_merge_sort` `ProgressLoggers` | Not done: the sort code is being optimized concurrently; left alone to avoid merge conflicts. |
 | #19 `top_osm_tiles` `write_to_file` | Not done: the CLI is still blocked on xz (#33). |
 | #20 `ArchiveOptions` | **Done.** Removed; every archive takes `&Arguments` (`apply_fallbacks` is `Arguments::of_map(query).or_else(args.with_prefix(format))`). |
@@ -249,7 +249,6 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 |---|---|---|---|
 | 14 | `planetiler/src/main.rs:46` + `custommap/src/validator.rs:3` + `custommap/tests/schema_tests.rs:3` (3 TODOs) | `planetiler_core::validator::{base_schema_validator, schema_specification}` now exist. Implement `SchemaValidator: BaseSchemaValidator` in `custommap/validator.rs` (`validate(schema, spec)` using `build_root_context` + `ConfiguredProfile` + `base_schema_validator::validate`; `main` handling `--watch` and the `verify schema.yml` shortcut). Delete the ~400-line test-only reimplementation in `schema_tests.rs`. Wire up `verify_schema` in the CLI. `java_profile_validator.rs` (132 lines) is the model to follow. | S-M (~150 LOC net negative) |
 | 15 | `benchmarks/src/bin/benchmark_osm_read.rs:16` | `OsmReader::pass1` exists (`osm_reader.rs:560`). Build an `OsmReader` with a noop node map and a test profile, like Java's `BenchmarkOsmRead`, and call `pass1(&config)` each iteration. Delete the hand-copied pass-1 loop. | S |
-| 16 | `core/src/reader/parquet/parquet_reader.rs:12` | `worker::distributor::Distributor` exists. Wrap each block's per-feature work in `distributor.for_thread(..)` the way Java does, so idle threads help with large row groups. **This matters for performance on Overture inputs**, where some row groups are much larger than others. | S-M |
 | 17 | `core/src/collection/feature_sort.rs:164` | Return or hold a `worker::Worker` (`Worker::new(prefix, stats, threads, task)`) instead of raw `JoinHandle`s, so `ProgressLoggers::add_pipeline_stats`/`add_thread_pool_stats_for_worker` can report reader threads. | S |
 | 18 | `core/src/collection/external_merge_sort.rs:601` | `ProgressLoggers::create().add_percent_counter("chunks", num_groups, \|\| done).add_file_size_path(dir).add_process_stats().add_thread_pool_stats(..)`, and call `.log()` in the wait loop instead of the ad-hoc `info!`. | S |
 | 19 | `core/src/util/top_osm_tiles.rs:116` | `TileWeights::write_to_file` exists. Wire it into the `top-osm-tiles` CLI. Still blocked on xz (#33) for real downloads. | XS |
@@ -298,9 +297,7 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 2. **Snap rounding at segment intersections in `reduce_precision`** (#29, plus #30 for lines). M. It is a source of
    geometry and validity differences from Java in tile output, so it makes Java-vs-Rust archive comparisons noisy.
 3. ~~**MLT encoder** (#27, five markers).~~ Done (`planetiler_core::mlt`, byte-identical to Java).
-4. **Parquet `Distributor` load balancing** (#16). S-M, and the dependency is already ported. It is the best
-   performance gain per line of code for Overture builds, where uneven row-group sizes leave threads idle at the
-   end of the read phase.
+4. ~~**Parquet `Distributor` load balancing** (#16).~~ Done (`ParquetReader` hands off row chunks).
 5. **General EPSG/WKT CRS support** (#31). M. Inputs that Java accepts fail outright in Rust.
 
 The best quick wins are #32 (free-after-read disk estimate, ~10 LOC) and #14 (the custommap `SchemaValidator`/

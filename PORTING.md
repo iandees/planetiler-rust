@@ -338,8 +338,17 @@ tiles.join()?;
 - `ParquetFeature` implements `SourceFeature` itself (owns a `SourceFeatureBase`) instead of being converted to a
   `SimpleFeature`: WKB/WKT decoding stays lazy so features a profile rejects by tags never parse their geometry, and
   nothing is copied. `vector_tile_feature_id` now uses `wrapping_mul` (Java `long` overflow semantics; parquet IDs are
-  64-bit hashes). TODO(port): Java's `ParquetReader` feeds features through a `Distributor` so idle threads help
-  with large row groups; here a thread processes a whole block.
+  64-bit hashes).
+- Parquet load balancing: like Java, each processing thread reads whole row groups and passes its work through a
+  shared `worker::distributor::Distributor`, so threads that run out of row groups help with large ones. Difference
+  from Java: the unit handed off is a `parquet_input_file::RowChunk` (up to 256 decoded arrow rows, sharing the
+  `RecordBatch`), not a built `ParquetFeature`. Building tags and IDs costs about as much as running a simple profile
+  on a feature, so with per-feature handoff the thread reading a huge row group stays the bottleneck. Handing off
+  single cheap items also costs a queue operation and usually a thread wake-up (a syscall) per item: a per-feature
+  version was 3x *slower* than no load balancing on a skewed input (8.0s vs 2.7s read stage, 26s of sys time).
+  `ParquetReader::with_load_balancing(false)` turns it off. `Distributor` itself matches Java (bounded queue,
+  `try_send` or process inline, drain until every worker is finished), except that the last worker to finish wakes
+  the draining threads instead of leaving them to wait for their next 100ms poll.
 - `ShapefileReader::new(projection, source, path)` / `with_bounds(.., &Bounds)`: self-contained `.shp`/`.dbf`/`.prj`/
   `.cpg` parser (no GeoTools). Inputs: `.shp` on disk, a path inside a zip (`zip/dir/x.shp`, from
   `file_utils::walk_path_with_pattern`) or a zip containing one shapefile; zip entries are streamed (not extracted)

@@ -152,8 +152,6 @@ From [PORTING.md](PORTING.md) and the `TODO(port)` triage in
   in other projections fail where Java (GeoTools) succeeds.
 - **CLI tasks not ported:** `top-osm-tiles` (needs xz decompression) and `benchmark-mapping`.
   `benchmark-longlongmap` points you at the benchmarks crate instead.
-- **Parquet load balancing.** Parquet row groups aren't redistributed between threads (Java's `Distributor`), which
-  can leave threads idle on inputs with uneven row-group sizes.
 
 ## License
 
