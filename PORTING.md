@@ -498,15 +498,23 @@ p.run()?;
   `bike_route_overlay`, `osm_qa_tiles`, `admin_borders_overlay`, `parks_overlay`, `tram_route_overlay`,
   `water_infrastructure_project`, `overture`.
 
-**Comparison against Java** (`planetiler-dist-0.10.3-SNAPSHOT`, decoded tiles compared ignoring ring start/order):
-- Toilets overlay (Monaco, `--process_threads=1` because the sort key is a processing-order counter): identical.
-- `custom --schema=owg_simple.yml` (Monaco): identical apart from polygon ring start points/order.
-- OpenMapTiles Monaco: same 23 tiles/5357 features; remaining differences: z13 merged buildings (`mergeNearbyPolygons`
-  buffer/unbuffer output has ~50% more vertices than JTS mitre buffers, area within 0.5%), housenumber merged-point
-  IDs (Java picks the first feature of a `HashMap` iteration), polygon ring start/order.
-- OpenMapTiles Switzerland: see the final report of the orchestrator port (buffer-merge vertex counts for
-  building/landuse/landcover/transportation, `transportation_name` line-merge differences at z12-14, data error counts
-  `osm_boundary_missing_way`/`osm_multipolygon_missing_way` lower than Java).
+**Comparison against Java** (`planetiler-dist-0.10.3-SNAPSHOT`, decoded tiles compared ignoring polygon ring start
+point/order; scripts in the orchestrator port's final report):
+- Toilets overlay (Monaco, `--process_threads=1` because its sort key is a processing-order counter): identical.
+- `custom --schema=owg_simple.yml` (Monaco): identical.
+- OpenMapTiles Monaco (`--process_threads=1`): identical (incl. feature IDs) except 4 z13 merged `building`
+  features (`mergeNearbyPolygons` buffer/unbuffer: same shape within 0.5% area, ~50% more vertices than JTS mitre
+  buffers).
+- OpenMapTiles Switzerland (default threads): same feature count in every layer; differences: 2791 z13 merged
+  buildings + 725 z6-12 `landuse` + 21 `landcover` (all the same buffer-merge vertex difference), 10 `transportation`
+  lines (line-merge picks a different continuation at a junction / 1-unit vertex shifts), 1730 housenumber merged-point
+  IDs (multi-threaded input order), 28 empty tiles Java writes and Rust skips (OMT `mountain_peak` post-processing
+  nulls every feature: Java still adds an empty layer, the Rust convention removes them), and lower
+  `osm_boundary_missing_way`/`osm_multipolygon_missing_way`/`merge_snap_fix_input` data error counts (Java recomputes
+  and re-logs failed geometries per layer).
+- Fixes made while comparing: hot-pixel snap rounding in `reduce_precision`, Java multimap order for relation
+  memberships (`route_N_*` attributes), Java `HashMap` iteration order for OMT housenumber grouping, custommap OSM
+  tags, empty layers after point-buffer filtering (see above).
 
 ## Follow-ups (tracked by the coordinator)
 
@@ -519,7 +527,7 @@ p.run()?;
 - Unify the two `VectorLayer` types (`archive::tile_archive_metadata` and `util::layer_attr_stats`).
 - Re-enable the four `#[cfg(any())]` merge tests in `crates/planetiler-core/tests/` once FeatureMerge merges.
 - `feature_merge::buffer_geometry`: mitre buffer output has ~50% more vertices than JTS (z13 OpenMapTiles buildings).
-- `transportation_name` z12-14 differences vs Java on Switzerland (line merging / route attributes).
+- OMT `mountain_peak`: Java writes empty tiles when post-processing nulls every feature (28 in Switzerland); Rust skips them.
 - Port custommap `SchemaValidator` CLI, `TopOsmTiles.main` (xz), `OpenMapTilesMapping` benchmark; in-memory stream
   archive readers for the csv/tsv/json/proto `testPlanetilerRunner` variants.
 - MLT tile format (MapLibre Tile) encoder.

@@ -123,7 +123,13 @@ impl LayerPostProcessor for Housenumber {
                 }
             }
         }
-        let mut result: Vec<vector_tile::Feature> = groups.into_values().collect();
+        // Java iterates the `groupingBy` HashMap, so emit the groups in Java HashMap order (this decides which
+        // feature's ID the merged multipoint keeps)
+        let keys: Vec<String> =
+            groups.keys().map(|k| k.as_ref().map(Value::to_string_lossy).unwrap_or_default().into_owned()).collect();
+        let order = java_hash_map_order(&keys);
+        let mut slots: Vec<Option<vector_tile::Feature>> = groups.into_values().map(Some).collect();
+        let mut result: Vec<vector_tile::Feature> = order.into_iter().filter_map(|i| slots[i].take()).collect();
         // remove temporary attributes
         for item in &mut result {
             item.tags.shift_remove(TEMP_HAS_NAME);
@@ -251,5 +257,46 @@ mod tests {
         assert_eq!(vec![vt_point_feature(LAYER_NAME, tags! {"housenumber" => "765/6 (no name)"}, 1)], result);
         // only one point in multipoint => 3 commands
         assert_eq!(3, result[0].geometry.commands().len());
+    }
+}
+
+/// Java `String.hashCode` (over UTF-16 code units).
+fn java_string_hash(s: &str) -> i32 {
+    s.encode_utf16().fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32))
+}
+
+/// The order a `java.util.HashMap<String, _>` (default capacity 16, load factor 0.75) iterates `keys` inserted in
+/// order: by bucket of the final table, then insertion order within a bucket (ignoring treeified bins, which need 8+
+/// colliding keys).
+fn java_hash_map_order(keys: &[String]) -> Vec<usize> {
+    let mut capacity = 16usize;
+    while keys.len() > capacity * 3 / 4 {
+        capacity *= 2;
+    }
+    let bucket = |k: &str| {
+        let h = java_string_hash(k) as u32;
+        ((h ^ (h >> 16)) as usize) & (capacity - 1)
+    };
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by_key(|&i| bucket(&keys[i]));
+    order
+}
+
+#[cfg(test)]
+mod java_hash_map_order_tests {
+    use super::*;
+
+    #[test]
+    fn java_string_hash_matches() {
+        assert_eq!(0, java_string_hash(""));
+        assert_eq!(97, java_string_hash("a"));
+        assert_eq!(99162322, java_string_hash("hello"));
+    }
+
+    #[test]
+    fn hash_map_order() {
+        // java: new HashMap<>() with "b", "a", "c" iterates a, b, c (buckets 1, 2, 3)
+        let keys: Vec<String> = ["b", "a", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(vec![1, 0, 2], java_hash_map_order(&keys));
     }
 }
