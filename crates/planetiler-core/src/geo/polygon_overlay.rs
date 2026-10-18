@@ -80,7 +80,11 @@ fn exact_grid(max_abs: f64) -> Grid {
     if max_abs == 0.0 || !max_abs.is_finite() {
         return Grid { scale: 1.0, round: false };
     }
-    let exp = 61 - (max_abs.log2().ceil() as i32);
+    let mut exp = 61 - (max_abs.log2().ceil() as i32);
+    // log2 can round down to an integer for values just above a power of 2
+    while max_abs * 2f64.powi(exp) > I64_LIMIT {
+        exp -= 1;
+    }
     Grid { scale: 2f64.powi(exp), round: false }
 }
 
@@ -1040,5 +1044,14 @@ mod tests {
         let result = buffer_zero(&p).unwrap();
         assert!(is_valid(&result), "{result:?}");
         assert!((result.unsigned_area() - 14.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn coordinates_just_above_a_power_of_two_fit_the_grid() {
+        let max = 256.0 + 256.0 * f64::EPSILON;
+        let grid = exact_grid(max);
+        assert!(max * grid.scale <= I64_LIMIT);
+        let p: Geometry<f64> = rectangle_xy(0.0, 0.0, max, 10.0).into();
+        assert!((buffer_zero(&p).unwrap().unsigned_area() - max * 10.0).abs() < 1e-9);
     }
 }

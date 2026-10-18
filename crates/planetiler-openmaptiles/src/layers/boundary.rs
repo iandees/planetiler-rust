@@ -222,7 +222,7 @@ impl Boundary {
             let mut polygonizer = Polygonizer::new();
             polygonizer.add_all(lines);
             let polygons = polygonizer.geometry();
-            let combined = match polygon_overlay::union_all(&polygons) {
+            let combined = match planetiler_core::geo::cascaded_polygon_union::union_geometry(&polygons) {
                 Ok(combined) => combined,
                 Err(e) => {
                     warn!("Unable to build boundary polygon for OSM relation {region_id}: {e:?}");

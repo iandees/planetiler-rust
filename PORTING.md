@@ -88,6 +88,21 @@ See the table at the bottom of this file; update it as modules are completed.
   `LineString`; geo has no empty point so `EMPTY_POINT` is an empty `MultiPoint`.
 - CRS support (`geo::crs`) is limited to EPSG:4326/4269/3857 (+aliases), PROJ strings via `proj4rs`, and simple
   `GEOGCS`/web-mercator `PROJCS` WKT.
+- JTS `BufferOp` -> `geo::buffer::buffer(geom, distance, &BufferParameters)`: port of the offset curve generation
+  (`BufferParameters`, `BufferInputLineSimplifier`, `OffsetSegmentGenerator`/`OffsetSegmentString`,
+  `OffsetCurveBuilder`, `BufferCurveSetBuilder`; raw curves bit-for-bit identical to JTS) with `i_overlay` (positive
+  winding, `polygon_overlay::positive_winding_region`) instead of JTS's noding/graph. Intersection vertices are
+  recomputed with JTS's `RobustLineIntersector` and rings rotated to JTS's start point; JTS's floating-noding failure
+  (and fallback to snap-rounding at 12 digits) is predicted by emulating its noder and `FastNodingValidator`
+  (`geo::buffer::noding`). See the module docs for the remaining differences.
+- JTS `geometryCollection.union()` for polygons -> `geo::cascaded_polygon_union::union` (port of
+  `CascadedPolygonUnion` with the `STRtree` item order; pairwise `polygon_overlay::union_pair`). Use it where Java
+  calls `union()` and exact vertices matter; `polygon_overlay::union_all` is a faster single-pass union.
+- JTS primitives with identical floating point behaviour (`DD`, `CGAlgorithmsDD.orientationIndex`/`intersection`,
+  `RobustLineIntersector`, `Distance`, `Angle`, `Area.ofRingSigned`) are in `geo::cg_algorithms`; trig uses `libm`
+  (fdlibm, like `StrictMath`) since the platform `sin`/`cos`/`atan2` can differ in the last bit.
+- `polygon_overlay`'s exact grid scales coordinates so `max * scale <= 2^61` (i64 engine), so coordinates >= 1 are
+  exact; a coarser grid turns exactly-collinear edges into spurious crossings.
 - JTS `Polygonizer` -> `geo::polygonizer::Polygonizer` (`new()` / `with_extract_only_polygonal(bool)`,
   `set_check_rings_valid`, `add_geometry` / `add_all` / `add_line`, then `polygons()`, `geometry()`, `dangles()`,
   `cut_edges()`, `invalid_ring_lines()`; ports `PolygonizeGraph`, `EdgeRing`, `HoleAssigner` and the `planargraph`
@@ -107,16 +122,16 @@ See the table at the bottom of this file; update it as modules are completed.
   `merge_line_strings_with(.., resimplify, Option<GeometryPipelineRef>)`; `merge_overlapping_polygons`,
   `merge_nearby_polygons(features, min_area, min_hole_area, min_dist, buffer)`,
   `merge_nearby_polygons_with(.., &dyn Stats, Option<&dyn GeometryPipeline>)` (return `GeometryResult`).
-- JTS `BufferOp` with mitre joins -> `geo::Buffer` (`i_overlay` outline) with `LineJoin::Miter(2 * asin(1/5))`
-  (JTS mitre limit 5). Negative buffers of multi-part input are applied to their union (like JTS). i_overlay's mitre
-  joins emit 3 points per outside corner (2 near-collinear offset ends + the mitre point) where JTS emits 1, so
-  `buffer_geometry` drops vertices within `H * 2^-25` (`H` = half the input extent + 6|d|) of the line through
-  their remaining neighbors, smallest deviation first, keeping spikes (docs/analysis-merge-vertices.md Fix A).
-- `buffer_union_unbuffer` succeeds on 3 of the protomaps538 inputs where JTS's unbuffer collapses
-  (locationtech/jts#1183) and Java falls back to a plain union; the Rust result fills sub-pixel gaps (area up to ~3%
-  larger than the input), so that test allows a 3% area increase instead of 1%. The `@Slow` Boston/Jakarta tests are
-  `#[ignore]`d (run with `--release -- --ignored`, ~1s) and allow a 1% difference in the polygon count (Java's
-  exact counts are within 0.5%).
+- JTS `BufferOp` with mitre joins -> `geo::buffer` (JTS offset-curve port, see geo notes) and `union()` ->
+  `geo::cascaded_polygon_union` (docs/analysis-merge-vertices.md "Fix B"). `merge_*_matches_java` compare
+  `merge_nearby_polygons` with Java's output on the Boston/Jakarta/protomaps538 tiles (stored in
+  `tests/resources/buffer/`; ~1% of polygons differ, mostly by one vertex), and `bench_merge_building_tiles`
+  benchmarks against the previous `geo::Buffer` implementation (`tests::legacy`).
+- `buffer_union_unbuffer` succeeds on 3 of the protomaps538 inputs where JTS's floating unbuffer silently returns an
+  empty result (locationtech/jts#1183) and Java falls back to a plain union; the Rust result fills sub-pixel gaps
+  (area up to ~3% larger than the input), so that test allows a 3% area increase instead of 1%. The `@Slow`
+  Boston/Jakarta tests are `#[ignore]`d (run with `--release -- --ignored`, ~1s) and match Java's polygon counts
+  exactly.
 
 
 ### OSM multipolygon / way splitter notes
@@ -549,11 +564,8 @@ p.run()?;
 point/order; scripts in the orchestrator port's final report):
 - Toilets overlay (Monaco, `--process_threads=1` because its sort key is a processing-order counter): identical.
 - `custom --schema=owg_simple.yml` (Monaco): identical.
-- OpenMapTiles Monaco (`--process_threads=1`): identical (incl. feature IDs) except 4 z13 merged `building`
-  features (`mergeNearbyPolygons` buffer/unbuffer). After removing near-collinear buffer vertices they have 3610
-  points vs Java's 3666 (was 5823, ~+59%), and 163 of their 211 rings are identical (was 54); the rest differ by
-  sub-pixel JTS-vs-i_overlay offset-curve details (a vertex Java keeps at a shallow input corner, 1-unit shifts).
-  Exact parity needs a port of JTS `OffsetCurveBuilder`/`BufferInputLineSimplifier` (Fix B in the analysis).
+- OpenMapTiles Monaco: identical. (The 4 z13 merged `building` features that used to differ match since the JTS
+  buffer port.)
 - OpenMapTiles Switzerland (default threads): same feature count in every layer; differences: 2791 z13 merged
   buildings + 725 z6-12 `landuse` + 21 `landcover` (all the same buffer-merge vertex difference), 10 `transportation`
   lines (line-merge picks a different continuation at a junction / 1-unit vertex shifts), 1730 housenumber merged-point
@@ -564,6 +576,8 @@ point/order; scripts in the orchestrator port's final report):
   Re-run 2026-10-18 (`docs/switzerland-parity.md`): tile sets identical (the 28 empty tiles are fixed); 2387 z13
   buildings, 404 landuse, 21 landcover, 10 transportation, 1730 housenumber ID diffs; one extra z13 building in Rust
   (a merged polygon of area 4.002 px² at the 4 px² merge threshold).
+  After the JTS buffer port: same feature count in every layer; 578 z13 buildings, 35 landuse, 17 landcover and 10
+  transportation features differ (`docs/switzerland-parity.md`).
 - Fixes made while comparing: hot-pixel snap rounding in `reduce_precision`, Java multimap order for relation
   memberships (`route_N_*` attributes), Java `HashMap` iteration order for OMT housenumber grouping, custommap OSM
   tags, empty layers after point-buffer filtering (see above).
@@ -576,8 +590,6 @@ point/order; scripts in the orchestrator port's final report):
   `planetiler_core::mbtiles::verify`.
 - Unify the two `VectorLayer` types (`archive::tile_archive_metadata` and `util::layer_attr_stats`).
 - Re-enable the four `#[cfg(any())]` merge tests in `crates/planetiler-core/tests/` once FeatureMerge merges.
-- `feature_merge::buffer_geometry`: near-collinear mitre vertices are now removed (Monaco z13 buildings within ~1.5%
-  of Java's vertex count); exact parity would need a port of the JTS offset-curve builder.
 - Port custommap `SchemaValidator` CLI, `TopOsmTiles.main` (xz), `OpenMapTilesMapping` benchmark; in-memory stream
   archive readers for the csv/tsv/json/proto `testPlanetilerRunner` variants.
 - MLT tile format (MapLibre Tile) encoder.

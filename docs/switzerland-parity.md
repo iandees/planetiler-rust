@@ -77,6 +77,27 @@ Note that `compare` counts polygon geometry command differences that the normali
 (different ring start point or ring order), which is why its `landcover`/`water`/`park`/`aeroway` numbers are larger
 than the normalized ones (0 for `water`, `park`, `aeroway`).
 
+## After the JTS buffer port (Fix B)
+
+Re-checked 2026-10-18 with the JTS offset-curve / `CascadedPolygonUnion` port (`docs/analysis-merge-vertices.md`
+"Fix B"), Rust output `target/release/planetiler --osm_path=switzerland-latest.osm.pbf` (same cached sources)
+against the same Java archive:
+
+- Tiles: identical set (23,922). Feature count per layer: identical in every layer, including `building` (39,652;
+  the extra Rust building at the area threshold is gone).
+- Differing features (normalized, ignoring IDs; Java-only / Rust-only):
+
+| Layer | Now | Before |
+|-------|-----|--------|
+| building | 578 / 578 (all z13) | 2,387 / 2,388 |
+| landuse | 35 / 35 (z6-z14) | 404 / 404 |
+| landcover | 17 / 17 (z11-z14) | 21 / 21 |
+| transportation | 10 / 10 | 10 / 10 (line merging, unrelated) |
+| boundary | 0 | 0 (now with the `Polygonizer` port for `adm0_l`/`adm0_r`) |
+| all other layers | 0 | 0 |
+
+Monaco: identical to Java in every layer.
+
 ## Reproduce
 
 ```sh

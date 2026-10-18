@@ -44,6 +44,52 @@ Do not put it in `snap_and_fix` (Java keeps collinear points there).
 `OffsetSegmentString`, `OffsetCurveBuilder.getRingCurve` into `geo/` and union the raw curves with `polygon_overlay`
 (`FillRule::Positive`).
 
+**Status: Fix B implemented** (replaces Fix A and `geo::Buffer`; the old implementation is kept only as
+`feature_merge::tests::legacy` for benchmarking). What it took, in order of impact:
+
+1. `geo::buffer`: port of `BufferParameters`, `BufferInputLineSimplifier`, `OffsetSegmentGenerator` /
+   `OffsetSegmentString` (all joins and caps), `OffsetCurveBuilder` and `BufferCurveSetBuilder` (erosion and
+   inverted-ring checks, hole handling, `keepLargestArea`). The raw curves are bit-for-bit identical to JTS's
+   (`geo::cg_algorithms` ports JTS's double-double orientation/intersection, `RobustLineIntersector`,
+   `Distance`/`Angle` helpers; trig uses fdlibm via `libm`). The curves are resolved with `i_overlay`, positive fill.
+2. Exact integer grid: `polygon_overlay::exact_grid` now scales so `max * scale <= 2^61` (was `2^52`), so every
+   coordinate >= 1 px is exact on the grid. With the coarser grid, edges that are exactly collinear (or vertices
+   exactly on another edge) in doubles became crossing or off-edge, adding vertices JTS doesn't have.
+3. `geo::cascaded_polygon_union`: Java's `geometryCollection.union()` is `CascadedPolygonUnion` (STRtree order,
+   pairwise classic `OverlayOp`). Each pairwise union's intersection points are computed from that pair's segments,
+   so the order changes their last bits; a single-pass union matched Java's union exactly in only 69% of Boston
+   groups, the cascade in 99.9%.
+4. JTS-exact output vertices: after each overlay, vertices that are not input vertices are recomputed with JTS's
+   `RobustLineIntersector` on the two input segments (i_overlay's are a few ulps off), and every ring is rotated to
+   start where JTS's graph starts it (the first result edge along the input rings). Start points matter because
+   the next buffer's input simplification and first join depend on them.
+5. JTS's fixed-precision fallback: JTS's floating noding of the unbuffer curves is often invalid (rounded nodes
+   leave crossings), building the result throws, and `BufferOp` retries with snap-rounding at 12 significant digits
+   (output on a 1e-9 grid). `geo::buffer::noding` emulates JTS's `MCIndexNoder` + `IntersectionAdder` and
+   `FastNodingValidator` to predict that (all 73 fallbacks on a Boston tile, 6 false positives in 2,211), and the
+   port then snap-rounds the same way (hot pixels at curve vertices and intersections). This alone fixed ~70% of the
+   remaining differences.
+
+Results:
+
+- `mergeNearbyPolygons` vs Java on the Boston/Jakarta test tiles (new `merge_*_matches_java` tests with Java's
+  output stored in `tests/resources/buffer/`): polygon counts now exactly equal (1141, 947, 1073, 410); polygons
+  without an identical Java polygon: 11/1141, 5/947, 19/1073, 11/410 (before: 195, 105, 176, 97 with Fix A).
+  Almost all remaining ones differ in one vertex by one 1/16 px unit or one extra/missing vertex.
+- Monaco OpenMapTiles: identical to Java (the 4 z13 `building` features now match).
+- Switzerland: building 578 differing features (was 2,387), landuse 35 (was 404), landcover 17 (was 21), same
+  feature count in every layer (`docs/switzerland-parity.md`).
+
+Remaining causes: clusters of intersection points a few ulps apart that JTS's floating noding keeps and `i_overlay`
+merges (they round differently later); wrong fallback predictions; JTS's floating noding being invalid without
+JTS noticing (locationtech/jts#1183: JTS returns an empty buffer and Java falls back to a plain union, the port
+returns the snap-rounded result); `Math.sin`/`cos` intrinsics vs fdlibm in limited mitre joins.
+
+Performance (`feature_merge::tests::bench_merge_building_tiles`, release, min CPU of 7, loaded machine):
+buffer/union/unbuffer+snap of every group of nearby buildings, port vs `geo::Buffer`: Boston 221 vs 190 ms (+16%),
+176 vs 148 ms (+19%), 179 vs 148 ms (+21%); Jakarta 651 vs 1038 ms (-37%). Switzerland end to end: 158 s user CPU
+(168 s CPU before).
+
 **Regression test:** merge ~30°-rotated L-shapes/rectangles with `buffer = 0.5` and assert exact vertex counts
 (rotated L: 6 + closing point; currently 8).
 

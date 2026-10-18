@@ -2167,12 +2167,9 @@ mod tests {
         poly
     }
 
-    /// geo's mitre buffer emits 3 vertices per outside corner where JTS emits 1; after buffer/union/unbuffer the 2
-    /// extra (near-collinear) points survive on every concave corner of non-axis-aligned shapes unless they are
-    /// removed (docs/analysis-merge-vertices.md). Expected output is Java's
-    /// `FeatureMerge.mergeNearbyPolygons(features, 0, 0, 0.5, 0.5)` on the same input (some keep a vertex or two
-    /// where rounding the input to the tile grid left the bridged edges slightly non-collinear). Before the fix the
-    /// 30° L had 11 points instead of 8.
+    /// Merged rotated L-shapes / rectangles match Java's `FeatureMerge.mergeNearbyPolygons(features, 0, 0, 0.5, 0.5)`
+    /// exactly (some keep a vertex or two where rounding the input to the tile grid left the bridged edges slightly
+    /// non-collinear). With `geo::Buffer` the 30° L had 11 points instead of 8 (docs/analysis-merge-vertices.md).
     #[test]
     fn merge_rotated_polygons_match_java() {
         /// (rotation, L point count, L from Java, rectangles point count, rectangles from Java)
