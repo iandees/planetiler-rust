@@ -53,7 +53,7 @@ impl SimpleReader for GeoJsonReader {
     }
 
     fn read_features(&self, next: &mut FeatureSink<'_>) -> Result<()> {
-        let layer = Some(self.layer.clone());
+        let layer: Option<std::sync::Arc<str>> = Some(self.layer.as_str().into());
         for (id, feature) in self.file.iter()?.enumerate() {
             let feature = feature?;
             next(ReaderFeature {
@@ -64,6 +64,31 @@ impl SimpleReader for GeoJsonReader {
             })?;
         }
         Ok(())
+    }
+}
+
+/// Entry points that run a profile on geojson files (Java's static `GeoJsonReader.process`).
+impl GeoJsonReader {
+    /// Renders map features for all elements from the geojson files at `source_paths` based on the mapping logic
+    /// defined in `profile`, writing them to `writer`.
+    pub fn process(
+        source_name: &str,
+        source_paths: Vec<std::path::PathBuf>,
+        writer: &std::sync::Arc<crate::collection::feature_group::FeatureGroup>,
+        config: &std::sync::Arc<crate::config::planetiler_config::PlanetilerConfig>,
+        profile: &std::sync::Arc<dyn crate::profile::Profile>,
+        stats: crate::stats::stats::StatsRef,
+    ) -> Result<()> {
+        let name = source_name.to_string();
+        crate::reader::source_feature_processor::process_files(
+            source_name,
+            source_paths,
+            move |path: &Path| Ok(GeoJsonReader::new(&name, path)),
+            writer,
+            config,
+            profile,
+            stats,
+        )
     }
 }
 
@@ -124,5 +149,27 @@ mod tests {
         let (features, _) = read_file("feature.geojson", "feature", 1);
         let c = centroid(&features);
         assert!((c.x() - 102.0).abs() < 1e-5 && (c.y() - 0.5).abs() < 1e-5, "{c:?}");
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::reader::source_feature_processor::test_support::*;
+
+    #[test]
+    fn process_geojson_with_profile() {
+        let resources = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/resources");
+        let paths = vec![resources.join("featurecollection.geojson"), resources.join("newlines.geojson")];
+        let profile = Arc::new(CollectingProfile::default());
+        let output = run_with_group(config(false), profile.clone(), |group, config, profile, stats| {
+            GeoJsonReader::process("geojson", paths.clone(), group, config, profile, stats)
+        });
+        profile.assert_saw("geojson", &[("featurecollection", 3), ("newlines", 3)]);
+        assert_eq!(6, output.len());
+        assert_eq!(vec!["geojson"], *profile.finished.lock());
     }
 }

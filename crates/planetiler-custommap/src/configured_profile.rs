@@ -7,6 +7,7 @@ use planetiler_core::expression::expression::{Expression, match_type, or};
 use planetiler_core::expression::multi_expression::{Index, MultiExpression, entry};
 use planetiler_core::expression::simplifiable::Simplifiable;
 use planetiler_core::feature_collector::FeatureCollector;
+use planetiler_core::feature_merge;
 use planetiler_core::geo::geometry_exception::GeometryResult;
 use planetiler_core::profile::Profile;
 use planetiler_core::reader::osm::osm_element::Way;
@@ -141,21 +142,35 @@ impl Profile for ConfiguredProfile {
     fn post_process_layer_features(
         &self,
         layer: &str,
-        _zoom: u32,
-        _items: &mut Vec<vector_tile::Feature>,
+        zoom: u32,
+        items: &mut Vec<vector_tile::Feature>,
     ) -> GeometryResult<()> {
         let Some(feature_layer) = self.find_feature_layer(layer) else {
             return Ok(());
         };
-        let Some(_post_process) = &feature_layer.post_process else {
+        let Some(post_process) = &feature_layer.post_process else {
             return Ok(());
         };
-        // TODO(port): FeatureMerge is not ported yet. When it is:
-        // - merge_line_strings: FeatureMerge::merge_line_strings(items, min_length (min_length_at_max_zoom at
-        //   config.maxzoom_for_rendering, falling back to config.min_feature_size(zoom)), tolerance
-        //   (tolerance_at_max_zoom / config.tolerance(zoom)), buffer (merge.buffer, layer.buffer, or 4))
-        // - merge_polygons: FeatureMerge::merge_overlapping_polygons(items, min_area (min_area_at_max_zoom at max
-        //   zoom, falling back to config.min_feature_size(zoom)^2))
+        let config = self.root_context.config();
+        let at_max_zoom = zoom == config.maxzoom_for_rendering;
+
+        if let Some(merge) = &post_process.merge_line_strings {
+            let min_length = if at_max_zoom { merge.min_length_at_max_zoom } else { merge.min_length }
+                .unwrap_or_else(|| config.min_feature_size(zoom));
+            let tolerance = if at_max_zoom { merge.tolerance_at_max_zoom } else { merge.tolerance }
+                .unwrap_or_else(|| config.tolerance(zoom));
+            let buffer = merge.buffer.or(feature_layer.buffer).unwrap_or(4.0);
+            // after merging, remove lines still less than {min_length}px long, simplify output with a {tolerance}px
+            // tolerance, and remove detail more than {buffer}px outside the tile boundary
+            *items = feature_merge::merge_line_strings(std::mem::take(items), min_length, tolerance, buffer);
+        }
+
+        if let Some(merge) = &post_process.merge_polygons {
+            let min_area = if at_max_zoom { merge.min_area_at_max_zoom } else { merge.min_area }
+                .unwrap_or_else(|| config.min_feature_size(zoom) * config.min_feature_size(zoom));
+            // after merging, remove polygons still less than {min_area} square tile pixels
+            *items = feature_merge::merge_overlapping_polygons(std::mem::take(items), min_area)?;
+        }
         Ok(())
     }
 

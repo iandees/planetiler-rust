@@ -206,13 +206,12 @@ impl OsmElement {
 
 /// Vector tile feature ID for an OSM element: `id * multiplier + type offset`.
 pub fn vector_tile_feature_id(multiplier: i32, id: i64, element_type: OsmElementType) -> i64 {
-    id * multiplier as i64
-        + match element_type {
-            OsmElementType::Other => 0,
-            OsmElementType::Node => 1,
-            OsmElementType::Way => 2,
-            OsmElementType::Relation => 3,
-        }
+    id.wrapping_mul(multiplier as i64).wrapping_add(match element_type {
+        OsmElementType::Other => 0,
+        OsmElementType::Node => 1,
+        OsmElementType::Way => 2,
+        OsmElementType::Relation => 3,
+    })
 }
 
 macro_rules! impl_with_tags {

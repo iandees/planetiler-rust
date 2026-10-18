@@ -141,7 +141,7 @@ impl NaturalEarthReader {
         let Some(geometry_column) = columns.iter().position(|c| c == "GEOMETRY") else {
             return Ok(true);
         };
-        let layer = Some(table.to_string());
+        let layer: Option<std::sync::Arc<str>> = Some(table.into());
         let mut rows = stmt.query([])?;
         let mut id = first_id;
         let mut batch = Vec::with_capacity(BATCH);
@@ -238,6 +238,36 @@ impl Drop for NaturalEarthReader {
     }
 }
 
+/// Entry points that run a profile on natural earth (Java's static `NaturalEarthReader.process`).
+impl NaturalEarthReader {
+    /// Renders map features for all elements from the natural earth sqlite file at `source_path` (or a zip file
+    /// containing it, extracted to `tmp_dir`) based on the mapping logic defined in `profile`, writing them to
+    /// `writer`. When `keep_unzipped` is true, the extracted file is kept to speed up subsequent runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process(
+        source_name: &str,
+        source_path: &Path,
+        tmp_dir: &Path,
+        writer: &std::sync::Arc<crate::collection::feature_group::FeatureGroup>,
+        config: &std::sync::Arc<crate::config::planetiler_config::PlanetilerConfig>,
+        profile: &std::sync::Arc<dyn crate::profile::Profile>,
+        stats: crate::stats::stats::StatsRef,
+        keep_unzipped: bool,
+    ) -> Result<()> {
+        let name = source_name.to_string();
+        let tmp_dir = tmp_dir.to_path_buf();
+        crate::reader::source_feature_processor::process_files(
+            source_name,
+            vec![source_path.to_path_buf()],
+            move |path: &Path| NaturalEarthReader::new(&name, path, &tmp_dir, keep_unzipped),
+            writer,
+            config,
+            profile,
+            stats,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use geo::Centroid;
@@ -323,5 +353,47 @@ mod tests {
         assert!(!is_valid_table_name("ne_"));
         assert!(!is_valid_table_name("ne_a-b"));
         assert!(!is_valid_table_name("geometry_columns"));
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::reader::source_feature_processor::test_support::*;
+
+    #[test]
+    fn process_natural_earth_with_profile() {
+        let zip = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/resources/natural_earth_vector.sqlite.zip");
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = Arc::new(CollectingProfile::default());
+        let output = run_with_group(config(true), profile.clone(), |group, config, profile, stats| {
+            NaturalEarthReader::process("ne", &zip, tmp.path(), group, config, profile, stats, false)
+        });
+        // features entirely outside the web mercator latitude range are skipped like in Java
+        let reader = NaturalEarthReader::new("ne", &zip, tmp.path(), false).unwrap();
+        let world = *crate::geo::geo_utils::WORLD_LAT_LON_BOUNDS;
+        let in_bounds = reader
+            .read_all()
+            .unwrap()
+            .iter()
+            .filter(|f| crate::geo::envelope::Envelope::of_geometry(&f.geometry).intersects(&world))
+            .count();
+        assert!(in_bounds > 7_600, "{in_bounds}");
+        let seen = profile.seen.lock();
+        assert_eq!(in_bounds, seen.len());
+        assert!(seen.iter().all(|(source, _, _)| source == "ne"));
+        assert_eq!(
+            19,
+            seen.iter().filter(|(_, layer, _)| layer == "ne_110m_geography_regions_elevation_points").count()
+        );
+        drop(seen);
+        assert_eq!(
+            19,
+            output.iter().filter(|(_, layer, _)| layer == "ne_110m_geography_regions_elevation_points").count()
+        );
+        assert_eq!(vec!["ne"], *profile.finished.lock());
     }
 }

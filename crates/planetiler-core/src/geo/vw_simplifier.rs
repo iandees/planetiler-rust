@@ -24,8 +24,14 @@ struct IndexedMinHeap {
 const NOT_IN_HEAP: usize = usize::MAX;
 
 impl IndexedMinHeap {
-    fn new(n: usize) -> Self {
-        IndexedMinHeap { heap: Vec::with_capacity(n), pos: vec![NOT_IN_HEAP; n], values: vec![0.0; n] }
+    /// Clears the heap and prepares it for ids `0..n`, reusing the existing allocations.
+    fn reset(&mut self, n: usize) {
+        self.heap.clear();
+        self.heap.reserve(n);
+        self.pos.clear();
+        self.pos.resize(n, NOT_IN_HEAP);
+        self.values.clear();
+        self.values.resize(n, 0.0);
     }
 
     #[inline]
@@ -110,6 +116,29 @@ impl IndexedMinHeap {
 
 const NONE: usize = usize::MAX;
 
+/// Per-thread buffers reused between calls so simplifying small geometries doesn't allocate.
+struct Scratch {
+    prev: Vec<usize>,
+    next: Vec<usize>,
+    areas: Vec<f64>,
+    heap: IndexedMinHeap,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Scratch {
+            prev: Vec::new(),
+            next: Vec::new(),
+            areas: Vec::new(),
+            heap: IndexedMinHeap { heap: Vec::new(), pos: Vec::new(), values: Vec::new() },
+        }
+    }
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::new());
+}
+
 /// Area of the triangle formed by 3 points.
 #[inline]
 pub fn triangle_area(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> f64 {
@@ -159,10 +188,23 @@ impl VWSimplifier {
         if num <= min_points {
             return coords.to_vec();
         }
-        let mut prev = vec![NONE; num];
-        let mut next = vec![NONE; num];
-        let mut areas = vec![0.0; num];
-        let mut heap = IndexedMinHeap::new(num);
+        SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+            Ok(mut scratch) => self.simplify_with(coords, min_points, &mut scratch),
+            Err(_) => self.simplify_with(coords, min_points, &mut Scratch::new()),
+        })
+    }
+
+    fn simplify_with(&self, coords: &[Coord<f64>], min_points: usize, scratch: &mut Scratch) -> Vec<Coord<f64>> {
+        let num = coords.len();
+        let Scratch { prev, next, areas, heap } = scratch;
+        prev.clear();
+        prev.resize(num, NONE);
+        next.clear();
+        next.resize(num, NONE);
+        areas.clear();
+        areas.resize(num, 0.0);
+        heap.reset(num);
+        let (prev, next, areas) = (&mut prev[..], &mut next[..], &mut areas[..]);
 
         let update_area = |i: usize, prev: &[usize], next: &[usize]| -> f64 {
             let (p, n) = (prev[i], next[i]);
@@ -177,10 +219,10 @@ impl VWSimplifier {
         for i in 1..num {
             prev[i] = i - 1;
             next[i - 1] = i;
-            areas[i - 1] = update_area(i - 1, &prev, &next);
+            areas[i - 1] = update_area(i - 1, prev, next);
             heap.push(i - 1, areas[i - 1]);
         }
-        areas[num - 1] = update_area(num - 1, &prev, &next);
+        areas[num - 1] = update_area(num - 1, prev, next);
         heap.push(num - 1, areas[num - 1]);
 
         let mut left = num;
@@ -197,11 +239,11 @@ impl VWSimplifier {
             }
             left -= 1;
             if p != NONE {
-                areas[p] = update_area(p, &prev, &next);
+                areas[p] = update_area(p, prev, next);
                 heap.update(p, areas[p]);
             }
             if n != NONE {
-                areas[n] = update_area(n, &prev, &next);
+                areas[n] = update_area(n, prev, next);
                 heap.update(n, areas[n]);
             }
         }

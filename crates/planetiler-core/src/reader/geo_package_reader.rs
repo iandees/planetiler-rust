@@ -283,7 +283,7 @@ impl GeoPackageReader {
 }
 
 fn decode_rows(table_name: &str, transform: &MathTransform, rows: Vec<RawRow>) -> Result<Vec<ReaderFeature>> {
-    let layer = Some(table_name.to_string());
+    let layer: Option<std::sync::Arc<str>> = Some(table_name.into());
     rows.into_iter()
         .map(|row| {
             let mut geometry =
@@ -387,6 +387,43 @@ impl Drop for GeoPackageReader {
     }
 }
 
+/// Entry points that run a profile on geopackages (Java's static `GeoPackageReader.process`).
+impl GeoPackageReader {
+    /// Renders map features for all elements from the geopackages at `source_paths` (`.gpkg` files or paths inside
+    /// zip files, extracted to `tmp_dir`) based on the mapping logic defined in `profile`, writing them to `writer`.
+    ///
+    /// `source_projection` overrides the CRS declared in the geopackage. When `keep_unzipped` is true, extracted
+    /// files are kept in `tmp_dir` to speed up subsequent runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process(
+        source_projection: Option<&str>,
+        source_name: &str,
+        source_paths: Vec<PathBuf>,
+        tmp_dir: &Path,
+        writer: &std::sync::Arc<crate::collection::feature_group::FeatureGroup>,
+        config: &std::sync::Arc<crate::config::planetiler_config::PlanetilerConfig>,
+        profile: &std::sync::Arc<dyn crate::profile::Profile>,
+        stats: crate::stats::stats::StatsRef,
+        keep_unzipped: bool,
+    ) -> Result<()> {
+        let projection = source_projection.map(str::to_string);
+        let name = source_name.to_string();
+        let tmp_dir = tmp_dir.to_path_buf();
+        let bounds = config.bounds.clone();
+        crate::reader::source_feature_processor::process_files(
+            source_name,
+            source_paths,
+            move |path: &Path| {
+                GeoPackageReader::new(projection.as_deref(), &name, path, &tmp_dir, keep_unzipped, Some(&bounds))
+            },
+            writer,
+            config,
+            profile,
+            stats,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use geo::Centroid;
@@ -486,5 +523,42 @@ mod tests {
         .unwrap();
         assert_eq!(GeoPackageGeometryHeader { srs_id: 4326, empty: false, wkb_offset: 40 }, header);
         assert!(parse_geometry_header(b"XX000000").is_err());
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::reader::source_feature_processor::test_support::*;
+    use crate::util::file_utils;
+
+    #[test]
+    fn process_geopackage_with_profile() {
+        let resources = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/resources");
+        let in_zip =
+            file_utils::walk_path_with_pattern(&resources.join("geopackage.gpkg.zip"), "*.gpkg").unwrap().remove(0);
+        for (write_threads, path) in [(false, resources.join("geopackage.gpkg")), (true, in_zip)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let profile = Arc::new(CollectingProfile::default());
+            let output = run_with_group(config(write_threads), profile.clone(), |group, config, profile, stats| {
+                GeoPackageReader::process(
+                    None,
+                    "gpkg",
+                    vec![path.clone()],
+                    tmp.path(),
+                    group,
+                    config,
+                    profile,
+                    stats,
+                    false,
+                )
+            });
+            profile.assert_saw("gpkg", &[("stations", 86)]);
+            assert_eq!(86, output.len());
+            assert_eq!(vec!["gpkg"], *profile.finished.lock());
+        }
     }
 }

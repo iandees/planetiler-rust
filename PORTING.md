@@ -70,6 +70,8 @@ See the table at the bottom of this file; update it as modules are completed.
 | `archive::tile_archive_writer` (`TileArchiveWriter.writeOutput`), `validator::{schema_specification, base_schema_validator, java_profile_validator}`, `testing` harness + `tests/planetiler_tests*.rs` (the `runWithReaderFeatures` subset of `PlanetilerTests`), benchmark `benchmark_tile_archive_writer` | done (MLT output errors; OSM/orchestrator tests listed as `TODO(port)` in `tests/planetiler_tests.rs`) |
 | `planetiler-openmaptiles`: `Generate` (generator + vendored schema), generated `OpenMapTilesSchema`/`Tables`, `OpenMapTilesProfile`, `OpenMapTilesMain` (setup only), all 16 layers, `OmtLanguageUtils`, `Utils`, `VerifyMonaco`, all unit tests (249) | done (see notes below; deferred: `OpenMapTilesTest` end-to-end + runner call wait on `Planetiler`; uses a FeatureMerge copy until core lands it) |
 | `planetiler-custommap` (configschema, contexts, TagValueProducer, TypeConversion, ConfigExpression/Parser, BooleanExpressionParser/Script, CEL stdlib on the `cel` crate, ConfiguredFeature, ConfiguredProfile, ConfiguredMapMain `configure`, bundled samples + JSON schemas) | done (see notes below); deferred: `post_process_layer_features` merging (needs `FeatureMerge`), the planetiler run in `ConfiguredMapMain` (needs `Planetiler`), `SchemaValidator` CLI (needs `planetiler_core::validator`), `ConfiguredMapTest`/`VerifyMonaco` (full pipeline) |
+| `feature_merge` (`FeatureMerge`: line merging via `LoopLineMerger`, nearby/overlapping polygon merging with buffer/union/unbuffer, multi-point/line/polygon merging, `remove_points_outside_buffer`, `group_by_attrs`, `extract_connected_components`) + full `FeatureMergeTest` | done (see notes below) |
+| `reader::{simple_reader, source_feature_processor, shapefile_reader, geo_package_reader, natural_earth_reader}`, `reader::geojson::*`, `reader::parquet::*` + benchmark `benchmark_simple_readers` | done, including profile/`FeatureGroup` wiring (`source_feature_processor::process_files`, per-reader `process` entry points, `impl SourceFeature for ParquetFeature`); see notes for the orchestrator API |
 
 ### `geo` notes
 
@@ -83,6 +85,25 @@ See the table at the bottom of this file; update it as modules are completed.
   `LineString`; geo has no empty point so `EMPTY_POINT` is an empty `MultiPoint`.
 - CRS support (`geo::crs`) is limited to EPSG:4326/4269/3857 (+aliases), PROJ strings via `proj4rs`, and simple
   `GEOGCS`/web-mercator `PROJCS` WKT.
+- `LoopLineMerger` stores both directions of an edge as one pair (`id ^ 1` is the reverse) sharing a coordinate range
+  in one arena, node edge lists are inline for up to 4 edges, and node lookup uses one `hashbrown` map; output is
+  identical to the straight port. `VWSimplifier` reuses thread-local scratch buffers.
+
+### `feature_merge` notes
+
+- Functions take `Vec<Feature>` by value and move unchanged features to the output. Overloads:
+  `merge_line_strings(features, min_length, tolerance, buffer)`, `merge_line_strings_resimplify(.., resimplify)`,
+  `merge_line_strings_dynamic(features, |tags| min_length, tolerance, buffer)`,
+  `merge_line_strings_with(.., resimplify, Option<GeometryPipelineRef>)`; `merge_overlapping_polygons`,
+  `merge_nearby_polygons(features, min_area, min_hole_area, min_dist, buffer)`,
+  `merge_nearby_polygons_with(.., &dyn Stats, Option<&dyn GeometryPipeline>)` (return `GeometryResult`).
+- JTS `BufferOp` with mitre joins -> `geo::Buffer` (`i_overlay` outline) with `LineJoin::Miter(2 * asin(1/5))`
+  (JTS mitre limit 5). Negative buffers of multi-part input are applied to their union (like JTS).
+- `buffer_union_unbuffer` succeeds on 3 of the protomaps538 inputs where JTS's unbuffer collapses
+  (locationtech/jts#1183) and Java falls back to a plain union; the Rust result fills sub-pixel gaps (area up to ~3%
+  larger than the input), so that test allows a 3% area increase instead of 1%. The `@Slow` Boston/Jakarta tests are
+  `#[ignore]`d (run with `--release -- --ignored`, ~1s) and allow a 1% difference in the polygon count (Java's
+  exact counts are within 0.5%).
 
 
 ### OSM multipolygon / way splitter notes
@@ -218,17 +239,41 @@ tiles.join()?;
 
 - Readers are *decoders*: they implement `reader::simple_reader::SimpleReader` (`source_name()`, `feature_count() ->
   Result<u64>`, `read_features(&mut dyn FnMut(ReaderFeature) -> Result<()>)`, `read_all()`) and emit
-  `ReaderFeature { geometry (lat/lon), tags, source_layer, id }` (the arguments of Java's `SimpleFeature.create`).
+  `ReaderFeature { geometry (lat/lon), tags, source_layer: Option<Arc<str>> (one shared Arc per layer), id }`.
   Readers may decode in parallel internally but always call the sink from the calling thread.
-  **TODO(port) for whoever ports `SimpleFeature`/`Profile`/`FeatureGroup`:** add `ReaderFeature -> SimpleFeature`
-  (`SimpleFeature.create(geometry, tags, sourceName, sourceLayer, id)`), then build Java's
-  `SourceFeatureProcessor.processFiles(name, paths, readerFactory, writer, config, profile, stats)` on top of
-  `source_feature_processor::process_files(name, paths, reader_factory, config, stats, processor_factory)` (the
-  per-thread `processor_factory` closure should convert to `SimpleFeature`, run `profile.process_feature`, render
-  into `writer.writer_for_thread()`, and `profile.finish(..)` must be called afterwards), and the static
-  `ShapefileReader.processWithProjection`, `GeoPackageReader.process`, `NaturalEarthReader.process`,
-  `GeoJsonReader.process` entry points. Same for `ParquetReader::process(paths, config, cares_about,
-  processor_factory)` (pass `profile.cares_about`, wrap `ParquetFeature` as a `SourceFeature`).
+  `ReaderFeature::into_simple_feature(&Arc<str> source)` moves geometry/tags/layer into a `SimpleFeature` (Java
+  `SimpleFeature.create(geometry, tags, sourceName, sourceLayer, id)`).
+- **Profile wiring** (`reader::source_feature_processor`): `process_files(name, paths, reader_factory, &writer,
+  &config, &profile, stats)` is Java's static `SourceFeatureProcessor.processFiles`: `read` threads ->
+  `process_queue` -> `feature_group::process_and_write` (inline when `config.parallel_temp_io`, else via write
+  threads). Each process thread owns a `ProfileProcessor` (`feature_collector::Factory`, `RenderedFeatureEncoder`,
+  shared `Arc<FeatureRenderer>`), skips features whose lat/lon envelope misses `config.bounds`, runs
+  `profile.process_feature` (panics are caught and logged like Java's `catch (Exception e)`; write errors fail the
+  pipeline) and renders into the sink. Loggers: `read` (rate/percent), `write` (`num_features_written`), file size
+  (`impl DiskBacked for FeatureGroup`), process + pipeline stats. Afterwards `profile.finish(name, ...)` is rendered
+  into `writer.feature_writer()` on the calling thread. Returns immediately if `!profile.cares_about_source(name)`
+  (Java checks this in `Planetiler`, doing it here too is harmless). The closure-based variant is
+  `process_files_with(name, paths, reader_factory, config, stats, processor_factory)` /
+  `ParquetReader::process_with(paths, config, cares_about, processor_factory)`.
+- **API for the `Planetiler` orchestrator** (all take `writer: &Arc<FeatureGroup>`, `config: &Arc<PlanetilerConfig>`,
+  `profile: &Arc<dyn Profile>`, `stats: StatsRef` and return `anyhow::Result<()>`; after the last source reclaim the
+  group with `Arc::into_inner` and call `prepare()`):
+  - `addShapefileSource(projection, name, path/glob)`: `ShapefileReader::process_with_projection(projection:
+    Option<&str>, name, paths: Vec<PathBuf>, writer, config, profile, stats)` (or `ShapefileReader::process(name,
+    paths, ..)` for the `.prj` projection). Expand globs / zip contents with `file_utils::walk_path_with_pattern`.
+  - `addGeoPackageSource(projection, name, path/glob)`: `GeoPackageReader::process(projection, name, paths, tmp_dir,
+    writer, config, profile, stats, keep_unzipped)`.
+  - `addNaturalEarthSource(name, path)`: `NaturalEarthReader::process(name, &path, tmp_dir, writer, config, profile,
+    stats, keep_unzipped)`.
+  - `addGeoJsonSource(name, path/glob)`: `GeoJsonReader::process(name, paths, writer, config, profile, stats)`.
+  - `addParquetSource(name, paths, hive_partitioning, get_id, get_layer)`:
+    `ParquetReader::with_options(name, stats, get_id, get_layer, hive_partitioning).process(&paths, writer, config,
+    profile)` (filters files/row groups with `profile.cares_about`).
+- `ParquetFeature` implements `SourceFeature` itself (owns a `SourceFeatureBase`) instead of being converted to a
+  `SimpleFeature`: WKB/WKT decoding stays lazy so features a profile rejects by tags never parse their geometry, and
+  nothing is copied. `vector_tile_feature_id` now uses `wrapping_mul` (Java `long` overflow semantics; parquet IDs are
+  64-bit hashes). TODO(port): Java's `ParquetReader` feeds features through a `Distributor` so idle threads help
+  with large row groups; here a thread processes a whole block.
 - `ShapefileReader::new(projection, source, path)` / `with_bounds(.., &Bounds)`: self-contained `.shp`/`.dbf`/`.prj`/
   `.cpg` parser (no GeoTools). Inputs: `.shp` on disk, a path inside a zip (`zip/dir/x.shp`, from
   `file_utils::walk_path_with_pattern`) or a zip containing one shapefile; zip entries are streamed (not extracted).
@@ -464,3 +509,4 @@ test-only port of `BaseSchemaValidator.validate` running the full shortbread spe
   the `ConfiguredMapMain` run call once the orchestrator lands.
 - custommap CEL gaps vs cel-java (no type checker, `1 == 1.0` is true, Rust regex syntax in `replaceRegex`): consider
   closing these if real schemas hit them.
+  `ParquetFeature` implements `SourceFeature` and has `into_reader_feature()`.
