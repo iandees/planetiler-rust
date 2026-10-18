@@ -15,6 +15,7 @@ proj4rs.workspace = true
 prost.workspace = true
 flate2.workspace = true
 zstd.workspace = true
+lz4_flex.workspace = true
 brotli.workspace = true
 rusqlite.workspace = true
 rmp.workspace = true
