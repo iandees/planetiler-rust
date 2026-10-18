@@ -24,6 +24,15 @@ unbuffer only `snap_and_fix_polygon` runs (`geo/geo_utils.rs:325-370`), same as 
 - Minor: no `BufferInputLineSimplifier` port; limited-mitre bevel placement differs; vertex snapping tolerances differ
   (all below the tile grid).
 
+**Status: Fix A implemented** (`feature_merge.rs` `remove_near_collinear_ring`, removal is smallest deviation first so
+very shallow corners keep one of their three points). The rotated-L / rotated-rectangle test
+(`merge_rotated_polygons_match_java`) now matches Java's `mergeNearbyPolygons` output exactly at 0/17/30/45/72
+degrees (the 30-degree L is 8 points like Java; it was 11; Java itself keeps 1-2 extra points where rounding the input
+to the tile grid leaves bridged edges slightly non-collinear). Monaco OpenMapTiles: the 4 merged z13 `building`
+features have 3610 points vs Java's 3666 (5823 before), and 163 of 211 rings are identical (54 before). They still
+differ: about 90 vertices Java keeps that i_overlay's offset curve cuts across (shallow input corners within a fraction
+of a pixel of the line), and about 35 one-unit shifts. Those need Fix B.
+
 **Fix A (recommended, small):** remove near-collinear vertices from `geo::Buffer` output in `buffer_geometry`
 (`feature_merge.rs:595-602`), for both `+d` and `-d`. Drop vertex b between a and c when
 `|cross(b-a, c-a)| / |c-a| <= eps` and `dot(b-a, c-b) > 0` (keep spikes); wrap the closing vertex; drop rings < 4
@@ -46,6 +55,10 @@ Do not put it in `snap_and_fix` (Java keeps collinear points there).
 - Rust `MountainPeak::post_process` (`crates/planetiler-openmaptiles/src/layers/mountain_peak.rs:188-205`) uses
   `retain_mut`, emptying the vector; `build_vector_tile` (`collection/feature_group.rs:828-847`) only adds an empty
   layer when unscaling (not the post-processor) emptied it.
+
+**Status: fixed** as described below (`mountain_peak.rs` `post_process`, plus
+`test_empty_geometries_after_layer_post_processing_write_empty_tiles` in `core/tests/planetiler_tests.rs`). Not yet
+re-checked on Switzerland.
 
 **Fix (mountain_peak only):** replace `retain_mut` with an `iter_mut()` loop that sets out-of-buffer peaks'
 geometry to an empty `VectorGeometry` (keep the group-count increment before the test, as Java does). The existing

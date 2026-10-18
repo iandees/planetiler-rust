@@ -101,7 +101,10 @@ See the table at the bottom of this file; update it as modules are completed.
   `merge_nearby_polygons(features, min_area, min_hole_area, min_dist, buffer)`,
   `merge_nearby_polygons_with(.., &dyn Stats, Option<&dyn GeometryPipeline>)` (return `GeometryResult`).
 - JTS `BufferOp` with mitre joins -> `geo::Buffer` (`i_overlay` outline) with `LineJoin::Miter(2 * asin(1/5))`
-  (JTS mitre limit 5). Negative buffers of multi-part input are applied to their union (like JTS).
+  (JTS mitre limit 5). Negative buffers of multi-part input are applied to their union (like JTS). i_overlay's mitre
+  joins emit 3 points per outside corner (2 near-collinear offset ends + the mitre point) where JTS emits 1, so
+  `buffer_geometry` drops vertices within `H * 2^-25` (`H` = half the input extent + 6|d|) of the line through
+  their remaining neighbors, smallest deviation first, keeping spikes (docs/analysis-merge-vertices.md Fix A).
 - `buffer_union_unbuffer` succeeds on 3 of the protomaps538 inputs where JTS's unbuffer collapses
   (locationtech/jts#1183) and Java falls back to a plain union; the Rust result fills sub-pixel gaps (area up to ~3%
   larger than the input), so that test allows a 3% area increase instead of 1%. The `@Slow` Boston/Jakarta tests are
@@ -503,13 +506,15 @@ point/order; scripts in the orchestrator port's final report):
 - Toilets overlay (Monaco, `--process_threads=1` because its sort key is a processing-order counter): identical.
 - `custom --schema=owg_simple.yml` (Monaco): identical.
 - OpenMapTiles Monaco (`--process_threads=1`): identical (incl. feature IDs) except 4 z13 merged `building`
-  features (`mergeNearbyPolygons` buffer/unbuffer: same shape within 0.5% area, ~50% more vertices than JTS mitre
-  buffers).
+  features (`mergeNearbyPolygons` buffer/unbuffer). After removing near-collinear buffer vertices they have 3610
+  points vs Java's 3666 (was 5823, ~+59%), and 163 of their 211 rings are identical (was 54); the rest differ by
+  sub-pixel JTS-vs-i_overlay offset-curve details (a vertex Java keeps at a shallow input corner, 1-unit shifts).
+  Exact parity needs a port of JTS `OffsetCurveBuilder`/`BufferInputLineSimplifier` (Fix B in the analysis).
 - OpenMapTiles Switzerland (default threads): same feature count in every layer; differences: 2791 z13 merged
   buildings + 725 z6-12 `landuse` + 21 `landcover` (all the same buffer-merge vertex difference), 10 `transportation`
   lines (line-merge picks a different continuation at a junction / 1-unit vertex shifts), 1730 housenumber merged-point
-  IDs (multi-threaded input order), 28 empty tiles Java writes and Rust skips (OMT `mountain_peak` post-processing
-  nulls every feature: Java still adds an empty layer, the Rust convention removes them), and lower
+  IDs (multi-threaded input order), 28 empty tiles Java writes and Rust skipped (OMT `mountain_peak` post-processing
+  nulls every feature; since fixed: dropped peaks now get an empty geometry so the empty layer is kept), and lower
   `osm_boundary_missing_way`/`osm_multipolygon_missing_way`/`merge_snap_fix_input` data error counts (Java recomputes
   and re-logs failed geometries per layer).
 - Fixes made while comparing: hot-pixel snap rounding in `reduce_precision`, Java multimap order for relation
@@ -526,8 +531,10 @@ point/order; scripts in the orchestrator port's final report):
   `planetiler_core::mbtiles::verify`.
 - Unify the two `VectorLayer` types (`archive::tile_archive_metadata` and `util::layer_attr_stats`).
 - Re-enable the four `#[cfg(any())]` merge tests in `crates/planetiler-core/tests/` once FeatureMerge merges.
-- `feature_merge::buffer_geometry`: mitre buffer output has ~50% more vertices than JTS (z13 OpenMapTiles buildings).
-- OMT `mountain_peak`: Java writes empty tiles when post-processing nulls every feature (28 in Switzerland); Rust skips them.
+- `feature_merge::buffer_geometry`: near-collinear mitre vertices are now removed (Monaco z13 buildings within ~1.5%
+  of Java's vertex count); exact parity would need a port of the JTS offset-curve builder.
+- Re-run the Switzerland Java-vs-Rust comparison to confirm the `mountain_peak` empty-tile fix and the buffer-merge
+  vertex change on `landuse`/`landcover`.
 - Port custommap `SchemaValidator` CLI, `TopOsmTiles.main` (xz), `OpenMapTilesMapping` benchmark; in-memory stream
   archive readers for the csv/tsv/json/proto `testPlanetilerRunner` variants.
 - MLT tile format (MapLibre Tile) encoder.
@@ -549,7 +556,8 @@ prebuilt CEL bindings for `args`/`args.<name>`). The nested Java context records
 `.create_attr_zoom_context(&value)`, `root.as_context()`. The input is a `FeatureRef` (a `&dyn SourceFeature`, or
 `SplitTest(&Way)` for `split_osm_way_at_intersections` so no tags are cloned). `ScriptContext` implements
 `ExpressionInput`; core custom expressions/getters recover it with `ScriptContext::from_input(&dyn ExpressionInput)`
-(an `as_any` lifetime-erasure trick, see the SAFETY comment) and compare `kind()` to emulate Java's `instanceof`.
+(`as_any` returns a private `repr(transparent)` lifetime-erased wrapper that only `from_input` can downcast to,
+see the SAFETY comment) and compare `kind()` to emulate Java's `instanceof`.
 
 **Expressions.** `ScriptEnvironment { kind, root }` replaces the CEL declaration list (`contains_variable`).
 `ConfigExpression` is an enum (`Const`, `Match(Arc<MatchExpression>)` with a prebuilt `MultiExpression` index,

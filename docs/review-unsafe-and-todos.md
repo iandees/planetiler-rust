@@ -2,6 +2,9 @@
 
 Read-only review of `main` @ `c116961` (2026-10-17). Nothing was compiled or run. Line numbers are as of that commit.
 
+**Status (2026-10-18):** all 2 unsound and 3 risky items in Part 1 are fixed (each section below has a **Fixed** note).
+Part 2 is unchanged.
+
 ## Part 1: `unsafe` audit
 
 Scope: `crates/planetiler-core/src` (23 sites) and `crates/planetiler-custommap/src` (3 sites). The benchmarks crate is
@@ -18,6 +21,10 @@ covered briefly at the end.
 ### Unsound
 
 #### U1. `crates/planetiler-custommap/src/contexts.rs:681`: `ScriptContext::as_any` transmutes `&ScriptContext<'a>` to `&ScriptContext<'static>`
+
+**Fixed:** `as_any` now hands out a private `#[repr(transparent)] struct ErasedScriptContext(ScriptContext<'static>)`
+that only `from_input` can name; downcasting to `ScriptContext<'static>` returns `None` (tested in
+`contexts::tests::cannot_downcast_to_public_static_context`).
 
 The SAFETY comment says "the only way to get the context back out is `ScriptContext::from_input`". That isn't true.
 `ExpressionInput::as_any` is a public trait method and `ScriptContext` is a public type, so any crate can downcast to
@@ -57,6 +64,10 @@ the trait, or to use a crate like `better_any`/`transient` that does lifetime-aw
 
 #### U2. `crates/planetiler-core/src/collection/array_long_long_map_mmap.rs`: TOCTOU between `read_map` and `new_writer`/`segment_ptr`
 
+**Fixed:** `new_writer` increments `active_writers` under the write lock, and `read_map` takes that lock before
+checking the count and sealing. Writers created after sealing fail on their first `put`. Tests:
+`writer_created_after_read_fails`, `read_with_open_writer_panics`, `racing_read_and_new_writer_is_safe`.
+
 `read_map` (lines 113-126) does `assert_eq!(0, active_writers)` *before* it takes the `write` lock. It then sets
 `sealed` and drops every writable `MmapMut`. `new_writer` (line 165) increments `active_writers` without taking the
 lock or checking `sealed`. This interleaving is possible using only safe methods:
@@ -89,6 +100,10 @@ fn new_writer(&self) -> Box<dyn LongLongMapWriter + '_> {
 
 #### R1. `array_long_long_map_mmap.rs:104,108`: `MmapMut::as_mut_ptr` goes through `DerefMut`, creating a `&mut [u8]` that aliases memory other threads are writing
 
+**Fixed:** segments are mapped with the safe `MmapOptions::map_raw` and stored as `MmapRaw`, whose
+`as_mut_ptr(&self)` never creates a reference (this also removed the `unsafe` around mapping). `segment_bits` is now
+capped at 40 (`rejects_huge_segments`).
+
 `memmap2 0.9.11` has no inherent `MmapMut::as_mut_ptr`. Only `MmapRaw` has one. So
 `state.segments[idx].as_mut().unwrap().as_mut_ptr()` auto-derefs to `<[u8]>::as_mut_ptr(&mut [u8])`. Every time
 *any* writer enters a segment (line 108 runs even when the segment is already mapped), it creates a fresh, unique
@@ -113,6 +128,10 @@ Minor: `with_segment_bits` accepts any `segment_bits >= 3`. A value of 64 or mor
 
 #### R2. `crates/planetiler-custommap/src/expression/stdlib.rs:55,57`: `unsafe impl<T> Send/Sync for Shared<T>`
 
+**Fixed:** `Shared` is gone. `WithGeometry` (and so `SourceFeature`) now has `Send + Sync` supertraits, which every
+implementation already satisfied, so `GeometryVal`/`Resolver` are auto `Send + Sync`
+(`stdlib::tests::values_borrowing_features_are_send_sync`).
+
 The impl is a blanket one for **every** `T`. It is only `pub(crate)`, and today it wraps `&'a dyn WithGeometry`
 (lines 330/344/563) and `ScriptContext<'a>` (line 512). The SAFETY argument is "only used on the creating thread
 during one CEL evaluation". That holds today. But it depends on the `cel` crate (0.15) never moving values across
@@ -128,6 +147,9 @@ they are all `Sync` anyway.
 those two concrete payloads instead of `impl<T>`.
 
 #### R3. `crates/planetiler-core/src/collection/append_store_mmap.rs:112`: `(map.as_ptr() as *const T).add(i).read_unaligned()`
+
+**Fixed:** `Primitive` gained `fn read_ne(&[u8]) -> Self`, and `get` decodes `&map[i * BYTES..(i + 1) * BYTES]`, so the
+`unsafe` is gone and a bad impl can only panic or misread (`append_store_mmap::tests::decodes_with_encoded_width`).
 
 This is sound for the two impls that exist (`i32`, `i64`). However, `Primitive` (`append_store_ram.rs:8`) is a *safe*
 public trait in a public module, and the read relies on two things it doesn't enforce:
