@@ -37,6 +37,7 @@ use crate::archive::tile_archive_metadata::TileArchiveMetadata;
 use crate::archive::tile_archive_writer;
 use crate::archive::tile_compression::TileCompression;
 use crate::collection::feature_group::FeatureGroup;
+use crate::collection::long_long_map;
 use crate::config::arguments::Arguments;
 use crate::config::planetiler_config::PlanetilerConfig;
 use crate::feature_collector::{self, FeatureCollector};
@@ -47,7 +48,9 @@ use crate::geo::tile_coord::TileCoord;
 use crate::geo::tile_order::TileOrder;
 use crate::mbtiles::mbtiles::Mbtiles;
 use crate::profile::{FeatureConsumer, LayerFeatures, Profile};
-use crate::reader::osm::osm_element::Relation;
+use crate::reader::osm::osm_block_source::ElementsBlockSource;
+use crate::reader::osm::osm_element::{OsmElement, Relation};
+use crate::reader::osm::osm_reader::OsmReader;
 use crate::reader::osm::osm_relation_info::OsmRelationInfo;
 use crate::reader::simple_feature::SimpleFeature;
 use crate::reader::source_feature::SourceFeature;
@@ -190,8 +193,10 @@ impl DiskBacked for NoDiskUsage {
 
 /// Context handed to a [`run`] runner to populate the feature group.
 pub struct RunContext<'a> {
-    pub feature_group: &'a FeatureGroup,
+    pub feature_group: &'a Arc<FeatureGroup>,
     pub profile: &'a dyn Profile,
+    /// The same profile as a shared handle (for readers like `OsmReader` that need to own it).
+    pub profile_arc: &'a Arc<dyn Profile>,
     pub config: &'a Arc<PlanetilerConfig>,
     pub stats: &'a StatsRef,
 }
@@ -206,8 +211,17 @@ pub fn run(
 ) -> anyhow::Result<PlanetilerResults> {
     let config = Arc::new(PlanetilerConfig::from(&Arguments::of_pairs(args.iter().copied()))?);
     let stats = InMemoryStats::arc();
-    let mut feature_group = FeatureGroup::new_in_memory(TileOrder::Tms, profile.clone(), config.clone(), stats.clone());
-    runner(&RunContext { feature_group: &feature_group, profile: &*profile, config: &config, stats: &stats })?;
+    let feature_group =
+        Arc::new(FeatureGroup::new_in_memory(TileOrder::Tms, profile.clone(), config.clone(), stats.clone()));
+    runner(&RunContext {
+        feature_group: &feature_group,
+        profile: &*profile,
+        profile_arc: &profile,
+        config: &config,
+        stats: &stats,
+    })?;
+    let mut feature_group =
+        Arc::into_inner(feature_group).ok_or_else(|| anyhow::anyhow!("feature group still in use after runner"))?;
     feature_group.prepare()?;
     let mut db =
         Mbtiles::new_in_memory_database_with_options(&ArchiveOptions::from_arguments(config.arguments.clone()))?;
@@ -263,6 +277,58 @@ pub fn process_reader_features(ctx: &RunContext<'_>, features: &[SimpleFeature])
         return Err(e);
     }
     writer.close()
+}
+
+/// Splits `elements` into blocks the way they come from an OSM file (other, nodes, ways, relations) (Java
+/// `PlanetilerTests.processOsmFeatures` block source).
+pub fn osm_elements_block_source(elements: &[OsmElement]) -> ElementsBlockSource {
+    let of_type = |f: fn(&OsmElement) -> bool| elements.iter().filter(|e| f(e)).cloned().collect::<Vec<_>>();
+    ElementsBlockSource(vec![
+        of_type(|e| matches!(e, OsmElement::Other(_))),
+        of_type(|e| matches!(e, OsmElement::Node(_))),
+        of_type(|e| matches!(e, OsmElement::Way(_))),
+        of_type(|e| matches!(e, OsmElement::Relation(_))),
+    ])
+}
+
+/// Runs OSM `elements` through `OsmReader` pass 1 and pass 2 into the feature group (Java
+/// `PlanetilerTests.processOsmFeatures`).
+pub fn process_osm_features(ctx: &RunContext<'_>, elements: &[OsmElement]) -> anyhow::Result<()> {
+    let reader = OsmReader::new_in_memory_multipolygons(
+        "osm",
+        osm_elements_block_source(elements),
+        Arc::from(long_long_map::new_in_memory_sorted_table()),
+        ctx.profile_arc.clone(),
+        InMemoryStats::arc(),
+    );
+    reader.pass1(ctx.config)?;
+    reader.pass2(ctx.feature_group, ctx.config)?;
+    reader.close();
+    Ok(())
+}
+
+/// Runs OSM `elements` through `profile` (Java `PlanetilerTests.runWithOsmElements(args, features, profile)`).
+pub fn run_with_osm_elements_profile(
+    args: &[(&str, &str)],
+    elements: Vec<OsmElement>,
+    profile: impl Profile + 'static,
+) -> anyhow::Result<PlanetilerResults> {
+    run(args, |ctx| process_osm_features(ctx, &elements), Arc::new(profile))
+}
+
+/// Runs OSM `elements` through a [`TestProfile`] with `preprocess_osm_relation` and `profile_function` (Java
+/// `PlanetilerTests.runWithOsmElements(args, features, preprocessOsmRelation, profileFunction)`).
+pub fn run_with_osm_elements(
+    args: &[(&str, &str)],
+    elements: Vec<OsmElement>,
+    preprocess_osm_relation: impl Fn(&Relation) -> Option<Vec<Arc<dyn OsmRelationInfo>>> + Send + Sync + 'static,
+    profile_function: impl Fn(&dyn SourceFeature, &mut FeatureCollector<'_>) + Send + Sync + 'static,
+) -> anyhow::Result<PlanetilerResults> {
+    run_with_osm_elements_profile(
+        args,
+        elements,
+        TestProfile::process_source_features(profile_function).with_preprocess_osm_relation(preprocess_osm_relation),
+    )
 }
 
 /// Runs `features` through a [`TestProfile`] that calls `profile_function` for each one (Java
