@@ -324,3 +324,11 @@ stage is faster than Java, so these are about absolute time, not parity.
    No end-to-end effect for `.mbtiles` output, but `.pmtiles` writes pay it on every directory.
 7. **Efficiency, not wall time:** water_polygons burns 5s CPU for 0.35s wall (avg 14 cores; Java uses 5s on one
    thread). Smaller: Douglas-Peucker on 50-100 point lines at tolerance 0.1-1 (0.88-0.97x Java).
+
+### History: util::var_int fast path (after f60f636)
+
+The cleanup pass (`da514d1`) switched PMTiles directory varints to `util::var_int`, whose per-byte `split_first` +
+`i == 9` branch halved `BenchmarkPmtiles` (110M -> 52M entries/s). `try_get_var_long` now has a single-byte fast path
+and index-based decoding, and `put_var_long` uses a `while v >= 0x80` loop. Spot check on a quiet machine (load ~1.6,
+Rust only, not a full pass): BenchmarkPmtiles 95-109M entries/s, BenchmarkVarInt 362-450M/s (was 244M/s). Re-measure
+against Java in the next full pass.
