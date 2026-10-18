@@ -148,8 +148,10 @@ From [PORTING.md](PORTING.md) and the remaining `TODO(port)` list in
   integer overlay, so a small number of merged buildings/landuse/landcover features differ from Java by single
   1/16-pixel vertices (Switzerland: 578 of ~39.6k buildings, 35 landuse, 17 landcover; see
   [docs/switzerland-parity.md](docs/switzerland-parity.md)).
-- **Coordinate reference systems.** Only EPSG:4326, 4269 and 3857, PROJ strings and simple WKT are supported. Inputs
-  in other projections fail where Java (GeoTools) succeeds.
+- **Coordinate reference systems.** EPSG codes, WKT (`.prj` files, GeoPackage SRS definitions) and PROJ strings
+  are supported like GeoTools, but grid-based datum shifts (NTv2/NADCON) are not (Java doesn't ship the grids), and
+  one EPSG projection method GeoTools supports isn't: Lambert Conic Conformal (2SP Belgium), used only by the
+  obsolete EPSG:31300. See [PORTING.md](PORTING.md#coordinate-reference-systems).
 - **CLI tasks not ported:** `top-osm-tiles` (needs xz decompression) and `benchmark-mapping`.
   `benchmark-longlongmap` points you at the benchmarks crate instead.
 

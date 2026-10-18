@@ -1,0 +1,89 @@
+# Reference cases for crates/planetiler-core/src/geo/crs/tests.rs. Columns: name, definition for GeoTools,
+# points in the axis order of the CRS, [definition for Rust when GeoTools does not support it].
+# Regenerate reference.tsv: tools/crs/java.sh RefTransform crates/planetiler-core/tests/resources/crs/cases.tsv crates/planetiler-core/tests/resources/crs > crates/planetiler-core/tests/resources/crs/reference.tsv
+swiss_lv95	EPSG:2056	2600000,1200000;2683000,1248000;2500000,1100000
+swiss_lv95_urn	urn:ogc:def:crs:EPSG::2056	2600000,1200000
+swiss_lv95_http	http://www.opengis.net/def/crs/EPSG/0/2056	2600000,1200000
+swiss_lv03	EPSG:21781	600000,200000;683000,248000
+british_national_grid	EPSG:27700	530000,180000;325000,673000;100000,800000
+ny_long_island_ftus	EPSG:2263	988000,200000;1050000,250000
+utm_33n	EPSG:32633	500000,5000000;400000,6000000;700000,4500000
+utm_18s	EPSG:32718	300000,8000000
+etrs_laea_lat_first	EPSG:3035	3200000,4300000;5000000,3000000
+etrs_laea_lon_first	EPSG:3035:lon_first	4300000,3200000;3000000,5000000
+nsidc_north	EPSG:3413	1000000,-1000000;-2000000,500000
+nsidc_north_lon_first	EPSG:3413:lon_first	1000000,-1000000
+antarctic_polar_stereo	EPSG:3031	1000000,-1000000;-2000000,500000
+ups_north	EPSG:32661	2500000,1500000
+etrs89	EPSG:4258	52,10;40,-5
+etrs89_lon_first	EPSG:4258:lon_first	10,52
+wgs84	EPSG:4326	52,10
+wgs84_urn	urn:ogc:def:crs:EPSG::4326	52,10
+crs84	CRS:84	10,52
+nad83	EPSG:4269	40,-100
+nad27	EPSG:4267	40,-100;30,-90
+conus_albers	EPSG:5070	1500000,2000000;-2000000,1500000
+web_mercator	EPSG:3857	1000000,5000000
+esri_web_mercator	EPSG:3857	1000000,5000000;-2000000,-3000000	EPSG:102100
+web_mercator_3785	EPSG:3785	1000000,5000000
+world_mercator	EPSG:3395	1000000,5000000
+lambert_93	EPSG:2154	650000,6860000;900000,6300000
+rd_new	EPSG:28992	121000,487000;190000,330000
+belgian_lambert_72	EPSG:31370	150000,170000
+belgian_lambert_2008	EPSG:3812	650000,670000
+krovak_east_north	EPSG:5514	-743000,-1043000;-500000,-1200000
+krovak_lat_first	EPSG:2065	1043000,743000
+australian_albers	EPSG:3577	1000000,-3000000
+gda94	EPSG:4283	-33,151
+gda2020_mga56	EPSG:7856	334000,6252000
+nztm	EPSG:2193	5920000,1750000
+nzmg	EPSG:27200	2650000,6000000
+sweref99_tm	EPSG:3006	6580000,674000
+etrs_tm35fin	EPSG:3067	385000,6672000
+etrs_utm32	EPSG:25832	690000,5335000
+israel_tm	EPSG:2039	180000,660000
+greek_grid	EPSG:2100	476000,4205000
+hungarian_eov	EPSG:23700	650000,240000
+michigan_oblique	EPSG:3078	500000,500000
+borneo_rso	EPSG:29873	600000,500000
+malaysia_rso	EPSG:3375	450000,350000
+cassini_trinidad	EPSG:2314	400000,300000
+brazil_polyconic	EPSG:5880	5000000,8000000
+ease_grid_north	EPSG:3408	1000000,-1000000
+world_eqc	EPSG:4087	1000000,2000000
+equal_earth	EPSG:8857	1000000,2000000
+south_african_lo15	EPSG:2046	50000,2535000
+ntf_paris_grads	EPSG:4807	50,0
+ntf_paris_lambert_2	EPSG:27572	600000,2200000
+monte_mario_italy_1	EPSG:3003	1500000,4600000
+pulkovo_gk	EPSG:28404	6200000,4400000
+tokyo_jgd2011	EPSG:6677	-5000,-35000
+indian_1960_utm	EPSG:3149	261310,1769342
+michigan_north_ft	EPSG:2251	26000000,1000000
+esri_bng	@british_national_grid_esri.prj	530000,180000;325000,673000
+gdal_bng	@british_national_grid_gdal.prj	530000,180000;325000,673000
+esri_lv95	@ch1903plus_lv95_esri.prj	2600000,1200000;2683000,1248000
+esri_ny_ftus	@ny_long_island_ftus_esri.prj	988000,200000;1050000,250000
+esri_utm33n	@wgs84_utm33n_esri.prj	500000,5000000;400000,6000000
+esri_etrs_laea	@etrs89_laea_esri.prj	4300000,3200000;3000000,5000000
+esri_nsidc_north	@nsidc_north_esri.prj	1000000,-1000000;-2000000,500000
+gdal_nsidc_north	@nsidc_north_gdal.prj	1000000,-1000000;-2000000,500000
+esri_conus_albers	@conus_albers_esri.prj	1500000,2000000;-2000000,1500000
+esri_web_mercator_aux	@web_mercator_aux_esri.prj	1000000,5000000;-2000000,-3000000
+esri_etrs89	@etrs89_esri.prj	10,52;-5,40
+gdal_ntf_paris_lambert2	@ntf_paris_lambert2_gdal.prj	600000,2200000
+ogc_nad27	@nad27_ogc.prj	-100,40;-90,30
+esri_nad27	@nad27_esri.prj	-100,40;-90,30
+gdal_rd_new	@rd_new_gdal.prj	121000,487000;190000,330000
+esri_lambert93	@lambert93_esri.prj	650000,6860000;900000,6300000
+esri_sinusoidal	@world_sinusoidal_esri.prj	1000000,2000000;-5000000,-4000000
+esri_mollweide	@world_mollweide_esri.prj	1000000,2000000;-5000000,-4000000
+esri_robinson	@world_robinson_esri.prj	1000000,2000000;-5000000,-4000000;10000000,7000000
+esri_equidistant_conic	@usa_equidistant_conic_esri.prj	1000000,200000;-1500000,-800000
+esri_krovak_east_north	EPSG:5514	-743000,-1043000;-500000,-1200000	@krovak_east_north_esri.prj
+wkt2_utm33n	EPSG:32633	500000,5000000;400000,6000000	@utm33n_wkt2.prj
+wkt2_ny_ftus	EPSG:2263	988000,200000;1050000,250000	@ny_long_island_ftus_wkt2.prj
+wkt2_wgs84_lat_lon	EPSG:4326	52,10	@wgs84_lat_lon_wkt2.prj
+wkt2_bng_boundcrs	EPSG:27700	530000,180000;325000,673000	@british_national_grid_boundcrs_wkt2.prj
+proj_utm33n	EPSG:32633	500000,5000000	+proj=utm +zone=33 +datum=WGS84 +units=m +no_defs
+proj_lv95	EPSG:2056	2600000,1200000;2683000,1248000	+proj=somerc +lat_0=46.9524055555556 +lon_0=7.43958333333333 +k_0=1 +x_0=2600000 +y_0=1200000 +ellps=bessel +towgs84=674.374,15.056,405.346,0,0,0,0 +units=m +no_defs

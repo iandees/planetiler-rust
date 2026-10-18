@@ -26,6 +26,10 @@ In addition to Planetiler itself, this repository contains Rust ports or copies 
     [earcut](https://github.com/mapbox/earcut) (ISC License)
 - [i_float](https://github.com/iShape-Rust/iFloat) 5.0.0 (MIT License), vendored with a faster exact division in
   `vendor/i_float/` (see `vendor/i_float/LICENSE`).
+- [PROJ](https://proj.org) (MIT License): the formulas of the map projections in
+  `crates/planetiler-core/src/geo/crs/projections.rs` (Cassini-Soldner, Hotine oblique mercator, polyconic,
+  sinusoidal, Robinson, equidistant conic, gnomonic, orthographic, Equal Earth, New Zealand Map Grid, Lambert
+  azimuthal equal area) are ports of PROJ's implementations.
 - Protocol buffer definitions `osmformat.proto` / `fileformat.proto` from
   [OSM-binary](https://github.com/openstreetmap/OSM-binary) (MIT License) and the Mapbox
   [vector tile spec](https://github.com/mapbox/vector-tile-spec) `vector_tile.proto` (CC0/BSD).
@@ -43,6 +47,12 @@ OpenMapTiles schema need to visibly credit "OpenMapTiles.org" or reference "Open
 http://openmaptiles.org/.
 
 ## Data
+
+`crates/planetiler-core/src/geo/crs/epsg.tsv.zst` contains coordinate reference system definitions derived from the
+[EPSG Geodetic Parameter Dataset](https://epsg.org) (version 11.031, as distributed in
+[GeoTools](https://geotools.org) `gt-epsg-hsql` 35.1), © International Association of Oil & Gas Producers (IOGP),
+used under the [EPSG terms of use](https://epsg.org/terms-of-use.html). The data has been converted to PROJ strings
+(with the datum shifts GeoTools selects) and is not the official EPSG dataset; see https://epsg.org for that.
 
 Test resources include small extracts of OpenStreetMap data (© OpenStreetMap contributors,
 [ODbL](https://www.openstreetmap.org/copyright)), Natural Earth (public domain), OSM water polygons (ODbL) and Overture

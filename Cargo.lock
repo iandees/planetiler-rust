@@ -2083,6 +2083,7 @@ dependencies = [
  "geo",
  "geo-traits",
  "geo-types",
+ "geographiclib-rs",
  "hashbrown 0.17.1",
  "i_overlay 9.1.0",
  "icu_experimental",
