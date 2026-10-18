@@ -158,3 +158,7 @@ From [PORTING.md](PORTING.md) and the `TODO(port)` triage in
 ## License
 
 Apache-2.0, like upstream Planetiler. Map data from OpenStreetMap is © OpenStreetMap contributors.
+
+## License
+
+Apache License 2.0 (see [LICENSE](LICENSE)); `crates/planetiler-openmaptiles` is BSD 3-Clause. See [NOTICE.md](NOTICE.md) for attributions, including the OpenMapTiles schema CC-BY 4.0 credit requirement.

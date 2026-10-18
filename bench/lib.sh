@@ -6,8 +6,8 @@
 #   meta - `uptime` before the run, quiet-wait duration, command line, cwd, exit status
 
 RUST_ROOT="${RUST_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-REF_ROOT="${REF_ROOT:-/Users/ian.dees/Workspace/planetiler-ref/planetiler}"
-BENCH_DATA="${BENCH_DATA:-/Users/ian.dees/Workspace/planetiler-bench}"
+REF_ROOT="${REF_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/planetiler-ref/planetiler}"
+BENCH_DATA="${BENCH_DATA:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/planetiler-bench}"
 SOURCES="${SOURCES:-$BENCH_DATA/data/sources}"
 JAVA="${JAVA:-/opt/homebrew/opt/openjdk@25/bin/java}"
 DIST_JAR="${DIST_JAR:-$REF_ROOT/planetiler-dist/target/planetiler-dist-0.10.3-SNAPSHOT-with-deps.jar}"

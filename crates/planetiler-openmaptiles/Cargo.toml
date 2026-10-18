@@ -2,7 +2,7 @@
 name = "planetiler-openmaptiles"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "BSD-3-Clause"
 
 [dependencies]
 planetiler-core.workspace = true
