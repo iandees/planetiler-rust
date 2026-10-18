@@ -17,31 +17,126 @@
 //! Planetiler](https://oliverwipfli.ch/improving-linestring-merging-in-planetiler-2024-10-30/).
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
 use geo::CoordsIter;
 use geo_types::{Coord, Geometry, LineString};
+use hashbrown::HashMap;
 
 use crate::geo::douglas_peucker_simplifier;
 use crate::geo::geometry_pipeline::GeometryPipelineRef;
 use crate::geo::precision_model::PrecisionModel;
 
-type NodeId = usize;
-type EdgeId = usize;
+type NodeId = u32;
+/// Directed edge id. Edges are created in pairs: the even id is the "main" edge in the direction of the input line,
+/// `id ^ 1` is the same edge reversed. Both share one coordinate range (stored in the main edge's direction).
+type EdgeId = u32;
+
+const NO_NODE: u32 = u32::MAX;
+
+/// List of edges attached to a node; stored inline for the common case of up to 4 edges.
+enum EdgeList {
+    Inline(u8, [EdgeId; 4]),
+    Heap(Vec<EdgeId>),
+}
+
+impl EdgeList {
+    #[inline]
+    fn new() -> Self {
+        EdgeList::Inline(0, [0; 4])
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[EdgeId] {
+        match self {
+            EdgeList::Inline(len, items) => &items[..*len as usize],
+            EdgeList::Heap(v) => v,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            EdgeList::Inline(len, _) => *len as usize,
+            EdgeList::Heap(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> EdgeId {
+        self.as_slice()[i]
+    }
+
+    fn push(&mut self, edge: EdgeId) {
+        match self {
+            EdgeList::Inline(len, items) if (*len as usize) < items.len() => {
+                items[*len as usize] = edge;
+                *len += 1;
+            }
+            EdgeList::Inline(len, items) => {
+                let mut v = Vec::with_capacity(8);
+                v.extend_from_slice(&items[..*len as usize]);
+                v.push(edge);
+                *self = EdgeList::Heap(v);
+            }
+            EdgeList::Heap(v) => v.push(edge),
+        }
+    }
+
+    /// Removes the first occurrence of `edge`, preserving the order of the others.
+    fn remove_item(&mut self, edge: EdgeId) {
+        match self {
+            EdgeList::Inline(len, items) => {
+                let n = *len as usize;
+                if let Some(pos) = items[..n].iter().position(|e| *e == edge) {
+                    items.copy_within(pos + 1..n, pos);
+                    *len -= 1;
+                }
+            }
+            EdgeList::Heap(v) => {
+                if let Some(pos) = v.iter().position(|e| *e == edge) {
+                    v.remove(pos);
+                }
+            }
+        }
+    }
+}
 
 struct Node {
     coordinate: Coord<f64>,
-    edges: Vec<EdgeId>,
+    edges: EdgeList,
 }
 
+/// One direction of an edge.
+#[derive(Clone, Copy)]
 struct Edge {
     from: NodeId,
     to: NodeId,
-    length: f64,
-    main: bool,
     removed: bool,
-    reversed: EdgeId,
-    coordinates: Vec<Coord<f64>>,
+}
+
+/// Data shared by both directions of an edge.
+#[derive(Clone, Copy)]
+struct EdgePair {
+    length: f64,
+    /// range of the coordinates (in the direction of the main edge) in [`LoopLineMerger::coords`]
+    start: u32,
+    len: u32,
+}
+
+#[inline]
+fn is_main(edge: EdgeId) -> bool {
+    edge & 1 == 0
+}
+
+#[inline]
+fn reversed(edge: EdgeId) -> EdgeId {
+    edge ^ 1
 }
 
 /// Hash key for a coordinate with `-0.0` normalized to `0.0` so it matches Java `Coordinate.equals`.
@@ -75,12 +170,35 @@ fn normalize_angle(mut angle: f64) -> f64 {
     angle
 }
 
+/// Reusable buffers for the graph algorithms (kept between calls to avoid allocating in inner loops).
+#[derive(Default)]
+struct Scratch {
+    edges: Vec<EdgeId>,
+    angled_pairs: Vec<(EdgeId, EdgeId, f64)>,
+    merged: Vec<EdgeId>,
+    loops: Vec<(EdgeId, f64)>,
+    to_remove: Vec<EdgeId>,
+    coords: Vec<Coord<f64>>,
+    /// A* best distance per node, valid when `best_stamp[node] == stamp`
+    best_distance: Vec<f64>,
+    best_stamp: Vec<u32>,
+    stamp: u32,
+    frontier: BinaryHeap<Candidate>,
+}
+
 /// Merges, simplifies and connects linestrings (see module docs).
 pub struct LoopLineMerger {
-    input: Vec<LineString<f64>>,
+    /// coordinates of all input lines, back to back
+    input_coords: Vec<Coord<f64>>,
+    /// end offset of each input line in `input_coords`
+    input_ends: Vec<usize>,
     nodes: Vec<Node>,
     edges: Vec<Edge>,
+    pairs: Vec<EdgePair>,
+    /// arena holding the coordinates of every edge; merged and simplified edges append new ranges
+    coords: Vec<Coord<f64>>,
     output: Vec<NodeId>,
+    scratch: Scratch,
     precision_model: PrecisionModel,
     min_length: f64,
     loop_min_length: f64,
@@ -187,10 +305,14 @@ impl Ord for Candidate {
 impl LoopLineMerger {
     pub fn new() -> Self {
         LoopLineMerger {
-            input: Vec::new(),
+            input_coords: Vec::new(),
+            input_ends: Vec::new(),
             nodes: Vec::new(),
             edges: Vec::new(),
+            pairs: Vec::new(),
+            coords: Vec::new(),
             output: Vec::new(),
+            scratch: Scratch::default(),
             precision_model: PrecisionModel::fixed(crate::geo::geo_utils::TILE_PRECISION_SCALE),
             min_length: 0.0,
             loop_min_length: 0.0,
@@ -244,19 +366,36 @@ impl LoopLineMerger {
         self
     }
 
+    fn add_coords(&mut self, coords: &[Coord<f64>]) {
+        self.input_coords.extend_from_slice(coords);
+        self.input_ends.push(self.input_coords.len());
+    }
+
     /// Adds a geometry to the merger. Only linestrings (including polygon rings) from the input are considered.
     pub fn add(&mut self, geometry: &Geometry<f64>) -> &mut Self {
         match geometry {
-            Geometry::LineString(ls) => self.input.push(ls.clone()),
-            Geometry::Line(l) => self.input.push((*l).into()),
-            Geometry::MultiLineString(mls) => self.input.extend(mls.0.iter().cloned()),
+            Geometry::LineString(ls) => self.add_coords(&ls.0),
+            Geometry::Line(l) => self.add_coords(&[l.start, l.end]),
+            Geometry::MultiLineString(mls) => {
+                let total: usize = mls.0.iter().map(|ls| ls.0.len()).sum();
+                self.input_coords.reserve(total);
+                self.input_ends.reserve(mls.0.len());
+                for ls in &mls.0 {
+                    self.add_coords(&ls.0);
+                }
+            }
             Geometry::Polygon(p) => {
-                self.input.push(p.exterior().clone());
-                self.input.extend(p.interiors().iter().cloned());
+                self.add_coords(&p.exterior().0);
+                for ring in p.interiors() {
+                    self.add_coords(&ring.0);
+                }
             }
             Geometry::MultiPolygon(mp) => {
                 for p in &mp.0 {
-                    self.add(&Geometry::Polygon(p.clone()));
+                    self.add_coords(&p.exterior().0);
+                    for ring in p.interiors() {
+                        self.add_coords(&ring.0);
+                    }
                 }
             }
             Geometry::Rect(r) => {
@@ -277,63 +416,99 @@ impl LoopLineMerger {
 
     // ---- graph primitives ----
 
-    fn new_edge(&mut self, from: NodeId, to: NodeId, coordinates: Vec<Coord<f64>>, length: f64) -> EdgeId {
-        let id = self.edges.len();
-        let mut rev_coords = coordinates.clone();
-        rev_coords.reverse();
-        self.edges.push(Edge { from, to, length, main: true, removed: false, reversed: id + 1, coordinates });
-        self.edges.push(Edge {
-            from: to,
-            to: from,
-            length,
-            main: false,
-            removed: false,
-            reversed: id,
-            coordinates: rev_coords,
-        });
+    #[inline]
+    fn edge(&self, edge: EdgeId) -> &Edge {
+        &self.edges[edge as usize]
+    }
+
+    #[inline]
+    fn pair(&self, edge: EdgeId) -> &EdgePair {
+        &self.pairs[(edge >> 1) as usize]
+    }
+
+    #[inline]
+    fn node(&self, node: NodeId) -> &Node {
+        &self.nodes[node as usize]
+    }
+
+    #[inline]
+    fn node_edges(&self, node: NodeId) -> &[EdgeId] {
+        self.nodes[node as usize].edges.as_slice()
+    }
+
+    #[inline]
+    fn length(&self, edge: EdgeId) -> f64 {
+        self.pair(edge).length
+    }
+
+    /// Coordinates of `edge` in the direction of its main edge.
+    #[inline]
+    fn pair_coords(&self, edge: EdgeId) -> &[Coord<f64>] {
+        let p = self.pair(edge);
+        &self.coords[p.start as usize..(p.start + p.len) as usize]
+    }
+
+    /// The `i`th coordinate of `edge` in its direction.
+    #[inline]
+    fn coord_at(&self, edge: EdgeId, i: usize) -> Coord<f64> {
+        let coords = self.pair_coords(edge);
+        if is_main(edge) { coords[i] } else { coords[coords.len() - 1 - i] }
+    }
+
+    /// True if `a` and `b` have the same coordinates (in their respective directions).
+    fn same_coordinates(&self, a: EdgeId, b: EdgeId) -> bool {
+        let ca = self.pair_coords(a);
+        let cb = self.pair_coords(b);
+        if ca.len() != cb.len() {
+            false
+        } else if is_main(a) == is_main(b) {
+            ca == cb
+        } else {
+            ca.iter().eq(cb.iter().rev())
+        }
+    }
+
+    fn new_edge(&mut self, from: NodeId, to: NodeId, start: usize, len: usize, length: f64) -> EdgeId {
+        let id = self.edges.len() as EdgeId;
+        debug_assert!(is_main(id));
+        self.edges.push(Edge { from, to, removed: false });
+        self.edges.push(Edge { from: to, to: from, removed: false });
+        self.pairs.push(EdgePair { length, start: start as u32, len: len as u32 });
         id
     }
 
     fn add_edge(&mut self, node: NodeId, edge: EdgeId) {
-        let coords = &self.edges[edge].coordinates;
-        for other in &self.nodes[node].edges {
-            if self.edges[*other].coordinates == *coords {
+        for &other in self.node_edges(node) {
+            if self.same_coordinates(other, edge) {
                 return;
             }
         }
-        self.nodes[node].edges.push(edge);
+        self.nodes[node as usize].edges.push(edge);
     }
 
+    #[inline]
     fn remove_edge_from_node(&mut self, node: NodeId, edge: EdgeId) {
-        let edges = &mut self.nodes[node].edges;
-        if let Some(pos) = edges.iter().position(|e| *e == edge) {
-            edges.remove(pos);
-        }
+        self.nodes[node as usize].edges.remove_item(edge);
     }
 
     fn remove(&mut self, edge: EdgeId) {
-        if !self.edges[edge].removed {
-            let (from, to, reversed) = (self.edges[edge].from, self.edges[edge].to, self.edges[edge].reversed);
-            self.remove_edge_from_node(from, edge);
-            self.remove_edge_from_node(to, reversed);
-            self.edges[edge].removed = true;
+        let e = *self.edge(edge);
+        if !e.removed {
+            self.remove_edge_from_node(e.from, edge);
+            self.remove_edge_from_node(e.to, reversed(edge));
+            self.edges[edge as usize].removed = true;
         }
     }
 
     #[inline]
     fn is_loop(&self, edge: EdgeId) -> bool {
-        self.edges[edge].from == self.edges[edge].to
-    }
-
-    fn node_distance(&self, a: NodeId, b: NodeId) -> f64 {
-        distance(&self.nodes[a].coordinate, &self.nodes[b].coordinate)
+        let e = self.edge(edge);
+        e.from == e.to
     }
 
     fn angle_to(&self, a: EdgeId, b: EdgeId) -> f64 {
-        let ca = &self.edges[a].coordinates;
-        let cb = &self.edges[b].coordinates;
-        let angle_a = angle(&ca[0], &ca[1]);
-        let angle_b = angle(&cb[0], &cb[1]);
+        let angle_a = angle(&self.coord_at(a, 0), &self.coord_at(a, 1));
+        let angle_b = angle(&self.coord_at(b, 0), &self.coord_at(b, 1));
         normalize_angle(angle_a - angle_b).abs()
     }
 
@@ -345,13 +520,14 @@ impl LoopLineMerger {
             self.degree_two_merge(node);
         }
         let nodes = &self.nodes;
-        self.output.retain(|n| !nodes[*n].edges.is_empty());
+        self.output.retain(|n| !nodes[*n as usize].edges.is_empty());
     }
 
     fn degree_two_merge(&mut self, node: NodeId) -> Option<EdgeId> {
-        if self.nodes[node].edges.len() == 2 {
-            let a = self.nodes[node].edges[0];
-            let b = self.nodes[node].edges[1];
+        let edges = &self.node(node).edges;
+        if edges.len() == 2 {
+            let a = edges.get(0);
+            let b = edges.get(1);
             // if one side is a loop, degree is actually > 2
             if !self.is_loop(a) && !self.is_loop(b) {
                 return Some(self.merge_two_edges(node, a, b));
@@ -360,79 +536,106 @@ impl LoopLineMerger {
         None
     }
 
+    /// Appends the coordinates of `edge` (in its direction, skipping the first `skip`) to the coordinate arena.
+    fn append_coords(&mut self, edge: EdgeId, skip: usize) {
+        let p = *self.pair(edge);
+        let (start, end) = (p.start as usize, (p.start + p.len) as usize);
+        if is_main(edge) {
+            self.coords.extend_from_within(start + skip.min(p.len as usize)..end);
+        } else {
+            let n = (p.len as usize).saturating_sub(skip);
+            self.coords.reserve(n);
+            for i in (start..start + n).rev() {
+                let c = self.coords[i];
+                self.coords.push(c);
+            }
+        }
+    }
+
     fn merge_two_edges(&mut self, node: NodeId, edge1: EdgeId, edge2: EdgeId) -> EdgeId {
         // attempt to preserve segment directions from the original line
         // when: A << N -- B then output C reversed from B to A
         // when: A >> N -- B then output C from A to B
-        let (a, b) = if self.edges[edge1].main { (edge2, edge1) } else { (edge1, edge2) };
+        let (a, b) = if is_main(edge1) { (edge2, edge1) } else { (edge1, edge2) };
         self.remove_edge_from_node(node, a);
         self.remove_edge_from_node(node, b);
-        let ea = &self.edges[a];
-        let eb = &self.edges[b];
-        let mut coordinates = Vec::with_capacity(ea.coordinates.len() + eb.coordinates.len());
-        coordinates.extend(ea.coordinates.iter().rev().copied());
-        coordinates.extend(eb.coordinates[1..].iter().copied());
-        let (a_to, b_to, a_rev, b_rev, length) = (ea.to, eb.to, ea.reversed, eb.reversed, ea.length + eb.length);
-        let c = self.new_edge(a_to, b_to, coordinates, length);
-        self.remove_edge_from_node(a_to, a_rev);
-        self.remove_edge_from_node(b_to, b_rev);
-        self.add_edge(a_to, c);
-        if a_to != b_to {
-            let c_rev = self.edges[c].reversed;
-            self.add_edge(b_to, c_rev);
+        let (ea, eb) = (*self.edge(a), *self.edge(b));
+        let length = self.length(a) + self.length(b);
+        // coordinates of a in reverse, then b without its first point
+        let start = self.coords.len();
+        self.append_coords(reversed(a), 0);
+        self.append_coords(b, 1);
+        let c = self.new_edge(ea.to, eb.to, start, self.coords.len() - start, length);
+        self.remove_edge_from_node(ea.to, reversed(a));
+        self.remove_edge_from_node(eb.to, reversed(b));
+        self.add_edge(ea.to, c);
+        if ea.to != eb.to {
+            self.add_edge(eb.to, reversed(c));
         }
         c
     }
 
     fn stroke_merge(&mut self) {
+        let mut edges = std::mem::take(&mut self.scratch.edges);
+        let mut angled_pairs = std::mem::take(&mut self.scratch.angled_pairs);
+        let mut merged = std::mem::take(&mut self.scratch.merged);
         for i in 0..self.output.len() {
             let node = self.output[i];
-            let edges = self.nodes[node].edges.clone();
-            if edges.len() >= 2 {
-                let mut angled_pairs: Vec<(EdgeId, EdgeId, f64)> = Vec::new();
+            if self.node(node).edges.len() >= 2 {
+                edges.clear();
+                edges.extend_from_slice(self.node_edges(node));
+                angled_pairs.clear();
                 for (ii, &edge_i) in edges.iter().enumerate() {
                     for &edge_j in &edges[ii + 1..] {
-                        if edge_i != self.edges[edge_j].reversed {
+                        if edge_i != reversed(edge_j) {
                             angled_pairs.push((edge_i, edge_j, self.angle_to(edge_i, edge_j)));
                         }
                     }
                 }
                 angled_pairs.sort_by(|a, b| a.2.total_cmp(&b.2));
-                let mut merged: Vec<EdgeId> = Vec::new();
+                merged.clear();
                 for &(a, b, _) in angled_pairs.iter().rev() {
                     if merged.contains(&a) || merged.contains(&b) {
                         continue;
                     }
-                    let from = self.edges[a].from;
+                    let from = self.edge(a).from;
                     self.merge_two_edges(from, a, b);
                     merged.push(a);
                     merged.push(b);
                 }
             }
         }
+        self.scratch.edges = edges;
+        self.scratch.angled_pairs = angled_pairs;
+        self.scratch.merged = merged;
     }
 
     fn break_loops(&mut self) {
+        let mut current_edges = std::mem::take(&mut self.scratch.edges);
+        let mut loops = std::mem::take(&mut self.scratch.loops);
         for i in 0..self.output.len() {
             let node = self.output[i];
-            if self.nodes[node].edges.len() <= 1 {
+            if self.node(node).edges.len() <= 1 {
                 continue;
             }
-            let current_edges = self.nodes[node].edges.clone();
-            for current in current_edges {
-                if !self.nodes[node].edges.contains(&current) {
+            current_edges.clear();
+            current_edges.extend_from_slice(self.node_edges(node));
+            for &current in &current_edges {
+                if !self.node_edges(node).contains(&current) {
                     continue;
                 }
-                let mut loops: Vec<(EdgeId, f64)> = Vec::new();
-                let (cur_to, cur_from) = (self.edges[current].to, self.edges[current].from);
-                for &other in &self.nodes[node].edges {
-                    let other_edge = &self.edges[other];
-                    let distance = other_edge.length
+                loops.clear();
+                let Edge { from: cur_from, to: cur_to, .. } = *self.edge(current);
+                for j in 0..self.node(node).edges.len() {
+                    let other = self.node(node).edges.get(j);
+                    let other_length = self.length(other);
+                    let other_to = self.edge(other).to;
+                    let distance = other_length
                         + self.shortest_distance_a_star(
-                            other_edge.to,
+                            other_to,
                             cur_to,
                             cur_from,
-                            self.loop_min_length - other_edge.length,
+                            self.loop_min_length - other_length,
                         );
                     if distance <= self.loop_min_length {
                         loops.push((other, distance));
@@ -445,36 +648,53 @@ impl LoopLineMerger {
                             min = idx;
                         }
                     }
-                    for (idx, l) in loops.iter().enumerate() {
+                    for (idx, &(edge, _)) in loops.iter().enumerate() {
                         if idx != min {
-                            self.remove(l.0);
+                            self.remove(edge);
                         }
                     }
                 }
             }
         }
+        self.scratch.edges = current_edges;
+        self.scratch.loops = loops;
     }
 
-    fn shortest_distance_a_star(&self, start: NodeId, end: NodeId, exclude: NodeId, max_length: f64) -> f64 {
-        let mut best_distance: HashMap<NodeId, f64> = HashMap::new();
-        let mut frontier = BinaryHeap::new();
+    fn shortest_distance_a_star(&mut self, start: NodeId, end: NodeId, exclude: NodeId, max_length: f64) -> f64 {
+        let scratch = &mut self.scratch;
+        if scratch.best_stamp.len() < self.nodes.len() {
+            scratch.best_stamp.resize(self.nodes.len(), 0);
+            scratch.best_distance.resize(self.nodes.len(), f64::INFINITY);
+        }
+        scratch.stamp = scratch.stamp.wrapping_add(1);
+        if scratch.stamp == 0 {
+            scratch.best_stamp.fill(0);
+            scratch.stamp = 1;
+        }
+        let stamp = scratch.stamp;
+        let frontier = &mut scratch.frontier;
+        frontier.clear();
+        let nodes = &self.nodes;
+        let node_distance =
+            |a: NodeId, b: NodeId| distance(&nodes[a as usize].coordinate, &nodes[b as usize].coordinate);
         if exclude != start {
-            frontier.push(Candidate { node: start, length: 0.0, min_total_length: self.node_distance(start, end) });
+            frontier.push(Candidate { node: start, length: 0.0, min_total_length: node_distance(start, end) });
         }
         while let Some(candidate) = frontier.pop() {
             let current = candidate.node;
             if current == end {
                 return candidate.length;
             }
-            for &edge in &self.nodes[current].edges {
-                let edge = &self.edges[edge];
-                let neighbor = edge.to;
+            for &edge in nodes[current as usize].edges.as_slice() {
+                let neighbor = self.edges[edge as usize].to;
                 if neighbor != exclude {
-                    let new_dist = candidate.length + edge.length;
-                    let prev = best_distance.get(&neighbor).copied().unwrap_or(f64::INFINITY);
+                    let new_dist = candidate.length + self.pairs[(edge >> 1) as usize].length;
+                    let n = neighbor as usize;
+                    let prev = if scratch.best_stamp[n] == stamp { scratch.best_distance[n] } else { f64::INFINITY };
                     if new_dist < prev {
-                        best_distance.insert(neighbor, new_dist);
-                        let min_total_length = new_dist + self.node_distance(neighbor, end);
+                        scratch.best_stamp[n] = stamp;
+                        scratch.best_distance[n] = new_dist;
+                        let min_total_length = new_dist + node_distance(neighbor, end);
                         if min_total_length <= max_length {
                             frontier.push(Candidate { node: neighbor, length: new_dist, min_total_length });
                         }
@@ -486,47 +706,43 @@ impl LoopLineMerger {
     }
 
     fn is_short_stub_edge(&self, edge: EdgeId) -> bool {
-        let e = &self.edges[edge];
+        let e = self.edge(edge);
         !e.removed
-            && e.length < self.stub_min_length
-            && (self.nodes[e.from].edges.len() == 1 || self.nodes[e.to].edges.len() == 1 || e.from == e.to)
+            && self.length(edge) < self.stub_min_length
+            && (self.node(e.from).edges.len() == 1 || self.node(e.to).edges.len() == 1 || e.from == e.to)
     }
 
     fn remove_short_stub_edges(&mut self) {
-        let mut to_check: Vec<EdgeId> = Vec::new();
-        for &node in &self.output {
-            for &edge in &self.nodes[node].edges {
-                if self.is_short_stub_edge(edge) {
-                    to_check.push(edge);
-                }
-            }
-        }
         // the queue compares edges by length (which never changes for an edge), so store it alongside the id
         let mut queue: JavaPriorityQueue<(EdgeId, f64), _> =
             JavaPriorityQueue::new(|a: &(EdgeId, f64), b: &(EdgeId, f64)| a.1.total_cmp(&b.1));
-        for e in to_check {
-            queue.offer((e, self.edges[e].length));
+        for &node in &self.output {
+            for &edge in self.node_edges(node) {
+                if self.is_short_stub_edge(edge) {
+                    queue.offer((edge, self.length(edge)));
+                }
+            }
         }
         while !queue.is_empty() {
             let (edge, _) = queue.poll().unwrap();
-            if self.edges[edge].removed {
+            if self.edge(edge).removed {
                 continue;
             }
             if self.is_short_stub_edge(edge) {
                 self.remove(edge);
             }
-            let (from, to) = (self.edges[edge].from, self.edges[edge].to);
+            let Edge { from, to, .. } = *self.edge(edge);
             for (n, check) in [(from, true), (to, from != to)] {
                 if !check {
                     continue;
                 }
                 if let Some(merged) = self.degree_two_merge(n) {
-                    queue.offer((merged, self.edges[merged].length));
+                    queue.offer((merged, self.length(merged)));
                 }
-                if self.nodes[n].edges.len() == 1 {
-                    let other = self.nodes[n].edges[0];
+                if self.node(n).edges.len() == 1 {
+                    let other = self.node(n).edges.get(0);
                     if self.is_short_stub_edge(other) {
-                        queue.offer((other, self.edges[other].length));
+                        queue.offer((other, self.length(other)));
                     }
                 }
             }
@@ -534,46 +750,67 @@ impl LoopLineMerger {
     }
 
     fn remove_short_edges(&mut self) {
+        let mut edges = std::mem::take(&mut self.scratch.edges);
         for i in 0..self.output.len() {
             let node = self.output[i];
-            for edge in self.nodes[node].edges.clone() {
-                if self.edges[edge].length < self.min_length {
+            edges.clear();
+            edges.extend_from_slice(self.node_edges(node));
+            for &edge in &edges {
+                if self.length(edge) < self.min_length {
                     self.remove(edge);
                 }
             }
         }
+        self.scratch.edges = edges;
     }
 
+    /// Simplifies a main edge (both directions share the coordinates).
     fn simplify_edge(&mut self, edge: EdgeId) {
-        let coords = &self.edges[edge].coordinates;
-        let new_coords = if let Some(pipeline) = &self.pipeline {
-            Some(pipeline.apply(&Geometry::LineString(LineString(coords.clone()))).coords_iter().collect())
+        debug_assert!(is_main(edge));
+        let mut simplified = std::mem::take(&mut self.scratch.coords);
+        simplified.clear();
+        let coords = self.pair_coords(edge);
+        // (changed, may overwrite in place)
+        let (changed, in_place) = if let Some(pipeline) = &self.pipeline {
+            simplified.extend(pipeline.apply(&Geometry::LineString(LineString(coords.to_vec()))).coords_iter());
+            (true, false)
         } else if self.tolerance >= 0.0 {
-            Some(douglas_peucker_simplifier::simplify_coords(coords, self.tolerance, false))
+            douglas_peucker_simplifier::simplify_coords_into(coords, self.tolerance, false, &mut simplified);
+            (true, true)
         } else {
-            None
+            (false, false)
         };
-        if let Some(new_coords) = new_coords {
-            let mut rev: Vec<Coord<f64>> = new_coords.clone();
-            rev.reverse();
-            self.edges[edge].coordinates = new_coords;
-            let reversed = self.edges[edge].reversed;
-            self.edges[reversed].coordinates = rev;
+        if changed {
+            let pair = &mut self.pairs[(edge >> 1) as usize];
+            if in_place {
+                // Douglas-Peucker keeps a subset of the points including the first and last, so writing it over the
+                // old range never changes the shared split point at the end of the range that the next edge from
+                // the same input line starts with.
+                debug_assert!(simplified.len() <= pair.len as usize);
+                let start = pair.start as usize;
+                self.coords[start..start + simplified.len()].copy_from_slice(&simplified);
+            } else {
+                pair.start = self.coords.len() as u32;
+                self.coords.extend_from_slice(&simplified);
+            }
+            pair.len = simplified.len() as u32;
         }
+        self.scratch.coords = simplified;
     }
 
     fn is_collapsed(&self, edge: EdgeId) -> bool {
-        let c = &self.edges[edge].coordinates;
+        let c = self.pair_coords(edge);
         c.len() < 2 || (c.len() == 2 && c[0] == c[1])
     }
 
     fn simplify(&mut self) {
-        let mut to_remove = Vec::new();
+        let mut to_remove = std::mem::take(&mut self.scratch.to_remove);
+        to_remove.clear();
         for i in 0..self.output.len() {
             let node = self.output[i];
-            for j in 0..self.nodes[node].edges.len() {
-                let edge = self.nodes[node].edges[j];
-                if self.edges[edge].main {
+            for j in 0..self.node(node).edges.len() {
+                let edge = self.node(node).edges.get(j);
+                if is_main(edge) {
                     self.simplify_edge(edge);
                     if self.is_collapsed(edge) {
                         to_remove.push(edge);
@@ -581,27 +818,30 @@ impl LoopLineMerger {
                 }
             }
         }
-        for edge in to_remove {
+        for &edge in &to_remove {
             self.remove(edge);
         }
+        self.scratch.to_remove = to_remove;
     }
 
     fn remove_duplicated_edges(&mut self) {
+        let mut to_remove = std::mem::take(&mut self.scratch.to_remove);
         for i in 0..self.output.len() {
             let node = self.output[i];
-            let mut to_remove = Vec::new();
-            let edges = &self.nodes[node].edges;
+            to_remove.clear();
+            let edges = self.node_edges(node);
             for (ii, &a) in edges.iter().enumerate() {
                 for &b in &edges[ii + 1..] {
-                    if self.edges[b].to == self.edges[a].to && self.edges[a].coordinates == self.edges[b].coordinates {
+                    if self.edge(b).to == self.edge(a).to && self.same_coordinates(a, b) {
                         to_remove.push(b);
                     }
                 }
             }
-            for edge in to_remove {
+            for &edge in &to_remove {
                 self.remove(edge);
             }
         }
+        self.scratch.to_remove = to_remove;
     }
 
     /// Processes the added geometries and returns the merged linestrings. Can be called more than once.
@@ -609,8 +849,9 @@ impl LoopLineMerger {
         self.output.clear();
         self.nodes.clear();
         self.edges.clear();
-        let edges = self.node_lines();
-        self.build_nodes(edges);
+        self.pairs.clear();
+        self.coords.clear();
+        self.build_graph();
 
         self.degree_two_merge_all();
 
@@ -641,75 +882,95 @@ impl LoopLineMerger {
 
         let mut result = Vec::new();
         for &node in &self.output {
-            for &edge in &self.nodes[node].edges {
-                if self.edges[edge].main {
-                    result.push(LineString(self.edges[edge].coordinates.clone()));
+            for &edge in self.node_edges(node) {
+                if is_main(edge) {
+                    result.push(LineString(self.pair_coords(edge).to_vec()));
                 }
             }
         }
         result
     }
 
-    fn build_nodes(&mut self, edges: Vec<Vec<Coord<f64>>>) {
-        let mut node_map: HashMap<(u64, u64), NodeId> = HashMap::new();
-        for coordinates in edges {
-            let first_node = self.get_or_create_node(&mut node_map, coordinates[0]);
-            let last_node = self.get_or_create_node(&mut node_map, coordinates[coordinates.len() - 1]);
-            let length = line_length(&coordinates);
-            let edge = self.new_edge(first_node, last_node, coordinates, length);
-            self.add_edge(first_node, edge);
-            if first_node != last_node {
-                let reversed = self.edges[edge].reversed;
-                self.add_edge(last_node, reversed);
-            }
-        }
-    }
+    /// Snaps the input to the precision grid, splits lines at points shared by more than one line, and builds the
+    /// node/edge graph (Java's `nodeLines` + `buildNodes`).
+    fn build_graph(&mut self) {
+        // snapped coordinates of every input line are stored back-to-back in the coordinate arena, with the
+        // "vertex" id (distinct coordinate) of each. Edges are ranges of the arena (consecutive edges of a line
+        // share their split point).
+        let mut coords = std::mem::take(&mut self.coords);
+        coords.reserve(self.input_coords.len());
+        let mut vertex_ids: Vec<u32> = Vec::with_capacity(self.input_coords.len());
+        let mut lines: Vec<(usize, usize)> = Vec::with_capacity(self.input_ends.len());
+        let mut vertex_index: HashMap<(u64, u64), u32> = HashMap::with_capacity(self.input_coords.len());
+        // number of times each vertex appears in the input, then the node id of each vertex
+        let mut vertices: Vec<(u32, u32)> = Vec::with_capacity(self.input_coords.len());
 
-    fn get_or_create_node(&mut self, node_map: &mut HashMap<(u64, u64), NodeId>, coord: Coord<f64>) -> NodeId {
-        *node_map.entry(coord_key(&coord)).or_insert_with(|| {
-            let id = self.nodes.len();
-            self.nodes.push(Node { coordinate: coord, edges: Vec::new() });
-            self.output.push(id);
-            id
-        })
-    }
-
-    fn node_lines(&self) -> Vec<Vec<Coord<f64>>> {
-        let mut node_counts: HashMap<(u64, u64), u32> = HashMap::new();
-        let mut coords: Vec<Vec<Coord<f64>>> = Vec::with_capacity(self.input.len());
-        for line in &self.input {
-            let mut snapped: Vec<Coord<f64>> = Vec::with_capacity(line.0.len());
+        let mut line_start = 0;
+        for &line_end in &self.input_ends {
+            let start = coords.len();
             let mut last: Option<Coord<f64>> = None;
-            for c in &line.0 {
+            for c in &self.input_coords[line_start..line_end] {
                 let current = self.precision_model.make_precise_coord(*c);
                 if last != Some(current) {
-                    snapped.push(current);
-                    *node_counts.entry(coord_key(&current)).or_insert(0) += 1;
+                    let next_id = vertices.len() as u32;
+                    let id = *vertex_index.entry(coord_key(&current)).or_insert(next_id);
+                    if id == next_id {
+                        vertices.push((0, NO_NODE));
+                    }
+                    vertices[id as usize].0 += 1;
+                    coords.push(current);
+                    vertex_ids.push(id);
                 }
                 last = Some(current);
             }
-            if snapped.len() >= 2 {
-                coords.push(snapped);
+            if coords.len() - start >= 2 {
+                lines.push((start, coords.len()));
+            } else {
+                coords.truncate(start);
+                vertex_ids.truncate(start);
             }
+            line_start = line_end;
         }
+        drop(vertex_index);
+        self.coords = coords;
 
-        let mut result = Vec::with_capacity(self.input.len());
-        for seq in coords {
-            let mut start = 0;
-            let n = seq.len();
-            for i in 1..n.saturating_sub(1) {
-                if node_counts[&coord_key(&seq[i])] > 1 {
-                    result.push(seq[start..=i].to_vec());
-                    start = i;
+        let edge_count_guess = lines.len();
+        self.edges.reserve(edge_count_guess * 2);
+        self.pairs.reserve(edge_count_guess);
+        self.nodes.reserve(edge_count_guess + 1);
+        for (start, end) in lines {
+            let mut edge_start = start;
+            for i in start + 1..end - 1 {
+                if vertices[vertex_ids[i] as usize].0 > 1 {
+                    self.add_input_edge(&vertex_ids, &mut vertices, edge_start, i + 1);
+                    edge_start = i;
                 }
             }
-            if start == 0 {
-                result.push(seq);
-            } else {
-                result.push(seq[start..].to_vec());
-            }
+            self.add_input_edge(&vertex_ids, &mut vertices, edge_start, end);
         }
-        result
+    }
+
+    fn get_or_create_node(&mut self, vertices: &mut [(u32, u32)], vertex: u32, coordinate: Coord<f64>) -> NodeId {
+        let slot = &mut vertices[vertex as usize].1;
+        if *slot == NO_NODE {
+            let id = self.nodes.len() as NodeId;
+            self.nodes.push(Node { coordinate, edges: EdgeList::new() });
+            self.output.push(id);
+            *slot = id;
+        }
+        *slot
+    }
+
+    fn add_input_edge(&mut self, vertex_ids: &[u32], vertices: &mut [(u32, u32)], start: usize, end: usize) {
+        let (first, last) = (self.coords[start], self.coords[end - 1]);
+        let first_node = self.get_or_create_node(vertices, vertex_ids[start], first);
+        let last_node = self.get_or_create_node(vertices, vertex_ids[end - 1], last);
+        let length = line_length(&self.coords[start..end]);
+        let edge = self.new_edge(first_node, last_node, start, end - start, length);
+        self.add_edge(first_node, edge);
+        if first_node != last_node {
+            self.add_edge(last_node, reversed(edge));
+        }
     }
 }
 
