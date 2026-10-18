@@ -9,6 +9,8 @@ Java: OpenJDK 25.0.4.1 (Homebrew), planetiler `d88cf89`.
   Rust trials, then writes `bench/out/<timestamp>/summary.md` via `summarize.py`. Build first
   (`cargo build --release --workspace --bins`), then `bench/run_all.sh` or `bench/run_all.sh <bench>...`
   (`TRIALS`, `QUIET_LOAD`, `OUT` and input paths are configurable via env; see the scripts).
+  The last trial's end-to-end outputs are kept as `bench/out/<timestamp>/e2e_<name>/{java,rust}.mbtiles` for
+  correctness comparisons (see `docs/switzerland-parity.md`).
 - `gen_bench_mbtiles.py` — deterministic BenchmarkMbtilesRead input (`/tmp/ptbench/bench.mbtiles`).
 
 Component benchmarks are ports of `planetiler-benchmarks` with identical workloads:

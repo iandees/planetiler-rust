@@ -170,6 +170,8 @@ e2e() {
   after_trial() {
     local f="$SCRATCH/e2e/$1-$E2E_NAME.mbtiles"
     echo "output_bytes: $(stat -f %z "$f" 2>/dev/null || echo missing)" >>"$OUT/e2e_$E2E_NAME/$1.$2.meta"
+    # keep the last trial's output for correctness comparisons (not timed): $OUT/e2e_<name>/<side>.mbtiles
+    if (($2 == TRIALS)) && [[ -f "$f" ]]; then mv "$f" "$OUT/e2e_$E2E_NAME/$1.mbtiles"; fi
     rm -f "$f" "$f-journal" "$f-wal" "$f-shm"
     rm -rf "$SCRATCH/e2e/work-$1/data/tmp"
   }
