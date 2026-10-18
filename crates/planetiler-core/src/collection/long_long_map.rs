@@ -339,8 +339,21 @@ pub(crate) mod tests {
         for storage in Storage::VALUES {
             for map_type in LongLongMapType::VALUES {
                 let variant = format!("{storage}-{map_type}");
-                // TODO(port): Java also sanity-checks OsmReader.estimateNodeLocationUsage here (owned by reader/osm).
                 let params = StorageParams::new(dir.path().join(&variant), true);
+                let estimate = crate::reader::osm::osm_reader::OsmReader::estimate_node_location_usage(
+                    map_type,
+                    storage,
+                    70_000_000_000,
+                    &params.path,
+                );
+                let usage = if storage == Storage::Mmap {
+                    estimate.disk_usage()
+                } else {
+                    estimate.get(&[&crate::util::resource_usage::MEMORY])
+                };
+                if map_type != LongLongMapType::Noop {
+                    assert!(usage > 60e9 as u64 && usage < 100e9 as u64, "{variant}: {usage}");
+                }
                 let map = from(map_type, storage, &params).unwrap();
                 {
                     let mut writer = map.new_writer();

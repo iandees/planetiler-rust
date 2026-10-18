@@ -274,25 +274,8 @@ impl Drop for Permit<'_> {
 }
 
 /// Best-fit-decreasing bin packing of chunks by estimated memory size.
-///
-/// TODO(port): replace with `util::bin_pack::pack` once ported (owned by another module).
 fn bin_pack(items: Vec<Chunk>, max_bin_size: u64) -> Vec<Vec<Chunk>> {
-    let mut items = items;
-    items.sort_by_key(|c| std::cmp::Reverse(c.bytes_in_memory));
-    let mut bins: Vec<(u64, Vec<Chunk>)> = Vec::new();
-    for item in items {
-        let size = item.bytes_in_memory;
-        // use the "fullest" bin the item fits in
-        let best = bins.iter_mut().filter(|b| max_bin_size.saturating_sub(b.0) >= size).max_by_key(|b| b.0);
-        match best {
-            Some(bin) => {
-                bin.0 += size;
-                bin.1.push(item);
-            }
-            None => bins.push((size, vec![item])),
-        }
-    }
-    bins.into_iter().map(|b| b.1).collect()
+    crate::util::bin_pack::pack(items, max_bin_size as i64, |c| c.bytes_in_memory as i64)
 }
 
 /// An entry of a chunk being sorted in memory: the key plus the location of the value bytes in a shared buffer.

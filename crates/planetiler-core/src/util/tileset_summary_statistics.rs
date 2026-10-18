@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use crate::config::planetiler_config::{MAX_MAXZOOM, MIN_MINZOOM};
 use crate::geo::tile_coord::TileCoord;
 use crate::util::tile_size_stats::LayerStats;
+use crate::util::{ansi_colors, format};
 
 const TOP_N_TILES: usize = 10;
 const WARN_BYTES: i64 = 100_000;
@@ -48,61 +49,13 @@ impl TileWeightSource for NoTileWeights {
     }
 }
 
-/// Number formatting like `Format.storage` in Java: `123`, `1.2k`, `240M`.
-// TODO(port): switch to `crate::util::format` once `storage` is ported there.
-fn format_storage(num: f64, pad: bool) -> String {
-    const SUFFIXES: [(i64, &str); 5] =
-        [(1_000, "k"), (1_000_000, "M"), (1_000_000_000, "G"), (1_000_000_000_000, "T"), (1_000_000_000_000_000, "P")];
-    let width = if pad { 4 } else { 0 };
-    let value = num as i64;
-    let s = if value < 0 {
-        "-".to_string()
-    } else if num > 0.0 && num < 1.0 {
-        "<1".to_string()
-    } else if value < 1000 {
-        value.to_string()
-    } else {
-        let (divide_by, suffix) = SUFFIXES.iter().rev().find(|(d, _)| *d <= value).copied().expect(">= 1000");
-        let truncated = value / (divide_by / 10);
-        let has_decimal = truncated < 100 && (truncated % 10 != 0);
-        if has_decimal {
-            format!("{:.1}{suffix}", truncated as f64 / 10.0)
-        } else {
-            format!("{}{suffix}", truncated / 10)
-        }
-    };
-    format!("{s:>width$}")
-}
-
-/// Integer with thousands separators like `Format.integer` in Java (US locale).
-fn format_integer(value: i64) -> String {
-    let digits = value.unsigned_abs().to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    if value < 0 { format!("-{out}") } else { out }
-}
-
-// TODO(port): switch to `crate::util::ansi_colors` once ported.
-fn red(s: &str) -> String {
-    format!("\u{1b}[31m{s}\u{1b}[0m")
-}
-
-fn yellow(s: &str) -> String {
-    format!("\u{1b}[33m{s}\u{1b}[0m")
-}
-
 fn tile_biggest_layers(tile: &TileSummary) -> String {
     let min_size = tile.layers.iter().map(|l| l.layer_bytes).max().unwrap_or(0);
     let mut layers: Vec<&LayerStats> = tile.layers.iter().filter(|d| d.layer_bytes >= min_size).collect();
     layers.sort_by_key(|d| -d.layer_bytes);
     layers
         .iter()
-        .map(|d| format!("{}:{}", d.layer, format_storage(d.layer_bytes as f64, false)))
+        .map(|d| format!("{}:{}", d.layer, format::storage(d.layer_bytes as f64, false)))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -163,7 +116,7 @@ impl TilesetSummaryStatistics {
                         tile.coord.z,
                         tile.coord.x,
                         tile.coord.y,
-                        format_storage(tile.archived_size as f64, false),
+                        format::storage(tile.archived_size as f64, false),
                         tile.coord.get_debug_url(debug_url_pattern),
                         tile_biggest_layers(tile)
                     ))
@@ -176,11 +129,11 @@ impl TilesetSummaryStatistics {
             "Max tile sizes\n{}\n{}\n{}",
             result.format_table(
                 |n| {
-                    let string = format!(" {}", format_storage(n, true));
+                    let string = format!(" {}", format::storage(n, true));
                     if n as i64 > ERROR_BYTES {
-                        red(&string)
+                        ansi_colors::red(&string)
                     } else if n as i64 > WARN_BYTES {
-                        yellow(&string)
+                        ansi_colors::yellow(&string)
                     } else {
                         string
                     }
@@ -189,33 +142,33 @@ impl TilesetSummaryStatistics {
             ),
             result.format_row_with(
                 "full tile",
-                |n| format_storage(n, false),
+                |n| format::storage(n, false),
                 |z| result.get_zoom(z).max_size() as f64,
                 overall_stats.max_size() as f64
             ),
             result.format_row_with(
                 "gzipped",
-                |n| format_storage(n, false),
+                |n| format::storage(n, false),
                 |z| result.get_zoom(z).max_archived_size() as f64,
                 overall_stats.max_archived_size() as f64
             )
         );
         tracing::debug!(
             "   Max tile: {} (gzipped: {})",
-            format_storage(overall_stats.max_size() as f64, false),
-            format_storage(overall_stats.max_archived_size() as f64, false)
+            format::storage(overall_stats.max_size() as f64, false),
+            format::storage(overall_stats.max_archived_size() as f64, false)
         );
         tracing::debug!(
             "   Avg tile: {} (gzipped: {}) {}",
-            format_storage(overall_stats.weighted_average_size(), false),
-            format_storage(overall_stats.weighted_average_archived_size(), false),
+            format::storage(overall_stats.weighted_average_size(), false),
+            format::storage(overall_stats.weighted_average_archived_size(), false),
             if self.tile_weights.is_empty() {
                 "no tile weights, use --download-osm-tile-weights for weighted average"
             } else {
                 "using weighted average based on OSM traffic"
             }
         );
-        tracing::debug!("    # tiles: {}", format_integer(overall_stats.num_tiles()));
+        tracing::debug!("    # tiles: {}", format::integer(overall_stats.num_tiles()));
     }
 
     /// Returns an [`Updater`] that accepts individual tile layer stats from a thread that will eventually be combined
@@ -363,7 +316,7 @@ impl Cell {
                     tile.coord.z,
                     tile.coord.x,
                     tile.coord.y,
-                    format_storage(tile.archived_size as f64, false),
+                    format::storage(tile.archived_size as f64, false),
                     tile.coord.get_debug_url(debug_url_pattern),
                     tile_biggest_layers(tile)
                 )
@@ -803,12 +756,12 @@ mod tests {
 
     #[test]
     fn storage_format() {
-        assert_eq!("999", format_storage(999.0, false));
-        assert_eq!("1.2k", format_storage(1234.0, false));
-        assert_eq!("12k", format_storage(12345.0, false));
-        assert_eq!("<1", format_storage(0.5, false));
-        assert_eq!("  2M", format_storage(2_000_000.0, true));
-        assert_eq!("1,234,567", format_integer(1_234_567));
+        assert_eq!("999", format::storage(999.0, false));
+        assert_eq!("1.2k", format::storage(1234.0, false));
+        assert_eq!("12k", format::storage(12345.0, false));
+        assert_eq!("<1", format::storage(0.5, false));
+        assert_eq!("  2M", format::storage(2_000_000.0, true));
+        assert_eq!("1,234,567", format::integer(1_234_567));
     }
 
     #[test]

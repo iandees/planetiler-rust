@@ -1133,7 +1133,14 @@ impl Planetiler {
         write_phase.add_disk(Some(&self.feature_db_path), feature_size, "temporary feature storage");
         // output only needed during write phase
         write_phase.add_disk(output.get_local_path().as_deref(), output_size, "archive output");
-        // TODO(port): Java subtracts the size of `free_<name>_after_read` inputs from the write phase estimate.
+        // inputs marked free_<name>_after_read are deleted before the write phase
+        for input_path in self.input_paths.iter().filter(|p| p.free_after_reading) {
+            write_phase.free_disk(
+                &input_path.path,
+                file_utils::size_or_zero(&input_path.path),
+                &format!("delete {} source after reading", input_path.id),
+            );
+        }
 
         read_phase.check_against_limits(config.force, true)?;
         write_phase.check_against_limits(config.force, true)?;

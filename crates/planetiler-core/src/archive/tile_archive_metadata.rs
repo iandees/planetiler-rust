@@ -57,9 +57,7 @@ impl PartialEq for Coordinate {
     }
 }
 
-/// Port of `LayerAttrStats.FieldType`.
-///
-/// TODO(port): `util/layer_attr_stats.rs` should re-use (or re-export) this type.
+/// Port of `LayerAttrStats.FieldType` (re-exported as `util::layer_attr_stats::FieldType`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FieldType {
     #[serde(rename = "Number")]
@@ -75,11 +73,23 @@ impl FieldType {
     pub fn merge(old_value: FieldType, new_value: FieldType) -> FieldType {
         if old_value != new_value { FieldType::String } else { new_value }
     }
+
+    /// The field type of an attribute value, or `None` for null values.
+    pub fn of(value: &crate::value::Value) -> Option<FieldType> {
+        use crate::value::Value;
+        match value {
+            Value::Null => None,
+            Value::Int(_) | Value::Float(_) | Value::Double(_) => Some(FieldType::Number),
+            Value::Bool(_) => Some(FieldType::Boolean),
+            _ => Some(FieldType::String),
+        }
+    }
 }
 
 /// Port of `LayerAttrStats.VectorLayer`: an entry of the mbtiles `vector_layers` metadata.
 ///
-/// TODO(port): `util/layer_attr_stats.rs` should re-use (or re-export) this type.
+/// Intentionally separate from `util::layer_attr_stats::VectorLayer`, which keeps fields in insertion order while
+/// stats are collected; this one keeps them sorted, as written to archive metadata. Convert with `From`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorLayer {
     pub id: String,

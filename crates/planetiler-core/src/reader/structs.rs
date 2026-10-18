@@ -9,7 +9,10 @@
 //!
 //! In Rust a struct is a thin wrapper around a [`Value`] (cloning is cheap since nested values are reference counted).
 //!
-//! TODO(port): Java also supports `Instant`/`LocalDate`/`LocalTime`/`UUID` inputs; [`Value`] has no such variants.
+//! Difference from Java: [`Value`] has no `Instant`/`LocalDate`/`LocalTime`/`UUID` variants. Parquet temporal and UUID
+//! columns are converted to their Java `toString()` strings (see `parquet_primitive_converter`), which is what ends up
+//! in tiles, and [`Struct::as_timestamp`] parses them back.
+//!
 //! TODO(port): Java caches the parsed JSON of string values; here it is re-parsed on each access.
 
 use std::fmt;

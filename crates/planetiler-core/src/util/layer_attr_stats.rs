@@ -101,32 +101,7 @@ fn merge_field(fields: &mut BTreeMap<String, FieldType>, key: &str, field_type: 
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum FieldType {
-    #[serde(rename = "Number")]
-    Number,
-    #[serde(rename = "Boolean")]
-    Boolean,
-    #[serde(rename = "String")]
-    String,
-}
-
-impl FieldType {
-    /// Per the MBTiles spec: attributes whose type varies between features SHOULD be listed as "String".
-    pub fn merge(old_value: FieldType, new_value: FieldType) -> FieldType {
-        if old_value != new_value { FieldType::String } else { new_value }
-    }
-
-    /// The field type of an attribute value, or `None` for null values.
-    pub fn of(value: &Value) -> Option<FieldType> {
-        match value {
-            Value::Null => None,
-            Value::Int(_) | Value::Float(_) | Value::Double(_) => Some(FieldType::Number),
-            Value::Bool(_) => Some(FieldType::Boolean),
-            _ => Some(FieldType::String),
-        }
-    }
-}
+pub use crate::archive::tile_archive_metadata::FieldType;
 
 /// An entry in the MBTiles `vector_layers` metadata.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -168,24 +143,16 @@ impl VectorLayer {
     }
 }
 
-impl From<FieldType> for crate::archive::tile_archive_metadata::FieldType {
-    fn from(value: FieldType) -> Self {
-        use crate::archive::tile_archive_metadata::FieldType as F;
-        match value {
-            FieldType::Number => F::Number,
-            FieldType::Boolean => F::Boolean,
-            FieldType::String => F::String,
-        }
-    }
-}
-
 /// Converts to the archive metadata's `vector_layers` entry type.
-// TODO(port): unify with `archive::tile_archive_metadata::VectorLayer`.
+///
+/// The two `VectorLayer` types differ on purpose: this one keeps fields in insertion order (`IndexMap`) with `u32`
+/// zooms while stats are collected, and the archive one keeps them sorted (`BTreeMap`, as written to metadata) with
+/// `i32` zooms.
 impl From<VectorLayer> for crate::archive::tile_archive_metadata::VectorLayer {
     fn from(layer: VectorLayer) -> Self {
         crate::archive::tile_archive_metadata::VectorLayer {
             id: layer.id,
-            fields: layer.fields.into_iter().map(|(k, v)| (k, v.into())).collect(),
+            fields: layer.fields.into_iter().collect(),
             description: layer.description,
             minzoom: layer.minzoom.map(|z| z as i32),
             maxzoom: layer.maxzoom.map(|z| z as i32),

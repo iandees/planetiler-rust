@@ -105,11 +105,12 @@ pub static MEMORY: std::sync::LazyLock<LimitedResource> = std::sync::LazyLock::n
     })
 });
 
-/// An amount of a resource that has been requested.
+/// An amount of a resource that has been requested (negative when the resource is freed, like Java's
+/// `addDisk(path, -size, ...)`).
 #[derive(Clone, Debug)]
 pub struct Usage {
     pub resource: LimitedResource,
-    pub amount: u64,
+    pub amount: i64,
     pub description: String,
 }
 
@@ -136,12 +137,12 @@ impl ResourceUsage {
 
     /// Returns the total amount of disk requested so far.
     pub fn disk_usage(&self) -> u64 {
-        self.usages.lock().iter().filter(|u| u.resource.is_disk()).map(|u| u.amount).sum()
+        self.usages.lock().iter().filter(|u| u.resource.is_disk()).map(|u| u.amount).sum::<i64>().max(0) as u64
     }
 
     /// Returns the total amount requested so far for `types`.
     pub fn get(&self, types: &[&LimitedResource]) -> u64 {
-        self.usages.lock().iter().filter(|u| types.contains(&&u.resource)).map(|u| u.amount).sum()
+        self.usages.lock().iter().filter(|u| types.contains(&&u.resource)).map(|u| u.amount).sum::<i64>().max(0) as u64
     }
 
     /// Requests `amount` bytes on the file system that contains `path`.
@@ -150,6 +151,16 @@ impl ResourceUsage {
             Some(path) => self.add(LimitedResource::disk(path), amount, description),
             None => self,
         }
+    }
+
+    /// Records that `amount` bytes on the file system that contains `path` will be freed (for example an input file
+    /// that is deleted after reading), which offsets other requests on that file system.
+    pub fn free_disk(&self, path: &Path, amount: u64, description: &str) -> &Self {
+        self.add_usage(Usage {
+            resource: LimitedResource::disk(path),
+            amount: -(amount.min(i64::MAX as u64) as i64),
+            description: description.to_string(),
+        })
     }
 
     /// Requests `amount` bytes of RAM.
@@ -173,7 +184,11 @@ impl ResourceUsage {
 
     /// Requests `amount` of `resource`.
     pub fn add(&self, resource: LimitedResource, amount: u64, description: &str) -> &Self {
-        self.add_usage(Usage { resource, amount, description: description.to_string() })
+        self.add_usage(Usage {
+            resource,
+            amount: amount.min(i64::MAX as u64) as i64,
+            description: description.to_string(),
+        })
     }
 
     pub fn add_usage(&self, usage: Usage) -> &Self {
@@ -205,7 +220,7 @@ impl ResourceUsage {
         }
         let mut issues = Vec::new();
         for (resource, usages) in grouped {
-            let requested: u64 = usages.iter().map(|u| u.amount).sum();
+            let requested = usages.iter().map(|u| u.amount).sum::<i64>().max(0) as u64;
             let requested_string = format::storage(requested, false);
             let Some(limit) = resource.limit() else {
                 tracing::warn!(
@@ -287,6 +302,17 @@ mod tests {
         let check = ResourceUsage::new("disk");
         check.add_disk(Some(tmp.path()), 100, "a").add_disk(None, 100, "b");
         assert_eq!(100, check.disk_usage());
+        check.check_against_limits(false, true).unwrap();
+    }
+
+    #[test]
+    fn freed_disk_offsets_requests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let check = ResourceUsage::new("disk");
+        check.add_disk(Some(tmp.path()), 100, "a").free_disk(tmp.path(), 30, "delete input");
+        assert_eq!(70, check.disk_usage());
+        check.free_disk(tmp.path(), 1000, "delete more");
+        assert_eq!(0, check.disk_usage());
         check.check_against_limits(false, true).unwrap();
     }
 }

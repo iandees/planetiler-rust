@@ -849,7 +849,14 @@ mod tests {
         approx::assert_relative_eq!(85.0511287798066, world.max_y, epsilon = 1e-9);
         assert_eq!(None, Arguments::of().bounds("bounds", "bounds").unwrap());
         assert!(Arguments::of_pairs([("bounds", "1,2,3")]).bounds("bounds", "bounds").is_err());
-        // TODO(port): Java also tests falling back to the bounds of monaco-latest.osm.pbf via OsmInputFile
+        let monaco = crate::reader::osm::osm_input_file::OsmInputFile::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/resources/monaco-latest.osm.pbf"),
+            false,
+        );
+        assert_eq!(
+            Envelope::new(7.409205, 7.448637, 43.72335, 43.75169),
+            Bounds::new(Arguments::of().bounds("bounds", "bounds").unwrap()).add_fallback_provider(&monaco).lat_lon()
+        );
     }
 
     #[test]
