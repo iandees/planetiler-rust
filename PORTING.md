@@ -65,6 +65,7 @@ See the table at the bottom of this file; update it as modules are completed.
 | `reader::osm::{osm_multipolygon, osm_way_splitter, osm_node_bounds_provider}` | done (`NodeLocationProvider` trait lives in `osm_multipolygon` until `OsmReader` is ported; bounds provider does not use `OsmPhaser` yet) |
 | `util::{translations, language_utils, thread_local_transliterator, wikidata}` | done (`Wikidata` takes a `Fn(&OsmElement) -> bool` filter instead of `Profile`: see `TODO(port)`) |
 | Feature pipeline spine: `profile` (`Profile`, `NullProfile`), `feature_processor`, `forwarding_profile`, `feature_collector`, `reader::{source_feature, simple_feature}`, `reader::osm::osm_relation_info` (+ `RelationMember`), `render::{feature_renderer, tiled_geometry, geometry_coordinate_sequences, rendered_feature}`, `collection::feature_group` | done (see notes below) |
+| `planetiler-custommap` (configschema, contexts, TagValueProducer, TypeConversion, ConfigExpression/Parser, BooleanExpressionParser/Script, CEL stdlib on the `cel` crate, ConfiguredFeature, ConfiguredProfile, ConfiguredMapMain `configure`, bundled samples + JSON schemas) | done (see notes below); deferred: `post_process_layer_features` merging (needs `FeatureMerge`), the planetiler run in `ConfiguredMapMain` (needs `Planetiler`), `SchemaValidator` CLI (needs `planetiler_core::validator`), `ConfiguredMapTest`/`VerifyMonaco` (full pipeline) |
 
 ### `geo` notes
 
@@ -208,3 +209,53 @@ for tile in &mut tiles {
 tiles.join()?;
 ```
 `TileFeatures` is `Send + 'static` (holds an `Arc` of shared state), so it can be handed to encoder threads.
+
+### custommap notes (`crates/planetiler-custommap`)
+
+**Loading.** `SchemaConfig::load(path)` / `load_str(yaml)` go through `util::yaml` (anchors, aliases, `<<` merge keys)
+then serde with `deny_unknown_fields` (Jackson's default). Java `Object` fields are `Option<Value>` (mapping keys become
+strings like Jackson; YAML `null` == missing). `ConfiguredMapMain` -> `configured_map_main::{configure(&Arguments) ->
+ConfiguredMap { root, profile: Arc<ConfiguredProfile>, sources: Vec<ConfiguredSource> }, load_schema, main}`;
+`main` stops with a `TODO(port)` where it would build the `Planetiler` run. Samples are bundled with `include_str!`
+(`samples::get("shortbread.yml")`, also `/samples/...`), as are `planetiler.schema.json`/`planetilerspec.schema.json`.
+
+**Contexts.** `contexts::build_root_context(&Arguments, schema.args()) -> Result<Root, ParseException>` iterates
+argument definitions until they settle like Java. `Root` is a cheap `Arc` handle (argument values, `PlanetilerConfig`,
+prebuilt CEL bindings for `args`/`args.<name>`). The nested Java context records are one `Copy` struct
+`ScriptContext<'a>` tagged with a `ContextKind` (`Root < ProcessFeature < FeaturePostMatch < FeatureAttribute`):
+`root.create_process_feature_context(&feature, &tvp)`, `.create_post_match_context(&match_keys)`,
+`.create_attr_zoom_context(&value)`, `root.as_context()`. The input is a `FeatureRef` (a `&dyn SourceFeature`, or
+`SplitTest(&Way)` for `split_osm_way_at_intersections` so no tags are cloned). `ScriptContext` implements
+`ExpressionInput`; core custom expressions/getters recover it with `ScriptContext::from_input(&dyn ExpressionInput)`
+(an `as_any` lifetime-erasure trick, see the SAFETY comment) and compare `kind()` to emulate Java's `instanceof`.
+
+**Expressions.** `ScriptEnvironment { kind, root }` replaces the CEL declaration list (`contains_variable`).
+`ConfigExpression` is an enum (`Const`, `Match(Arc<MatchExpression>)` with a prebuilt `MultiExpression` index,
+`Coalesce`, `Variable`, `GetTag`, `GetArg`, `Cast`, `Script(Arc<ConfigExpressionScript>)`) implementing
+`Simplifiable` like Java; Java's output `Class<O>` is `type_conversion::OutType` (`Integer`/`Long` both produce
+`Value::Int`). `expr.into_getter()` wraps it as a core `TypedGetter` for `match_any_typed`.
+`BooleanExpressionScript::script(text, &env) -> Expression::Custom`. `ParseException`/`EvaluationException` are error
+structs; runtime script errors are logged once per script (then at debug) and evaluate to `null`/`false` instead of
+throwing.
+
+**CEL (`expression::stdlib`).** Uses the `cel` 0.15 crate: one shared `Env` (stdlib + strings extension + planetiler
+functions `coalesce` (0..32 args), `nullif`, `replaceRegex`, map `has(key, values...)`/`get`/`getOrDefault`/
+`getOrKeep`, `min`/`max` of lists, geometry `area(unit)`/`length(unit)`/`point_along_line`/`innermost_point`/
+`partial_line` and fields `lat lon min_lat max_lat min_lon max_lon bbox centroid centroid_if_convex validated_polygon
+point_on_surface line_midpoint innermost_point`). Scripts are parsed once into an AST and evaluated with
+`cel::Value::resolve_val` against a `VariableResolver` over the `ScriptContext`; `feature.tags` is a lazy map `Val`
+over the feature's tags (applies `tag_mappings`, `null` for missing keys, no per-feature map building). Static
+scripts (only `args`) are folded to constants at parse time (cached per script). Gaps vs cel-java: no type checker
+(undeclared variables are rejected at parse time by walking the AST, but type errors and unknown functions only
+surface at runtime); `has(m.f)` is rewritten to an internal function so maps with null-for-missing work; `1 == 1.0`
+is true (cel-java: false); `replaceRegex` uses `regex` crate syntax (no look-around/backrefs); geometry values
+can't be returned as results (they become `null`). Geometry functions reach the borrowed source feature by indexing
+the geometry value with an internal `"\0name\0args"` key since overloads can't downcast non-`'static` values.
+
+**Profile.** `ConfiguredProfile::new(schema, root) -> Result<_, ParseException>` implements `Profile`
+(`process_feature` uses a `MultiExpression` index over all features, `split_osm_way_at_intersections`, metadata);
+`sources()` evaluates `url`/`local_path`/`projection` expressions; `find_feature_layer`.
+`post_process_layer_features` is a `TODO(port)` until `FeatureMerge` exists. `configured_profile::can_be_line` ports
+`OsmReader.canBeLine`. Tests: `tests/{configured_feature_test, expression_tests, schema_tests}.rs` (the latter has a
+test-only port of `BaseSchemaValidator.validate` running the full shortbread spec, plus an ignored
+`bench_shortbread` throughput check: ~0.9M features/s/thread in release).

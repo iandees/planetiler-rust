@@ -1,0 +1,111 @@
+schema_name: OWG Simple Schema
+schema_description: Simple vector tile schema
+version: 1.0.0
+is_overlay: true
+attribution: <a href="https://www.openstreetmap.org/copyright" target="_blank">&copy;
+  OpenStreetMap contributors</a>
+sources:
+  water_polygons:
+    type: shapefile
+    url: https://osmdata.openstreetmap.de/download/water-polygons-split-3857.zip
+    projection: EPSG:3857
+  osm:
+    type: osm
+    url: geofabrik:monaco
+tag_mappings:
+  bridge: boolean
+  intermittent: boolean
+  layer: long
+  tunnel: boolean
+layers:
+- id: water
+  features:
+  - source: osm
+    geometry: polygon
+    include_when:
+      natural: water
+    attributes:
+    - key: natural
+    - key: intermittent
+      include_when:
+        intermittent: true
+    - key: name
+      min_tile_cover_size: 0.01
+      exclude_when:
+        tag:
+          key: water
+          value:
+          - river
+          - canal
+          - stream
+  - source: water_polygons
+    geometry: polygon
+    attributes:
+    - key: natural
+      value: water
+  - source: osm
+    min_zoom: 7
+    geometry: line
+    include_when:
+      tag:
+        key: waterway
+        value:
+        - river
+        - stream
+        - canal
+    attributes:
+    - key: waterway
+    - key: intermittent
+      include_when:
+        intermittent: true
+    - key: name
+      min_zoom: 12
+- id: road
+  features:
+  - source: osm
+    geometry: line
+    include_when:
+      highway:
+      - motorway
+      - trunk
+      - primary
+      - secondary
+      - tertiary
+      - motorway_link
+      - trunk_link
+      - primary_link
+      - secondary_link
+      - tertiary_link
+      - unclassified
+      - residential
+      - living_street
+      - service
+      - track
+    min_zoom:
+      default_value: 4
+      overrides:
+        5:
+          highway: trunk
+        7:
+          highway: primary
+        8:
+          highway: secondary
+        9:
+          highway:
+          - tertiary
+          - motorway_link
+          - trunk_link
+          - primary_link
+          - secondary_link
+          - tertiary_link
+        11:
+          highway:
+          - unclassified
+          - residential
+          - living_street
+        12:
+          highway: track
+        13:
+          highway: service
+    attributes:
+    - key: highway
