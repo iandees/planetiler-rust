@@ -313,6 +313,132 @@ impl Planetiler {
         })
     }
 
+    /// Adds a new ESRI shapefile source that will be processed using a projection inferred from the shapefile when
+    /// [`Planetiler::run`] is called.
+    ///
+    /// `default_path` can be a `.shp` file with the other shapefile components in the same directory, a directory, or
+    /// a `.zip` file containing the shapefile components. Override with the `name_path` argument.
+    pub fn add_shapefile_source(&mut self, name: &str, default_path: impl Into<PathBuf>) -> anyhow::Result<&mut Self> {
+        self.add_shapefile_source_with_projection(None, name, default_path, None)
+    }
+
+    /// Like [`Planetiler::add_shapefile_source`] but downloads from `default_url` (overridden by `name_url`) if the
+    /// file does not exist and `--download` is set.
+    pub fn add_shapefile_source_with_url(
+        &mut self,
+        name: &str,
+        default_path: impl Into<PathBuf>,
+        default_url: Option<&str>,
+    ) -> anyhow::Result<&mut Self> {
+        self.add_shapefile_source_with_projection(None, name, default_path, default_url)
+    }
+
+    /// Adds a new ESRI shapefile source with an explicit `projection` (CRS authority code like `EPSG:3857`, `None` to
+    /// infer it from the `.prj` file).
+    pub fn add_shapefile_source_with_projection(
+        &mut self,
+        projection: Option<&str>,
+        name: &str,
+        default_path: impl Into<PathBuf>,
+        default_url: Option<&str>,
+    ) -> anyhow::Result<&mut Self> {
+        let path = self.get_path(name, "shapefile", default_path.into(), default_url);
+        let projection = projection.map(str::to_string);
+        let description = format!("Process features in {}", path.display());
+        self.add_source_stage(name, &description, move |ctx| {
+            let source_paths = if file_utils::has_extension(&path, "zip") || path.is_dir() {
+                file_utils::walk_path_with_pattern(&path, "*.shp")?
+            } else {
+                vec![path.clone()]
+            };
+            simple_sources::process_shapefiles(projection.as_deref(), &source_paths, ctx)
+        })
+    }
+
+    /// Adds a new ESRI shapefile glob source that will process all files under `base_path` (a directory or zip
+    /// archive) matching `glob_pattern`. Zip files that match are searched for `*.shp` files.
+    pub fn add_shapefile_glob_source(
+        &mut self,
+        projection: Option<&str>,
+        name: &str,
+        base_path: impl Into<PathBuf>,
+        glob_pattern: &str,
+        default_url: Option<&str>,
+    ) -> anyhow::Result<&mut Self> {
+        let base_path = base_path.into();
+        let dir_path = self.get_path(name, "shapefile glob", base_path.clone(), default_url);
+        let projection = projection.map(str::to_string);
+        let pattern = glob_pattern.to_string();
+        let description = format!("Process all files matching {}/{glob_pattern}", dir_path.display());
+        self.add_source_stage(name, &description, move |ctx| {
+            // like Java, walk the base path (not the `name_path` override)
+            let source_paths = file_utils::walk_path_with_pattern_and_zip(&base_path, &pattern, |zip| {
+                file_utils::walk_path_with_pattern(zip, "*.shp").unwrap_or_default()
+            })?;
+            simple_sources::process_shapefiles(projection.as_deref(), &source_paths, ctx)
+        })
+    }
+
+    /// Adds a new OGC GeoPackage source that will be processed when [`Planetiler::run`] is called.
+    ///
+    /// If given a path to a ZIP file containing one or more GeoPackages, each `.gpkg` file within will be extracted to
+    /// a temporary directory at runtime (or next to the zip with `<name>_keep_unzipped`).
+    pub fn add_geopackage_source(
+        &mut self,
+        projection: Option<&str>,
+        name: &str,
+        default_path: impl Into<PathBuf>,
+        default_url: Option<&str>,
+    ) -> anyhow::Result<&mut Self> {
+        let path = self.get_path(name, "geopackage", default_path.into(), default_url);
+        let keep_unzipped = self.get_keep_unzipped(name);
+        let projection = projection.map(str::to_string);
+        let description = format!("Process features in {}", path.display());
+        self.add_source_stage(name, &description, move |ctx| {
+            let source_paths = if file_utils::has_extension(&path, "zip") {
+                file_utils::walk_path_with_pattern(&path, "*.gpkg")?
+            } else {
+                vec![path.clone()]
+            };
+            if source_paths.is_empty() {
+                bail!("No .gpkg files found in {}", path.display());
+            }
+            let unzip_dir = if keep_unzipped { unzipped_sibling(&path) } else { ctx.tmp_dir.to_path_buf() };
+            simple_sources::process_geopackages(projection.as_deref(), &source_paths, &unzip_dir, keep_unzipped, ctx)
+        })
+    }
+
+    /// Adds a new GeoJSON or newline-delimited GeoJSON source that will be processed when [`Planetiler::run`] is
+    /// called.
+    pub fn add_geojson_source(
+        &mut self,
+        name: &str,
+        default_path: impl Into<PathBuf>,
+        default_url: Option<&str>,
+    ) -> anyhow::Result<&mut Self> {
+        let path = self.get_path(name, "geojson", default_path.into(), default_url);
+        let description = format!("Process features in {}", path.display());
+        self.add_source_stage(name, &description, move |ctx| simple_sources::process_geojson(&[path], ctx))
+    }
+
+    /// Adds a new Natural Earth sqlite file source (the `.sqlite` file or a `.zip` containing it) that will be
+    /// processed when [`Planetiler::run`] is called. Deprecated in Java in favor of
+    /// [`Planetiler::add_geopackage_source`].
+    pub fn add_natural_earth_source(
+        &mut self,
+        name: &str,
+        default_path: impl Into<PathBuf>,
+        default_url: Option<&str>,
+    ) -> anyhow::Result<&mut Self> {
+        let path = self.get_path(name, "sqlite db", default_path.into(), default_url);
+        let keep_unzipped = self.get_keep_unzipped(name);
+        let description = format!("Process features in {}", path.display());
+        self.add_source_stage(name, &description, move |ctx| {
+            let unzip_dir = if keep_unzipped { unzipped_sibling(&path) } else { ctx.tmp_dir.to_path_buf() };
+            simple_sources::process_natural_earth(&path, &unzip_dir, keep_unzipped, ctx)
+        })
+    }
+
     /// Adds a new stage that will be invoked when [`Planetiler::run`] is called.
     ///
     /// - `name`: string to use in stats and logs to identify this stage
@@ -977,6 +1103,55 @@ impl Planetiler {
             }
         }
         Ok(())
+    }
+}
+
+/// `path.resolveSibling(path.getFileName() + "-unzipped")`.
+fn unzipped_sibling(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push("-unzipped");
+    path.with_file_name(name)
+}
+
+/// Glue between the runner and the simple readers.
+mod simple_sources {
+    use std::path::{Path, PathBuf};
+
+    use anyhow::bail;
+
+    use super::StageContext;
+
+    // TODO(port): wire to the reader entry points (`ShapefileReader.processWithProjection`, `GeoPackageReader.process`,
+    // `NaturalEarthReader.process`, `GeoJsonReader.process`) once the simple-reader integration lands.
+    pub fn process_shapefiles(
+        _projection: Option<&str>,
+        _paths: &[PathBuf],
+        ctx: &mut StageContext<'_>,
+    ) -> anyhow::Result<()> {
+        bail!("TODO(port): shapefile sources are not wired into the runner yet ({})", ctx.name)
+    }
+
+    pub fn process_geopackages(
+        _projection: Option<&str>,
+        _paths: &[PathBuf],
+        _unzip_dir: &Path,
+        _keep_unzipped: bool,
+        ctx: &mut StageContext<'_>,
+    ) -> anyhow::Result<()> {
+        bail!("TODO(port): geopackage sources are not wired into the runner yet ({})", ctx.name)
+    }
+
+    pub fn process_geojson(_paths: &[PathBuf], ctx: &mut StageContext<'_>) -> anyhow::Result<()> {
+        bail!("TODO(port): geojson sources are not wired into the runner yet ({})", ctx.name)
+    }
+
+    pub fn process_natural_earth(
+        _path: &Path,
+        _unzip_dir: &Path,
+        _keep_unzipped: bool,
+        ctx: &mut StageContext<'_>,
+    ) -> anyhow::Result<()> {
+        bail!("TODO(port): natural earth sources are not wired into the runner yet ({})", ctx.name)
     }
 }
 
