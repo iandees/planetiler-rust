@@ -39,6 +39,28 @@ const MAX_CHUNK_SIZE: u64 = 2_000_000_000; // 2GB
 const WRITE_BUFFER_BYTES: usize = 1 << 20;
 const READ_BUFFER_BYTES: usize = 1 << 16;
 
+/// Target size of each chunk file written in parallel when a sorted group is large.
+const WRITE_PIECE_BYTES: u64 = 128 << 20;
+
+/// Splits sorted `entries` into at most `pieces` ranges of similar length, only between entries with different keys
+/// (so features with the same key stay in one chunk, in sorted order).
+fn split_at_key_changes(entries: &[Entry], pieces: usize) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::with_capacity(pieces);
+    let mut start = 0;
+    for k in 1..pieces {
+        let mut end = (entries.len() * k / pieces).max(start);
+        while end > start && end < entries.len() && entries[end - 1].key == entries[end].key {
+            end += 1;
+        }
+        if end > start && end < entries.len() {
+            ranges.push(start..end);
+            start = end;
+        }
+    }
+    ranges.push(start..entries.len());
+    ranges
+}
+
 /// Estimated bytes of RAM needed to sort a feature with `len` value bytes (same estimate as Java, so chunk sizes
 /// match).
 #[inline]
@@ -185,14 +207,17 @@ impl ExternalMergeSort {
         ChunkReader::open(chunk, self.mmap_io, self.compress, self.madvise)
     }
 
-    /// Reads all chunks in `group` into memory, sorts, and writes the result to the first chunk's path.
+    /// Reads all chunks in `group` into memory, sorts, and writes the result to the first chunk's path, or for large
+    /// groups to several chunks with consecutive key ranges (the first chunk's path plus `-1`, `-2`, ...) written in
+    /// parallel. Writing a sorted group is mostly memory copying into the page cache, which ran at ~1.3 GB/s on one
+    /// thread and made the sort stage use ~2-3 cores.
     fn sort_group(
         &self,
         group: Vec<Chunk>,
         read_sem: &Semaphore,
         write_sem: &Semaphore,
         timing: &Timing,
-    ) -> anyhow::Result<Chunk> {
+    ) -> anyhow::Result<Vec<Chunk>> {
         let item_count: u64 = group.iter().map(|c| c.item_count).sum();
         let bytes: u64 = group.iter().map(|c| c.bytes_in_memory).sum();
         let data_bytes = bytes.saturating_sub(item_count * bytes_in_memory(0));
@@ -222,18 +247,44 @@ impl ExternalMergeSort {
         sortable.sort(self.parallel_sort);
         timing.sorting.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-        {
+        let first = &group[0].path;
+        let pieces = split_at_key_changes(&sortable.entries, (data_bytes / WRITE_PIECE_BYTES).clamp(1, 8) as usize);
+        let write_piece = |k: usize, entries: &[Entry]| -> anyhow::Result<Chunk> {
             let _permit = write_sem.acquire();
             let start = std::time::Instant::now();
-            let first = &group[0];
-            let mut out = open_writer(&first.path, self.compress)?;
-            for e in &sortable.entries {
+            let path = if k == 0 {
+                first.clone()
+            } else {
+                let mut name = first.file_name().unwrap_or_default().to_os_string();
+                name.push(format!("-{k}"));
+                first.with_file_name(name)
+            };
+            let mut out = open_writer(&path, self.compress)?;
+            let mut piece_bytes = 0;
+            for e in entries {
                 write_feature(&mut out, e.key as i64, sortable.value(e))?;
+                piece_bytes += bytes_in_memory(e.len as usize);
             }
             finish_writer(out)?;
             timing.writing.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            Ok(Chunk { path, item_count: entries.len() as u64, bytes_in_memory: piece_bytes })
+        };
+        if pieces.len() == 1 {
+            let chunk = write_piece(0, &sortable.entries)?;
+            return Ok(vec![Chunk { bytes_in_memory: bytes, ..chunk }]);
         }
-        Ok(Chunk { path: group[0].path.clone(), item_count, bytes_in_memory: bytes })
+        std::thread::scope(|s| {
+            let handles: Vec<_> = pieces
+                .iter()
+                .enumerate()
+                .map(|(k, range)| {
+                    let entries = &sortable.entries[range.clone()];
+                    let write_piece = &write_piece;
+                    s.spawn(move || write_piece(k, entries))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("sort writer panicked")).collect()
+        })
     }
 }
 
@@ -574,7 +625,8 @@ impl FeatureSort for ExternalMergeSort {
         let num_groups = groups.len();
         let queue: Mutex<std::vec::IntoIter<(usize, Vec<Chunk>)>> =
             Mutex::new(groups.into_iter().enumerate().collect::<Vec<_>>().into_iter());
-        let results: Mutex<Vec<Option<anyhow::Result<Chunk>>>> = Mutex::new((0..num_groups).map(|_| None).collect());
+        let results: Mutex<Vec<Option<anyhow::Result<Vec<Chunk>>>>> =
+            Mutex::new((0..num_groups).map(|_| None).collect());
         let failed = AtomicBool::new(false);
         let threads = self.workers.min(num_groups).max(1);
         let this = &*self;
@@ -611,20 +663,22 @@ impl FeatureSort for ExternalMergeSort {
         });
 
         let mut sorted_chunks = Vec::with_capacity(num_groups);
+        let mut sorted_groups = 0;
         for result in results.into_inner().into_iter().flatten() {
-            sorted_chunks.push(result?);
+            sorted_chunks.extend(result?);
+            sorted_groups += 1;
         }
-        if sorted_chunks.len() != num_groups {
-            anyhow::bail!("Sort did not complete: {} of {num_groups} chunks sorted", sorted_chunks.len());
+        if sorted_groups != num_groups {
+            anyhow::bail!("Sort did not complete: {sorted_groups} of {num_groups} chunks sorted");
         }
         *self.chunks.get_mut() = sorted_chunks;
         self.sorted = true;
         timer.stop();
         info!(
-            "read:{}s write:{}s sort:{}s",
-            Duration::from_nanos(timing.reading.load(Ordering::Relaxed)).as_secs(),
-            Duration::from_nanos(timing.writing.load(Ordering::Relaxed)).as_secs(),
-            Duration::from_nanos(timing.sorting.load(Ordering::Relaxed)).as_secs()
+            "read:{:.2}s write:{:.2}s sort:{:.2}s (summed over threads)",
+            Duration::from_nanos(timing.reading.load(Ordering::Relaxed)).as_secs_f64(),
+            Duration::from_nanos(timing.writing.load(Ordering::Relaxed)).as_secs_f64(),
+            Duration::from_nanos(timing.sorting.load(Ordering::Relaxed)).as_secs_f64()
         );
         Ok(())
     }
@@ -719,6 +773,19 @@ impl Drop for ExternalMergeSort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_at_key_changes() {
+        let entries =
+            |keys: &[u64]| -> Vec<Entry> { keys.iter().map(|&key| Entry { key, offset: 0, len: 0 }).collect() };
+        assert_eq!(vec![0..0], split_at_key_changes(&[], 4));
+        assert_eq!(vec![0..4], split_at_key_changes(&entries(&[1, 2, 3, 4]), 1));
+        assert_eq!(vec![0..2, 2..4], split_at_key_changes(&entries(&[1, 2, 3, 4]), 2));
+        // never splits a run of equal keys
+        assert_eq!(vec![0..3, 3..4], split_at_key_changes(&entries(&[1, 1, 1, 2]), 2));
+        assert_eq!(vec![0..4], split_at_key_changes(&entries(&[1, 1, 1, 1]), 3));
+        assert_eq!(vec![0..1, 1..2, 2..3], split_at_key_changes(&entries(&[1, 2, 3]), 8));
+    }
     use crate::collection::array_long_min_heap::tests::Rng;
     use crate::stats::stats::InMemoryStats;
 
