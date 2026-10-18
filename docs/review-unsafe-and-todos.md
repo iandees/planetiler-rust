@@ -245,7 +245,7 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 | # | Location | Feature | Size | Priority |
 |---|---|---|---|---|
 | 27 | `core/src/vector_tile.rs:781`, `core/src/archive/tile_archive_writer.rs:109`, `core/src/util/tile_size_stats.rs:20`, `core/tests/planetiler_tests.rs:137`, `core/tests/planetiler_tests_a.rs:52` (5 TODOs) | **MLT (MapLibre Tile) encoder** (+ decoder for `computeMltTileStats`). `tile-format=mlt` is an error right now. | L (Java pulls in `org.maplibre.mlt`; nothing equivalent exists in Rust, so it's a from-scratch encoder: column encodings, FSST/dictionary, property type coercion) | Medium: only a parity gap for users who opt in. The default MVT output is unaffected. |
-| 28 | `openmaptiles/src/layers/boundary.rs:222` | **JTS `Polygonizer`**. Country polygons for `adm0_l`/`adm0_r` are approximated with a line merger, which drops rings that only close through a node shared by 3 or more ways. | M (~400-600 LOC port of `Polygonizer`/`PolygonizeGraph`, which can reuse `geo::polygon_index` and point-in-ring code) | **High for OMT parity**: missing or wrong `adm0_l`/`adm0_r` on real planet data. |
+| 28 | `openmaptiles/src/layers/boundary.rs:222` | **Done**: JTS `Polygonizer` is ported (`geo::polygonizer`) and `boundary` builds country polygons with it like Java (polygonize, then union). | - | - |
 | 29 | `core/src/geo/polygon_overlay.rs:387` | JTS snap rounding: **hot pixels at segment intersections** (and near-vertex tolerance). Today only vertices are hot pixels and the integer overlay rounds the rest. | M | Medium-high: rare differences from Java in `reduce_precision` output for polygons. Could add slivers or validity differences after tile clipping. |
 | 30 | `core/src/geo/polygon_overlay.rs:455` | **Snap-rounding for lines** (noding at intersections). Lines are only rounded point by point. | M | Low-medium: JTS nodes self-intersecting lines during `GeometryPrecisionReducer`, which changes vertex counts and output bytes for merged or simplified lines. |
 | 31 | `core/src/geo/crs.rs:15` | Arbitrary EPSG codes and general WKT CRS. Only 4326/4269/3857, PROJ strings and simple WKT work. | M (`proj4rs` + `crs-definitions` feature + a WKT -> PROJ converter for `.prj` files) | Medium: shapefiles or geopackages in other projections fail where Java (GeoTools) succeeds. |
@@ -273,8 +273,7 @@ So 29 are stale (a1 + a2), 16 are real gaps and 8 are intentional.
 
 ### Top 5 real gaps (parity and performance)
 
-1. **JTS `Polygonizer` for OMT boundary `adm0_l`/`adm0_r`** (#28). M. It affects attribute correctness on planet
-   data, and it is the most visible OpenMapTiles parity gap.
+1. ~~**JTS `Polygonizer` for OMT boundary `adm0_l`/`adm0_r`** (#28).~~ Done (`geo::polygonizer`).
 2. **Snap rounding at segment intersections in `reduce_precision`** (#29, plus #30 for lines). M. It is a source of
    geometry and validity differences from Java in tile output, so it makes Java-vs-Rust archive comparisons noisy.
 3. **MLT encoder** (#27, five markers). L. It is the only unsupported output format and blocks several ported
