@@ -29,7 +29,7 @@ impl Timer {
     }
 
     pub fn elapsed(&self) -> ProcessTime {
-        let end = self.end.lock().clone().unwrap_or_else(ProcessTime::now);
+        let end = (*self.end.lock()).unwrap_or_else(ProcessTime::now);
         end.minus(&self.start)
     }
 }
@@ -37,5 +37,23 @@ impl Timer {
 impl fmt::Display for Timer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.elapsed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timer() {
+        let timer = Timer::start();
+        let elapsed1 = timer.elapsed();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let elapsed2 = timer.stop().elapsed();
+        let elapsed3 = timer.elapsed();
+        assert_eq!(elapsed2.wall, elapsed3.wall);
+        assert!(elapsed1.wall < elapsed2.wall);
+        assert!(elapsed3.cpu.is_some(), "no CPU time");
+        assert!(!timer.running());
     }
 }
