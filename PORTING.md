@@ -208,3 +208,58 @@ for tile in &mut tiles {
 tiles.join()?;
 ```
 `TileFeatures` is `Send + 'static` (holds an `Arc` of shared state), so it can be handed to encoder threads.
+
+### planetiler-openmaptiles notes
+
+**Generated code.** `Generate.java` -> `planetiler_openmaptiles::generate` (parsing/expression/emit functions, ported
+`GenerateTest`) + the `generate_openmaptiles` binary. Instead of crawling GitHub, it reads a vendored copy of the
+schema in `crates/planetiler-openmaptiles/schema` (pinned to openmaptiles `e0fb503`, the revision the checked-in Java
+`generated/*.java` match; refresh with `crates/planetiler-openmaptiles/scripts/fetch-schema.sh <ref> <dir>`), writes
+`src/generated/{open_map_tiles_schema,tables}.rs` and runs `rustfmt`. `generate::tests::test_generated_code_is_up_to_date`
+fails if the checked-in files drift from the generator output. Differences from Java: docs are markdown doc comments
+(no HTML rendering); YAML is parsed with `serde_yaml` (YAML 1.2: unquoted `yes`/`no` stay strings, the pinned schema
+quotes them).
+- `OpenMapTilesSchema.<Layer>` -> module `open_map_tiles_schema::<layer>` with `LAYER_NAME`, `BUFFER_SIZE`,
+  `fields::*`, `field_values::*` (`*_VALUES` are `&[&str]`) and `field_mappings::*` (`LazyLock<MultiExpression<&'static
+  str>>`, call `.index()` once). `create_instances(&Arc<Translations>, &Arc<PlanetilerConfig>, &StatsRef) ->
+  Vec<Arc<dyn Layer>>`.
+- `Tables.OsmX` records -> `tables::OsmX<'a> { source, mapping_key }`: a lazy, allocation-free view; column accessors
+  come from the generated `WithX<'a>` traits (`Option<Cow<'a, str>>` for strings, `bool`, `i64`, `i32`, `&'a str` for
+  the mapping key, `&'a dyn SourceFeature` for `source()`), computed from tags on each call. `OsmX::mapping()` is the
+  imposm3 `MAPPING` expression. `Tables.OsmX.Handler` -> trait `OsmXHandler { fn process_osm_x(&self, &OsmX<'_>,
+  &mut FeatureCollector<'_>) }`; layers expose it through `RowHandlers::as_osm_x_handler()` (Java `instanceof`).
+  `RowClassAndConstructor`/`generateDispatchMap` -> `enum Table` (`ALL`, `name`, `mapping`, `is_handled_by`,
+  `dispatch`) and `tables::MAPPINGS: MultiExpression<Table>`.
+
+**Layers / profile.** `Layer` (crate root `layer` module) is `Handler + RowHandlers + Any`, plus accessors for the
+OpenMapTiles source processors (`as_natural_earth_processor`, `as_lake_centerline_processor`,
+`as_osm_water_polygon_processor`, `as_osm_all_processor`) and `ignore_wikidata()` (Java `IgnoreWikidata`). Those
+processor traits live in `open_map_tiles_profile`. `OpenMapTilesProfile::new(Arc<Translations>, Arc<PlanetilerConfig>,
+StatsRef)` embeds a `ForwardingProfile` (with the `transportation_name -> transportation` layer dependency), registers
+layers that pass `--only-layers`/`--exclude-layers`, wires `TransportationName::needs_transportation_layer`, registers
+per-source closures, and builds one `MultiExpression<RowDispatch>` index over all imposm3 tables (tables nobody
+handles are dropped) plus a `bool` index for `cares_about_wikidata_translation` (evaluated on a borrowed
+tags+geometry-type view instead of building a `SimpleFeature`). `ExtraLayers` -> `addons::create`.
+
+**Main.** `OpenMapTilesMain.run` -> `open_map_tiles_main::setup(&Arguments) -> OpenMapTilesSetup` (default languages,
+`wikidata_names.json` path, the four `SourceSpec`s with default paths/URLs, `mbtiles` output) and `create_profile(..)`;
+`run` has a `TODO(port)` for the `Planetiler` runner call. Sources: `lake_centerlines` (shapefile, EPSG:3857,
+`data/sources/lake_centerline.shp.zip`, `https://dev.maptiler.download/geodata/omt/lake_centerline.shp.zip`),
+`water_polygons` (shapefile, `data/sources/water-polygons-split-3857.zip`,
+`https://osmdata.openstreetmap.de/download/water-polygons-split-3857.zip`), `natural_earth` (sqlite,
+`data/sources/natural_earth_vector.sqlite.zip`, `https://dev.maptiler.download/geodata/omt/natural_earth_vector.sqlite.zip`),
+`osm` (`data/sources/<area>.osm.pbf`, `geofabrik:<area>` or `aws:latest` for `planet`; `--area` defaults to `monaco`).
+
+**Utilities.** `OmtLanguageUtils.getNames(tags, translations)` -> `omt_language_utils::get_names(&Tags,
+Option<&Translations>) -> Tags`; `Utils.coalesce` is `Option::or`; `elevationTags` -> `utils::elevation_tags[_str]`;
+`brunnel` -> `utils::brunnel[_with_ford]` (`Option<&'static str>`). `VerifyMonaco` also hosts a local port of
+`Verify.getNumFeatures`/`checkMinFeatureCount` (`TODO(port)`: move into `mbtiles::verify`).
+
+**FeatureMerge.** Until `planetiler_core::feature_merge` lands, the crate uses `src/feature_merge_shim.rs`, a copy
+of that port with the same API (`TODO(port)`: replace with `pub(crate) use planetiler_core::feature_merge;` in
+`lib.rs` and drop the `rstar`/`hashbrown`/`ahash` dependencies).
+
+**Tests.** `AbstractLayerTest` -> `test_support` (`LayerTest`, `assert_features`, `assert_covers_zoom_range`,
+feature constructors, `to_map`/`assert_submap` copies of the core test helpers, `SharedWikidataTranslations` so tests
+can add wikidata translations after building `Translations`). Per-layer tests live in each layer file.
+`OpenMapTilesTest` (end-to-end Monaco build) is deferred until the `Planetiler` runner is ported.
