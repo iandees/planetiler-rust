@@ -67,9 +67,12 @@ See the table at the bottom of this file; update it as modules are completed.
 | `util::{translations, language_utils, thread_local_transliterator, wikidata}` | done (`wikidata::fetch` takes a `Fn(&OsmElement) -> bool` filter; `fetch_for_profile` / `profile_filter` adapt a `Profile`) |
 | Feature pipeline spine: `profile` (`Profile`, `NullProfile`), `feature_processor`, `forwarding_profile`, `feature_collector`, `reader::{source_feature, simple_feature}`, `reader::osm::osm_relation_info` (+ `RelationMember`), `render::{feature_renderer, tiled_geometry, geometry_coordinate_sequences, rendered_feature}`, `collection::feature_group` | done (see notes below) |
 | `reader::{simple_reader, source_feature_processor, shapefile_reader, geo_package_reader, natural_earth_reader}`, `reader::geojson::*`, `reader::parquet::*` + benchmark `benchmark_simple_readers` | done as *decoders* emitting `ReaderFeature`; wiring into `SimpleFeature`/`Profile`/`FeatureGroup` is `TODO(port)` (see notes) |
-| `archive::tile_archive_writer` (`TileArchiveWriter.writeOutput`), `validator::{schema_specification, base_schema_validator, java_profile_validator}`, `testing` harness + `tests/planetiler_tests*.rs` (the `runWithReaderFeatures` subset of `PlanetilerTests`), benchmark `benchmark_tile_archive_writer` | done (MLT output errors; OSM/orchestrator tests listed as `TODO(port)` in `tests/planetiler_tests.rs`) |
-| `planetiler-openmaptiles`: `Generate` (generator + vendored schema), generated `OpenMapTilesSchema`/`Tables`, `OpenMapTilesProfile`, `OpenMapTilesMain` (setup only), all 16 layers, `OmtLanguageUtils`, `Utils`, `VerifyMonaco`, all unit tests (249) | done (see notes below; deferred: `OpenMapTilesTest` end-to-end + runner call wait on `Planetiler`; uses a FeatureMerge copy until core lands it) |
-| `planetiler-custommap` (configschema, contexts, TagValueProducer, TypeConversion, ConfigExpression/Parser, BooleanExpressionParser/Script, CEL stdlib on the `cel` crate, ConfiguredFeature, ConfiguredProfile, ConfiguredMapMain `configure`, bundled samples + JSON schemas) | done (see notes below); deferred: `post_process_layer_features` merging (needs `FeatureMerge`), the planetiler run in `ConfiguredMapMain` (needs `Planetiler`), `SchemaValidator` CLI (needs `planetiler_core::validator`), `ConfiguredMapTest`/`VerifyMonaco` (full pipeline) |
+| `archive::tile_archive_writer` (`TileArchiveWriter.writeOutput`), `validator::{schema_specification, base_schema_validator, java_profile_validator}`, `testing` harness + `tests/planetiler_tests*.rs` (the `runWithReaderFeatures` subset of `PlanetilerTests`), benchmark `benchmark_tile_archive_writer` | done (MLT output errors) |
+| `planetiler` (`Planetiler.java` orchestrator) + `tests/planetiler_runner_tests.rs` (testPlanetilerRunner*, MemoryCheck*, ReuseFeatureDb) + `tests/planetiler_osm_tests.rs` (all OSM `PlanetilerTests`) + `testing::run_with_osm_elements`, `TileSizeStats.main` (`tile_size_stats::main`), `CompareArchives.main` (`compare_archives::main`) | done (see "Planetiler orchestrator notes"; deferred: csv/tsv/json/proto/MLT variants of testPlanetilerRunner, testExceptionWhileProcessingOsm is `#[ignore]`d) |
+| `planetiler` CLI crate (`planetiler-dist` `Main.java` task dispatch) | done (stubs that error: `verify`/`verify-schema` (custommap SchemaValidator CLI), `benchmark-mapping`, `benchmark-longlongmap` (use the benchmarks crate), `top-osm-tiles` (needs xz)) |
+| `planetiler-examples` (all 9 examples incl. `ToiletsOverlayLowLevelApi`, `OvertureBasemap`) + all example tests | done |
+| `planetiler-openmaptiles`: `Generate` (generator + vendored schema), generated `OpenMapTilesSchema`/`Tables`, `OpenMapTilesProfile`, `OpenMapTilesMain` (`setup`/`configure`/`run`/`main`), all 16 layers, `OmtLanguageUtils`, `Utils`, `VerifyMonaco`, all unit tests (249), `OpenMapTilesTest` (`tests/open_map_tiles_test.rs`) | done (see notes below) |
+| `planetiler-custommap` (configschema, contexts, TagValueProducer, TypeConversion, ConfigExpression/Parser, BooleanExpressionParser/Script, CEL stdlib on the `cel` crate, ConfiguredFeature, ConfiguredProfile, ConfiguredMapMain (`configure`, `create_planetiler`, `main`), bundled samples + JSON schemas, `ConfiguredMapTest`) | done (see notes below); deferred: `SchemaValidator` CLI |
 | `feature_merge` (`FeatureMerge`: line merging via `LoopLineMerger`, nearby/overlapping polygon merging with buffer/union/unbuffer, multi-point/line/polygon merging, `remove_points_outside_buffer`, `group_by_attrs`, `extract_connected_components`) + full `FeatureMergeTest` | done (see notes below) |
 | `reader::{simple_reader, source_feature_processor, shapefile_reader, geo_package_reader, natural_earth_reader}`, `reader::geojson::*`, `reader::parquet::*` + benchmark `benchmark_simple_readers` | done, including profile/`FeatureGroup` wiring (`source_feature_processor::process_files`, per-reader `process` entry points, `impl SourceFeature for ParquetFeature`); see notes for the orchestrator API |
 
@@ -422,7 +425,8 @@ tags+geometry-type view instead of building a `SimpleFeature`). `ExtraLayers` ->
 
 **Main.** `OpenMapTilesMain.run` -> `open_map_tiles_main::setup(&Arguments) -> OpenMapTilesSetup` (default languages,
 `wikidata_names.json` path, the four `SourceSpec`s with default paths/URLs, `mbtiles` output) and `create_profile(..)`;
-`run` has a `TODO(port)` for the `Planetiler` runner call. Sources: `lake_centerlines` (shapefile, EPSG:3857,
+`configure(&Arguments) -> Planetiler` applies it to the runner (profile built lazily with `set_profile_provider` from
+`p.translations()`), `run`/`main` run it. Sources: `lake_centerlines` (shapefile, EPSG:3857,
 `data/sources/lake_centerline.shp.zip`, `https://dev.maptiler.download/geodata/omt/lake_centerline.shp.zip`),
 `water_polygons` (shapefile, `data/sources/water-polygons-split-3857.zip`,
 `https://osmdata.openstreetmap.de/download/water-polygons-split-3857.zip`), `natural_earth` (sqlite,
@@ -441,7 +445,68 @@ of that port with the same API (`TODO(port)`: replace with `pub(crate) use plane
 **Tests.** `AbstractLayerTest` -> `test_support` (`LayerTest`, `assert_features`, `assert_covers_zoom_range`,
 feature constructors, `to_map`/`assert_submap` copies of the core test helpers, `SharedWikidataTranslations` so tests
 can add wikidata translations after building `Translations`). Per-layer tests live in each layer file.
-`OpenMapTilesTest` (end-to-end Monaco build) is deferred until the `Planetiler` runner is ported.
+`tests/open_map_tiles_test.rs` ports `OpenMapTilesTest` (Monaco end-to-end, all counts match Java).
+
+### Planetiler orchestrator notes (`planetiler::Planetiler`, CLI, examples)
+
+```rust
+let mut p = Planetiler::create(arguments)?;             // reads tmpdir/temp_* paths, --download, --only_download, ...
+p.set_default_languages(&LANGS)
+    .fetch_wikidata_name_translations("data/sources/wikidata_names.json")?
+    .set_profile_provider(|p| Ok(Arc::new(MyProfile::new(p.translations(), p.config().clone(), p.stats().clone()))))
+    .add_osm_source_with_url("osm", "data/sources/monaco.osm.pbf", Some("geofabrik:monaco"))?
+    .add_shapefile_source_with_projection(Some("EPSG:3857"), "lakes", "lakes.shp.zip", Some(url))?
+    .add_natural_earth_source("ne", "ne.sqlite.zip", Some(url))?
+    .add_geopackage_source(None, "gpkg", "x.gpkg", None)?
+    .add_geojson_source("gj", "x.geojson", None)?
+    .add_parquet_source("pq", paths, hive_partitioning, get_id, get_layer)?   // Option<Arc<dyn Fn(&Tags) -> Value>>
+    .add_overture_source("overture", "buildings", "building", "data/overture")?
+    .add_stage("custom", "description", |ctx: &mut StageContext| Ok(()))?      // also add_source_stage (cares_about_source)
+    .overwrite_output("data/output.mbtiles")?;          // or set_output / set_output_with_argument("mbtiles", ..)
+p.run()?;
+```
+- Builder methods that read arguments or can fail return `anyhow::Result<&mut Self>`; Java overloads became
+  `_with_url` / `_with_projection` variants or `Option` parameters. `set_profile(impl Profile)`, `set_profile_arc`,
+  `set_profile_provider(FnOnce(&mut Planetiler) -> Result<Arc<dyn Profile>>)` (constructed at `run()` like Java).
+- Stage tasks are `FnOnce(&mut StageContext) -> Result<()>`; `StageContext { name, feature_group: &Arc<FeatureGroup>,
+  profile, config: &Arc<PlanetilerConfig>, stats, metadata: &mut TileArchiveMetadata, tmp_dir }`. Stage errors are
+  wrapped with `Error occurred during stage <id>`. After the stages the group is reclaimed with `Arc::into_inner`,
+  prepared, and (with `--reuse_featuredb`) its string encoders/chunk manifest are saved under `feature.db/`.
+- `run()` mirrors Java: version/help, `--tests=<yml>` (`java_profile_validator::validate`; returns an error when a
+  case fails instead of exiting 1), output exists/`--force`/`--append` checks, multi-writer index files, cleanup of
+  tmp files, downloads (lazy overture STAC resolution on a background thread), `download_osm_tile_weights`, input
+  existence, wikidata fetch/load, disk + memory checks (`ResourceUsage`, fail unless `--force`), bounds from the OSM
+  header then `OsmNodeBoundsProvider` (`--osm_parse_node_bounds` skips the header), stages, `free_<name>_after_read`,
+  `TileArchiveWriter`, summary. `--help`/`--version` return `Ok(())` (Java calls `System.exit(0)`).
+- `PlanetilerConfig` is an `Arc`; inferred bounds produce a *new* config Arc (profiles built before that keep the old
+  one; everything the runner drives uses the new one). `Bounds::lat_lon_opt()` was added for that check.
+- Wikidata translations are attached through a deferred provider registered by `translations()` (a `OnceLock`
+  filled during `run()`), since `Arc<Translations>` is shared with the profile.
+- Not modelled: Java subtracts the size of `free_<name>_after_read` inputs from the write-phase disk estimate
+  (resource amounts are unsigned); `LogUtil.setStage` prefixes; virtual-thread executor.
+- Behaviour fixes made while comparing against Java on Monaco/Switzerland: `polygon_overlay::reduce_precision` now
+  snaps each segment to every hot pixel it passes through (JTS `SnapRoundingNoder`, vertices only - intersection hot
+  pixels are still left to the integer overlay), so sub-pixel slivers collapse like JTS; `FeatureGroup` writes a tile
+  with an empty layer (like Java) when all of a layer's features are removed by `unscale/removePointsOutsideBuffer`;
+  `test_utils::validate_geometry` uses JTS `isSimple` semantics like Java's `TestUtils`; custommap reads OSM tags via
+  `WithTags::tags` (OSM features have empty `base().tags`); `extract_from_zip` handles relative tmp dirs.
+- CLI (`crates/planetiler/src/main.rs`): `planetiler [task] [args]`, tasks as in `Main.java` (`openmaptiles` default
+  with the maptiler URL overrides, `custom`, `shortbread`, `*.yml` first arg, `example-*`, `overture`, `osm-qa`,
+  `verify-mbtiles`, `verify-monaco`, `stats`, `compare`). Logging via `tracing-subscriber` (`RUST_LOG`), messages
+  written verbatim so progress-log ANSI colors render.
+- Examples: `planetiler_examples::<module>::{main(args), run(..)}` for `toilets_overlay`, `toilets_overlay_low_level_api`,
+  `bike_route_overlay`, `osm_qa_tiles`, `admin_borders_overlay`, `parks_overlay`, `tram_route_overlay`,
+  `water_infrastructure_project`, `overture`.
+
+**Comparison against Java** (`planetiler-dist-0.10.3-SNAPSHOT`, decoded tiles compared ignoring ring start/order):
+- Toilets overlay (Monaco, `--process_threads=1` because the sort key is a processing-order counter): identical.
+- `custom --schema=owg_simple.yml` (Monaco): identical apart from polygon ring start points/order.
+- OpenMapTiles Monaco: same 23 tiles/5357 features; remaining differences: z13 merged buildings (`mergeNearbyPolygons`
+  buffer/unbuffer output has ~50% more vertices than JTS mitre buffers, area within 0.5%), housenumber merged-point
+  IDs (Java picks the first feature of a `HashMap` iteration), polygon ring start/order.
+- OpenMapTiles Switzerland: see the final report of the orchestrator port (buffer-merge vertex counts for
+  building/landuse/landcover/transportation, `transportation_name` line-merge differences at z12-14, data error counts
+  `osm_boundary_missing_way`/`osm_multipolygon_missing_way` lower than Java).
 
 ## Follow-ups (tracked by the coordinator)
 
@@ -453,6 +518,10 @@ can add wikidata translations after building `Translations`). Per-layer tests li
   `planetiler_core::mbtiles::verify`.
 - Unify the two `VectorLayer` types (`archive::tile_archive_metadata` and `util::layer_attr_stats`).
 - Re-enable the four `#[cfg(any())]` merge tests in `crates/planetiler-core/tests/` once FeatureMerge merges.
+- `feature_merge::buffer_geometry`: mitre buffer output has ~50% more vertices than JTS (z13 OpenMapTiles buildings).
+- `transportation_name` z12-14 differences vs Java on Switzerland (line merging / route attributes).
+- Port custommap `SchemaValidator` CLI, `TopOsmTiles.main` (xz), `OpenMapTilesMapping` benchmark; in-memory stream
+  archive readers for the csv/tsv/json/proto `testPlanetilerRunner` variants.
 - MLT tile format (MapLibre Tile) encoder.
 - Full benchmark re-run on a quiet machine (see `bench/RESULTS.md`).
 ### custommap notes (`crates/planetiler-custommap`)
@@ -461,7 +530,7 @@ can add wikidata translations after building `Translations`). Per-layer tests li
 then serde with `deny_unknown_fields` (Jackson's default). Java `Object` fields are `Option<Value>` (mapping keys become
 strings like Jackson; YAML `null` == missing). `ConfiguredMapMain` -> `configured_map_main::{configure(&Arguments) ->
 ConfiguredMap { root, profile: Arc<ConfiguredProfile>, sources: Vec<ConfiguredSource> }, load_schema, main}`;
-`main` stops with a `TODO(port)` where it would build the `Planetiler` run. Samples are bundled with `include_str!`
+`create_planetiler(&ConfiguredMap)` / `add_source` build the runner and `main` runs it (`tests/configured_map_test.rs`). Samples are bundled with `include_str!`
 (`samples::get("shortbread.yml")`, also `/samples/...`), as are `planetiler.schema.json`/`planetilerspec.schema.json`.
 
 **Contexts.** `contexts::build_root_context(&Arguments, schema.args()) -> Result<Root, ParseException>` iterates
@@ -500,13 +569,11 @@ the geometry value with an internal `"\0name\0args"` key since overloads can't d
 **Profile.** `ConfiguredProfile::new(schema, root) -> Result<_, ParseException>` implements `Profile`
 (`process_feature` uses a `MultiExpression` index over all features, `split_osm_way_at_intersections`, metadata);
 `sources()` evaluates `url`/`local_path`/`projection` expressions; `find_feature_layer`.
-`post_process_layer_features` is a `TODO(port)` until `FeatureMerge` exists. `configured_profile::can_be_line` ports
+`post_process_layer_features` uses `planetiler_core::feature_merge`. `configured_profile::can_be_line` ports
 `OsmReader.canBeLine`. Tests: `tests/{configured_feature_test, expression_tests, schema_tests}.rs` (the latter has a
 test-only port of `BaseSchemaValidator.validate` running the full shortbread spec, plus an ignored
 `bench_shortbread` throughput check: ~0.9M features/s/thread in release).
-- custommap: wire `post_process_layer_features` merging to `planetiler_core::feature_merge`; switch
-  `tests/schema_tests.rs` to `planetiler_core::validator`; port the SchemaValidator CLI/watch, ConfiguredMapTest and
-  the `ConfiguredMapMain` run call once the orchestrator lands.
+- custommap: switch `tests/schema_tests.rs` to `planetiler_core::validator`; port the SchemaValidator CLI/watch.
 - custommap CEL gaps vs cel-java (no type checker, `1 == 1.0` is true, Rust regex syntax in `replaceRegex`): consider
   closing these if real schemas hit them.
   `ParquetFeature` implements `SourceFeature` and has `into_reader_feature()`.
