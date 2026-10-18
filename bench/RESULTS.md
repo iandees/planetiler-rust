@@ -28,6 +28,9 @@ in [`results-detail.md`](results-detail.md). Java-vs-Rust output parity for Swit
   (PMTiles directory varints moved to `util::var_int`); it only affects `.pmtiles` output. Rows where Rust is slower
   than Java: Douglas-Peucker on 50-100 point rings at tolerance 0.1-1 (0.88-0.97x), and JTS `VWSimplifier` vs geo's
   `SimplifyVw` at tolerance 1-20 on 10-50 points (0.44-0.92x; different algorithms, not on any Planetiler code path).
+- **MLT (`--tile_format=mlt`) after the encoder pass: Switzerland archive stage 3.99s vs Java 15s (54s vs 194s CPU),
+  and with `--mlt_advanced=true` 5.1s vs Java 149s (68s vs 31m CPU; it was 28.5s / 6m10s before).** The MLT benchmark
+  tile encodes 6.5x (default) and 6.1x (advanced) faster than Java, byte-identical. See "MLT encoding".
 - Correctness: Monaco output is identical to Java in every layer including feature IDs. Switzerland: identical tile
   set and per-layer feature counts in all 16 layers; normalized differing features are building 578, landuse 35,
   landcover 17, transportation 10 (Java-only = Rust-only in each), plus 1,730 housenumber feature IDs; everything else
@@ -183,7 +186,84 @@ Per-process steady-state values (one per process, median of its steady-state pas
 `benchmark_osm_read` now runs the real `OsmReader::pass1` like Java's BenchmarkOsmRead (`09073c3`); the previous
 pass's 0.479s was the older pass-1 emulation, so the two are not comparable (Java: 0.85-0.86s both times).
 
+## MLT encoding
+
+Measured 2026-10-18 at `3d7e7d4` (after the MLT encoder optimization pass; "before" = `38f44fe`), same machine. The
+desktop was not idle (a video call kept the 1-minute load at ~4-6 between runs), so Java and Rust trials were
+alternated and every row is a median of 3 processes per side. All outputs are byte-identical before and after (and to
+Java): the `fnv1a64` hashes of the benchmark tile match on both sides, and see "Byte identity" below.
+
+| Benchmark | Java | Rust before | Rust after | Rust vs Java (after) |
+|-----------|------|-------------|------------|----------------------|
+| VectorTile bench tile (3,000 features), MLT default | 6.61 ms/tile (151/s) | 2.22 ms (451/s) | 1.01 ms (988/s) | 6.5x |
+| VectorTile bench tile, MLT `--mlt-advanced` (FSST + FastPFOR) | 8.89 ms/tile (112/s) | 3.56 ms (281/s) | 1.45 ms (692/s) | 6.1x |
+| Switzerland, every tile re-encoded on one thread (`mlt_reference bench`), default | - | 11.65s | 5.35s | - |
+| Switzerland, same, `--mlt-advanced` | - | 88.6s | 12.8s | - |
+| End to end Switzerland `--tile_format=mlt`: archive stage wall / CPU | 15s / 3m14s | 4.30s / 58s | 3.99s / 54s | 3.8x / 3.6x |
+| End to end: total wall / CPU | 46.1s / 400s | 12.7s / 132s | 11.5s / 134s | 4.0x / 3.0x |
+| End to end `--tile_format=mlt --mlt_advanced=true`: archive stage wall / CPU | 2m29s / 31m23s | 28.5s / 6m10s | 5.09s / 1m8s | 29x / 28x |
+| End to end advanced: total wall / CPU | 180s / 2050s | 36.6s / 424s | 13.6s / 148s | 13x / 14x |
+
+Methodology:
+- VectorTile rows: `benchmark_vector_tile 5000` vs `java -cp planetiler-dist-*-with-deps.jar
+  bench/java/BenchmarkVectorTile.java 5000` (1,250 MLT iterations, 250 advanced, after a warmup of a quarter of
+  that), J R J R J R. "Before" is the same binary built at `38f44fe`, 3 trials alternated with Java in the baseline
+  pass (Java then measured 5.95 / 8.40 ms on a quieter machine; the after-pass Java numbers above are 10% higher
+  because of the background load, so the Java ratios are conservative).
+- Switzerland one-thread rows: `mlt_reference bench <java-mvt.mbtiles> 1 [fsst fastpfor]` decodes all 23,922 tiles
+  of Java's Switzerland MVT output into `VectorTile`s first and times only `encode_mlt_with_layer_stats` (what
+  `TileArchiveWriter` runs per tile). Before / after binaries alternated, 2 trials each; they agree to 1%.
+- End to end: `planetiler --download_dir=... --osm_path=switzerland-latest.osm.pbf --output=... --force
+  --tile_format=mlt [--mlt_advanced=true]` vs `java -Xmx16g -jar planetiler-dist-*-with-deps.jar` with the same
+  arguments, each from an empty work directory, order J R J R per trial, 3 trials (and the same for the 3 baseline
+  trials). Wall / CPU from `/usr/bin/time -l`; the archive stage is planetiler's stage summary (Java prints whole
+  seconds; Rust wall from the log timestamps). The end-to-end default rows are within the run-to-run noise of this
+  loaded machine (the Rust default archive stage ranged 3.24-4.08s after and 4.01-4.91s before); the MLT encode
+  itself is now ~5s of its ~54s CPU (it was ~12s).
+- Rust MLT now costs about the same as MVT encoding in the archive stage (MVT: 3.41s / 45s CPU in the main table);
+  in the advanced run MLT encoding is ~26% of the archive stage's CPU samples, the rest is the same tile building
+  and feature merging as MVT.
+
+Byte identity: `bench/java/MltReference.java encode` and `mlt_reference encode` on Java's Switzerland MVT output,
+then `mlt_reference compare`, for all 11 variants (default, `excludeids`, `fastpfor`, `fsst`, `fsst fastpfor`,
+`shareddict`, `reorder`, `tessellate`, `tessellate outline`, `fsst fastpfor shareddict`, `fsst fastpfor tessellate
+outline reorder shareddict`): 23,922 / 23,922 tiles byte-identical in each, same totals as before (e.g. default
+457,673,829 bytes, `fsst fastpfor` 440,418,132), and the decoded MLT matches the MVT input for all 5,600,068 features.
+`cargo test --workspace` adds differential tests against test-only copies of the straight ports
+(`mlt/fsst_reference.rs`, `mlt/integer_encoder_reference.rs`).
+
 ## History (before/after of notable optimizations)
+
+- **MLT encoder (`38f44fe` -> `3d7e7d4`, output unchanged).** Profiled with `sample` on `mlt_reference bench` (one
+  thread over Switzerland) and on `benchmark_vector_tile`. Switzerland one-thread encode 11.65s -> 5.35s default,
+  88.6s -> 12.8s advanced; bench tile 2.22 -> 1.01 ms, 3.56 -> 1.45 ms. Hotspots and fixes, in order of impact:
+  - FSST (was ~85% of advanced): every `fsst::encode` call (106k per 2,393 tiles, median ~40 bytes) zeroed a fresh
+    1 MB pair-count matrix and seven 512 KB first-two-bytes indexes (`__bzero` + `madvise` were half the profile).
+    Now a per-thread scratch: pair counts cleared via touched-bit maps (and only touched rows/codes are visited when
+    building the next table), pooled `u16` indexes reset entry by entry. Java's `HashMap` iteration order is computed
+    from the final table size (bin, then newest first: head insertion plus order-preserving splits) instead of
+    emulating bins of `Vec`s with `insert(0)`; the `PriorityQueue` emulation keeps Java's exact sift order on
+    `(gain, index)`. The six iterations stop early once a table reproduces itself (every later iteration would repeat
+    it exactly). Symbol compare / match use 8-byte words. Per-call cost on short strings went from ~20 us to <1 us.
+  - Integer streams: Java builds all four candidates (plain, delta, RLE, delta-RLE) and physically encodes each. Now
+    one vectorized pass computes the plain / delta varint sizes and run counts, a second pass sizes only the RLE
+    candidates that exist; FastPFOR candidates under 256 values are sized by formula (header word + variable bytes),
+    longer ones by `fastpfor::encoded_size` (block bit widths only, no packing). Only the winner is encoded, straight
+    into the output. FastPFOR reuses a per-thread codec (exception arrays re-zeroed so partial groups still read
+    Java's zeros) and uses 4 interleaved bit-width histograms.
+  - Geometry columns (the largest default cost): Hilbert / Morton "dictionaries" used SipHash maps and computed each
+    curve code twice; now sorted `code << 32 | position` keys (LSD radix sort) give the same stable order and
+    last-index offsets. 96% of Switzerland columns keep the plain vertex buffer, so the dictionary candidates are only
+    sized when they can still win: their vertex/code stream plus a minimal offset stream is a lower bound, and offset
+    streams are sized with early exit against the remaining budget. Pre-tessellated polygon-only columns skip them
+    (Java computes and ignores them). Morton codes use mask interleaving.
+  - Input conversion: `VectorTile::encode_mlt*` no longer copies every feature's attributes into a `Tags` map; the
+    encoder is generic over `MltFeature` and reads borrowed `(key, value)` pairs. `create_tileset_metadata` skips
+    re-putting identical columns and uses foldhash; Java string order compares bytes unless both differ in non-ASCII;
+    MVT command decoding reserves each ring.
+  - Tried and reverted (slower): branch-free varint sizes in a single loop, and a keyed `u128` unstable sort of FSST
+    symbols.
+
 
 - **Previous quiet-machine pass (`cb984fd`, 2026-10-18 02:23) -> this pass (`627d901`).** Same machine, same harness.
   - Switzerland Rust 14.9s / 168s CPU / 4.03 GB -> 10.7s / 121s / 4.02 GB (wall and CPU both 28% less); vs Java

@@ -5,7 +5,7 @@ Java: OpenJDK 25.0.4.1 (Homebrew), planetiler `d88cf89`.
 
 - `java/` — Java-side benchmark programs that have no upstream equivalent, plus `MltReference.java` (re-encodes the
   tiles of an MVT mbtiles to MLT exactly like Java Planetiler, for byte comparisons with the Rust
-  `mlt_reference` binary; see PORTING.md "MLT output notes").
+  `mlt_reference` binary, whose `bench` subcommand times MLT encoding alone; see PORTING.md "MLT output notes").
 - `mlt-core-check/` — standalone crate (not in the workspace) that decodes MLT tiles with the official `mlt-core` crate
   and with the port's decoder and checks they agree.
 - `RESULTS.md` — measured results and methodology; `results-detail.md` — full generated tables.

@@ -518,7 +518,8 @@ third-party codecs are ported too: `fastpfor` is JavaFastPFOR 0.3.10 `Compositio
 words big-endian), `fsst` is the pure-Java `SymbolTableBuilder` (MLT uses it unless the JNI library is loaded), and
 `earcut` is earcut4j 3.0.0. Java quirks are kept on purpose because they change the bytes: the Hilbert "dictionary" is
 never deduplicated (the `last` variable is never updated), FSST symbol hashes include truncated bytes, and the FSST
-candidate order follows `java.util.HashMap` iteration and `PriorityQueue` heap order. `fsst` emulates both; bins that
+candidate order follows `java.util.HashMap` iteration and `PriorityQueue` heap order. `fsst` reproduces both (the map's
+order is derived from its final table size: by bin, newest key first; see `fsst::Candidates`); bins that
 Java would convert to trees (8+ colliding keys in a 64+ bucket table) are counted in `fsst::TREEIFIED_BINS` but
 their order isn't emulated. That never happened on Switzerland. `mlt::encode_tile` is Java `TileArchiveWriter`'s MLT
 branch (`findStringColumns`, `COERCE`, per-layer optimizations, Morton on, `ALL` outlines), and
@@ -540,13 +541,16 @@ returns an error). List / map / bytes attribute values become strings, as MVT do
 `TileSizeStats.main` (`stats`) still reads MVT only, like Java.
 
 **Verification.**
+- Performance rewrites keep the straight ports of `fsst` and `integer_encoder` as test-only references
+  (`fsst_reference.rs`, `integer_encoder_reference.rs`) with differential tests; the encoder reads features through
+  the `MltFeature` trait (`VectorTile::encode_mlt*` pass borrowed attributes). Details in bench/RESULTS.md.
 - Unit tests: round-trip encode/decode over all option combinations (`mlt::tests`), the ported `TileSizeStatsTest`
   MLT cases with Java's exact byte counts plus the `fastpfor.mlt` fixture Java wrote, and `PlanetilerTests`
   (`testSinglePoint` MLT variants, `testAttributeTypeCoercion`, `testPlanetilerRunner` with `--tile-format=mlt`, all
   `mlt_*` options, pmtiles and files outputs).
 - Byte identity with Java. `bench/java/MltReference.java encode` runs Java's exact `TileArchiveWriter` MLT code on
   every tile of an MVT mbtiles, and `mlt_reference encode` (planetiler-benchmarks) does the same in Rust.
-  `mlt_reference compare` diffs the two. On the Java OpenMapTiles outputs for Monaco (23 tiles, 5,357 features) and
+  `mlt_reference compare` diffs the two (`mlt_reference bench <mbtiles> <step> [options]` times only the encoding). On the Java OpenMapTiles outputs for Monaco (23 tiles, 5,357 features) and
   Switzerland (23,922 tiles, 5.6M features), every tile is **byte-identical** for: default, `exclude_ids`,
   `fastpfor`, `fsst`, `fsst`+`fastpfor` (`mlt_advanced`), `shared_dict`, `reorder_features`, `tessellate`,
   `tessellate`+`outline`, `fsst`+`fastpfor`+`shared_dict`, and everything at once. `mlt_reference encode` also
@@ -711,11 +715,9 @@ came from equivalent Python scripts; current Switzerland numbers are in `docs/sw
   of Java's vertex count); exact parity would need a port of the JTS offset-curve builder.
 - Port `TopOsmTiles.main` (xz), `OpenMapTilesMapping` benchmark; in-memory stream
   archive readers for the csv/tsv/json/proto/pbf `testPlanetilerRunner` variants (including their MLT variants).
-- MLT encoding speed: the port keeps Java's algorithm (every geometry column computes the plain, Hilbert dictionary
-  and Morton dictionary encodings, each integer stream tries 4 logical encodings, and FSST builds its symbol table
-  6 times), so it is several times slower than MVT encoding. A quiet benchmark pass (`benchmark_vector_tile` now
-  includes MLT) should measure it against Java before optimizing; any optimization must keep the output identical
-  (check with `mlt_reference` on Switzerland).
+- MLT encoding speed: done (bench/RESULTS.md "MLT encoding": 6x Java on the benchmark tile, advanced archive
+  stage 28.5s -> 5.1s). Remaining MLT cost is mostly the geometry dictionary candidates (curve codes, radix sort)
+  and FSST table building; any further change must stay byte-identical (`mlt_reference` on Switzerland, 11 variants).
 ### custommap notes (`crates/planetiler-custommap`)
 
 **Loading.** `SchemaConfig::load(path)` / `load_str(yaml)` go through `util::yaml` (anchors, aliases, `<<` merge keys)
