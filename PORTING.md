@@ -59,7 +59,7 @@ See the table at the bottom of this file; update it as modules are completed.
 | `worker` (`Worker`, `WorkerPipeline`, `WorkQueue`, `WeightedHandoffQueue`, `Distributor`) | done (`processAndWrite` is `collection::feature_group::process_and_write`) |
 | `util` (format, ansi_colors, parse, imposm3_parsers, var_int, hashing, sort_key, merging_range_map, sliding_window, zoom_function, cache_by_zoom, bin_pack, common_string_encoder, byte_buffer_util, gzip, yaml, build_info, madvise, memory_estimator, file_utils, file_watcher, resource_usage, tile_weights, downloader, aws_osm, geofabrik, overture_stac, top_osm_tiles) | done |
 | benchmarks: `benchmark_var_int`, `benchmark_tile_coord` | done |
-| Archives (`archive::{tile, tile_encoding_result, readable_tile_archive, writeable_tile_archive, tile_archive_config, tile_archive_metadata(_de_ser), tile_archives}`, `mbtiles`, `pmtiles`, `files`, `stream`, `util::compare_archives`, `geo::tile_order`) | done (`TileArchiveMetadata::from_profile`); deferred: `ArchiveOptions` stands in for the unported `Arguments` API, `VectorLayer`/`FieldType` live in `archive::tile_archive_metadata` until `util::layer_attr_stats` is ported, geometry-level checks in `mbtiles::{verify, compare}` / `CompareArchives` wait on `vector_tile` decoding |
+| Archives (`archive::{tile, tile_encoding_result, readable_tile_archive, writeable_tile_archive, tile_archive_config, tile_archive_metadata(_de_ser), tile_archives}`, `mbtiles`, `pmtiles`, `files`, `stream`, `util::compare_archives`, `geo::tile_order`) | done (`TileArchiveMetadata::from_profile`; archive options are `config::arguments::Arguments`; `util::layer_attr_stats` re-exports the archive `FieldType`, and the two `VectorLayer` types stay separate on purpose (insertion-ordered vs sorted fields); `mbtiles::{verify, compare}` and `CompareArchives` decode geometries like Java). Difference: `CompareArchives` pairs layers by name and only counts a tile diff when the decoded contents differ (see its module docs) |
 | Benchmarks `benchmark_mbtiles_writer`, `benchmark_mbtiles_read`, `benchmark_pmtiles` (`crates/planetiler-benchmarks/src/bin`) | done |
 | `geo` (geo_utils, simplifiers, smoothers, line_splitter, geometry_pipeline/transformer, point/polygon index, unit, with_geometry, tile_order, simplify_method) + JTS ports (`is_valid`, `polygon_overlay` fix/precision-reduce/boolean ops, `interior_point`/centroid, `maximum_inscribed_circle`, `normalize`, `precision_model`, `wkt`, `crs`) + `util::loop_line_merger` + `geo::test_utils` | done (see notes below) |
 | `reader::osm::{osm_multipolygon, osm_way_splitter, osm_node_bounds_provider}` | done (`NodeLocationProvider` trait lives in `osm_multipolygon`, re-exported from `osm_reader`) |
@@ -69,10 +69,10 @@ See the table at the bottom of this file; update it as modules are completed.
 | `reader::{simple_reader, source_feature_processor, shapefile_reader, geo_package_reader, natural_earth_reader}`, `reader::geojson::*`, `reader::parquet::*` + benchmark `benchmark_simple_readers` | done as *decoders* emitting `ReaderFeature`; wiring into `SimpleFeature`/`Profile`/`FeatureGroup` is `TODO(port)` (see notes) |
 | `archive::tile_archive_writer` (`TileArchiveWriter.writeOutput`), `validator::{schema_specification, base_schema_validator, java_profile_validator}`, `testing` harness + `tests/planetiler_tests*.rs` (the `runWithReaderFeatures` subset of `PlanetilerTests`), benchmark `benchmark_tile_archive_writer` | done (MLT output errors) |
 | `planetiler` (`Planetiler.java` orchestrator) + `tests/planetiler_runner_tests.rs` (testPlanetilerRunner*, MemoryCheck*, ReuseFeatureDb) + `tests/planetiler_osm_tests.rs` (all OSM `PlanetilerTests`) + `testing::run_with_osm_elements`, `TileSizeStats.main` (`tile_size_stats::main`), `CompareArchives.main` (`compare_archives::main`) | done (see "Planetiler orchestrator notes"; deferred: csv/tsv/json/proto/MLT variants of testPlanetilerRunner, testExceptionWhileProcessingOsm is `#[ignore]`d) |
-| `planetiler` CLI crate (`planetiler-dist` `Main.java` task dispatch) | done (stubs that error: `verify`/`verify-schema` (custommap SchemaValidator CLI), `benchmark-mapping`, `benchmark-longlongmap` (use the benchmarks crate), `top-osm-tiles` (needs xz)) |
+| `planetiler` CLI crate (`planetiler-dist` `Main.java` task dispatch) | done (`verify`/`verify-schema` run the custommap `SchemaValidator`; stubs that error: `benchmark-mapping`, `benchmark-longlongmap` (use the benchmarks crate), `top-osm-tiles` (needs xz)) |
 | `planetiler-examples` (all 9 examples incl. `ToiletsOverlayLowLevelApi`, `OvertureBasemap`) + all example tests | done |
 | `planetiler-openmaptiles`: `Generate` (generator + vendored schema), generated `OpenMapTilesSchema`/`Tables`, `OpenMapTilesProfile`, `OpenMapTilesMain` (`setup`/`configure`/`run`/`main`), all 16 layers, `OmtLanguageUtils`, `Utils`, `VerifyMonaco`, all unit tests (249), `OpenMapTilesTest` (`tests/open_map_tiles_test.rs`) | done (see notes below) |
-| `planetiler-custommap` (configschema, contexts, TagValueProducer, TypeConversion, ConfigExpression/Parser, BooleanExpressionParser/Script, CEL stdlib on the `cel` crate, ConfiguredFeature, ConfiguredProfile, ConfiguredMapMain (`configure`, `create_planetiler`, `main`), bundled samples + JSON schemas, `ConfiguredMapTest`) | done (see notes below); deferred: `SchemaValidator` CLI |
+| `planetiler-custommap` (configschema, contexts, TagValueProducer, TypeConversion, ConfigExpression/Parser, BooleanExpressionParser/Script, CEL stdlib on the `cel` crate, ConfiguredFeature, ConfiguredProfile, ConfiguredMapMain (`configure`, `create_planetiler`, `main`), bundled samples + JSON schemas, `ConfiguredMapTest`, `SchemaValidator` CLI + `--watch`) | done (see notes below) |
 | `feature_merge` (`FeatureMerge`: line merging via `LoopLineMerger`, nearby/overlapping polygon merging with buffer/union/unbuffer, multi-point/line/polygon merging, `remove_points_outside_buffer`, `group_by_attrs`, `extract_connected_components`) + full `FeatureMergeTest` | done (see notes below) |
 | `reader::{simple_reader, source_feature_processor, shapefile_reader, geo_package_reader, natural_earth_reader}`, `reader::geojson::*`, `reader::parquet::*` + benchmark `benchmark_simple_readers` | done, including profile/`FeatureGroup` wiring (`source_feature_processor::process_files`, per-reader `process` entry points, `impl SourceFeature for ParquetFeature`); see notes for the orchestrator API |
 
@@ -475,8 +475,8 @@ tags+geometry-type view instead of building a `SimpleFeature`). `ExtraLayers` ->
 
 **Utilities.** `OmtLanguageUtils.getNames(tags, translations)` -> `omt_language_utils::get_names(&Tags,
 Option<&Translations>) -> Tags`; `Utils.coalesce` is `Option::or`; `elevationTags` -> `utils::elevation_tags[_str]`;
-`brunnel` -> `utils::brunnel[_with_ford]` (`Option<&'static str>`). `VerifyMonaco` also hosts a local port of
-`Verify.getNumFeatures`/`checkMinFeatureCount` (`TODO(port)`: move into `mbtiles::verify`).
+`brunnel` -> `utils::brunnel[_with_ford]` (`Option<&'static str>`). `VerifyMonaco` uses
+`Verify::{get_num_features, check_min_feature_count[_range]}` from `planetiler_core::mbtiles::verify`.
 
 **FeatureMerge.** Until `planetiler_core::feature_merge` lands, the crate uses `src/feature_merge_shim.rs`, a copy
 of that port with the same API (`TODO(port)`: replace with `pub(crate) use planetiler_core::feature_merge;` in
@@ -522,8 +522,8 @@ p.run()?;
   one; everything the runner drives uses the new one). `Bounds::lat_lon_opt()` was added for that check.
 - Wikidata translations are attached through a deferred provider registered by `translations()` (a `OnceLock`
   filled during `run()`), since `Arc<Translations>` is shared with the profile.
-- Not modelled: Java subtracts the size of `free_<name>_after_read` inputs from the write-phase disk estimate
-  (resource amounts are unsigned); `LogUtil.setStage` prefixes; virtual-thread executor.
+- Not modelled: `LogUtil.setStage` prefixes; virtual-thread executor. (The write-phase disk estimate subtracts
+  `free_<name>_after_read` inputs like Java, via `ResourceUsage::free_disk`.)
 - Behaviour fixes made while comparing against Java on Monaco/Switzerland: `polygon_overlay::reduce_precision` now
   snaps each segment to every hot pixel it passes through (JTS `SnapRoundingNoder`, vertices only - intersection hot
   pixels are still left to the integer overlay), so sub-pixel slivers collapse like JTS; `FeatureGroup` writes a tile
@@ -532,7 +532,7 @@ p.run()?;
   `WithTags::tags` (OSM features have empty `base().tags`); `extract_from_zip` handles relative tmp dirs.
 - CLI (`crates/planetiler/src/main.rs`): `planetiler [task] [args]`, tasks as in `Main.java` (`openmaptiles` default
   with the maptiler URL overrides, `custom`, `shortbread`, `*.yml` first arg, `example-*`, `overture`, `osm-qa`,
-  `verify-mbtiles`, `verify-monaco`, `stats`, `compare`). Logging via `tracing-subscriber` (`RUST_LOG`), messages
+  `verify`/`verify-schema`, `verify-mbtiles`, `verify-monaco`, `stats`, `compare`). Logging via `tracing-subscriber` (`RUST_LOG`), messages
   written verbatim so progress-log ANSI colors render.
 - Examples: `planetiler_examples::<module>::{main(args), run(..)}` for `toilets_overlay`, `toilets_overlay_low_level_api`,
   `bike_route_overlay`, `osm_qa_tiles`, `admin_borders_overlay`, `parks_overlay`, `tram_route_overlay`,
@@ -567,13 +567,10 @@ point/order; scripts in the orchestrator port's final report):
   merges; drop the crate's `rstar`/`hashbrown`/`ahash` deps.
 - Port JTS `Polygonizer` into core and use it for OpenMapTiles boundary country polygons (currently a line-merge +
   union stand-in that drops rings closing only through a node shared by 3+ ways).
-- Move `Verify.checkMinFeatureCount`/`getNumFeatures` from `planetiler-openmaptiles/src/util/verify_monaco.rs` to
-  `planetiler_core::mbtiles::verify`.
-- Unify the two `VectorLayer` types (`archive::tile_archive_metadata` and `util::layer_attr_stats`).
 - Re-enable the four `#[cfg(any())]` merge tests in `crates/planetiler-core/tests/` once FeatureMerge merges.
 - `feature_merge::buffer_geometry`: near-collinear mitre vertices are now removed (Monaco z13 buildings within ~1.5%
   of Java's vertex count); exact parity would need a port of the JTS offset-curve builder.
-- Port custommap `SchemaValidator` CLI, `TopOsmTiles.main` (xz), `OpenMapTilesMapping` benchmark; in-memory stream
+- Port `TopOsmTiles.main` (xz), `OpenMapTilesMapping` benchmark; in-memory stream
   archive readers for the csv/tsv/json/proto `testPlanetilerRunner` variants.
 - MLT tile format (MapLibre Tile) encoder.
 ### custommap notes (`crates/planetiler-custommap`)
@@ -623,10 +620,11 @@ the geometry value with an internal `"\0name\0args"` key since overloads can't d
 (`process_feature` uses a `MultiExpression` index over all features, `split_osm_way_at_intersections`, metadata);
 `sources()` evaluates `url`/`local_path`/`projection` expressions; `find_feature_layer`.
 `post_process_layer_features` uses `planetiler_core::feature_merge`. `configured_profile::can_be_line` ports
-`OsmReader.canBeLine`. Tests: `tests/{configured_feature_test, expression_tests, schema_tests}.rs` (the latter has a
-test-only port of `BaseSchemaValidator.validate` running the full shortbread spec, plus an ignored
-`bench_shortbread` throughput check: ~0.9M features/s/thread in release).
-- custommap: switch `tests/schema_tests.rs` to `planetiler_core::validator`; port the SchemaValidator CLI/watch.
+`OsmReader.canBeLine`. `validator::{validate(schema, spec), SchemaValidator, main}` ports `SchemaValidator` on top of
+core's `BaseSchemaValidator` (`planetiler verify schema.yml [--watch]`). Tests:
+`tests/{configured_feature_test, expression_tests, schema_tests}.rs` (the latter runs the full shortbread spec through
+the core validator, `SchemaValidatorTest` including the CLI output, plus an ignored `bench_shortbread` throughput
+check: ~0.9M features/s/thread in release).
 - custommap CEL gaps vs cel-java (no type checker, `1 == 1.0` is true, Rust regex syntax in `replaceRegex`): consider
   closing these if real schemas hit them.
   `ParquetFeature` implements `SourceFeature` and has `into_reader_feature()`.
