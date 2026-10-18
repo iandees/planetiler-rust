@@ -1,0 +1,35 @@
+schema_name: Test Case Schema
+schema_description: Test case tile schema
+attribution: Test attribution
+sources:
+  osm:
+    type: osm
+    url: geofabrik:rhode-island
+tag_mappings:
+  b_type: boolean
+  l_type: long
+  i_type: integer
+  d_type: direction
+  s_type: string
+  double_type: double
+  is_intermittent:
+    input: intermittent
+    type: boolean
+  bridge:
+    type: boolean
+layers:
+- id: testLayer
+  features:
+  - source:
+    - osm
+    geometry: line
+    attributes:
+    - key: b_type
+    - key: l_type
+    - key: i_type
+    - key: double_type
+    - key: d_type
+    - key: s_type
+    - key: intermittent
+    - key: is_intermittent
+    - key: bridge

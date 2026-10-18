@@ -1,0 +1,816 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/onthegomap/planetiler/main/planetiler-custommap/planetiler.schema.json",
+  "title": "Planetiler",
+  "description": "Planetiler schema definition",
+  "type": "object",
+  "properties": {
+    "schema_name": {
+      "description": "A descriptive name for the schema",
+      "type": "string"
+    },
+    "schema_description": {
+      "description": "A longer description of the schema",
+      "type": "string"
+    },
+    "attribution": {
+      "description": "An attribution statement, which may include HTML such as links",
+      "type": "string"
+    },
+    "version": {
+      "description": "A version the schema",
+      "type": "string"
+    },
+    "is_overlay": {
+      "description": "A flag defining the type of the tileset as `overlay` or `baselayer`",
+      "type": "boolean"
+    },
+    "definitions": {
+      "description": "An unparsed spot where you can define anchors and aliases to be used in other parts of the schema",
+      "type": "object",
+      "properties": {
+        "attributes": {
+          "description": "An unparsed array of attribute fragments to be used below.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attribute"
+          }
+        }
+      }
+    },
+    "sources": {
+      "description": "An object where key is the source ID and value is the definition of where the features should be extracted from",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "description": "File format of the data source",
+            "enum": [
+              "osm",
+              "shapefile",
+              "geopackage",
+              "geojson"
+            ]
+          },
+          "url": {
+            "description": "Location to download the file from. For geofabrik named areas, use `geofabrik:` prefixes, for example `geofabrik:rhode-island`.",
+            "$ref": "#/$defs/expression"
+          },
+          "local_path": {
+            "description": "Local path to the file to use, inferred from `url` if missing",
+            "$ref": "#/$defs/expression"
+          },
+          "projection": {
+            "description": "Override the coordinate reference system authority code for a shapefile or geopackage source if it can not be determined automatically",
+            "anyOf": [
+              {
+                "enum": [
+                  "EPSG:3857",
+                  "EPSG:4326"
+                ]
+              },
+              {
+                "$ref": "#/$defs/expression"
+              }
+            ]
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "url"
+            ]
+          },
+          {
+            "required": [
+              "local_path"
+            ]
+          }
+        ]
+      }
+    },
+    "tag_mappings": {
+      "description": "Specifies that certain tag key should have their values treated as being a certain data type",
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/datatype"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "$ref": "#/$defs/datatype"
+              },
+              "input": {
+                "description": "The name of the key that this attribute is parsed from",
+                "type": "string"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "layers": {
+      "description": "A list of vector tile layers and their definitions",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "description": "Unique layer name",
+            "type": "string"
+          },
+          "features": {
+            "description": "A list of features contained in this layer",
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/feature"
+            }
+          },
+          "buffer": {
+            "description": "The default number of pixels of detail to render outside the visible tile boundary",
+            "type": "number"
+          },
+          "tile_post_process": {
+            "description": "Optional processing operations to merge features with the same attributes in a rendered tile",
+            "$ref": "#/$defs/tile_post_process"
+          }
+        }
+      }
+    },
+    "args": {
+      "description": "Set default values for built-in command-line arguments or expose new command-line arguments.",
+      "type": "object",
+      "properties": {
+        "threads": {
+          "description": "Default number of threads to use."
+        },
+        "write_threads": {
+          "description": "Default number of threads to use when writing temp features"
+        },
+        "process_threads": {
+          "description": "Default number of threads to use when processing input features"
+        },
+        "feature_read_threads": {
+          "description": "Default number of threads to use when reading features at tile write time"
+        },
+        "minzoom": {
+          "description": "Minimum tile zoom level to emit"
+        },
+        "maxzoom": {
+          "description": "Maximum tile zoom level to emit"
+        },
+        "render_maxzoom": {
+          "description": "Maximum rendering zoom level up to"
+        },
+        "force": {
+          "description": "Overwriting output file and ignore warnings",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "boolean"
+            }
+          ]
+        },
+        "gzip_temp": {
+          "description": "Gzip temporary feature storage (uses more CPU, but less disk space)",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "boolean"
+            }
+          ]
+        },
+        "mmap_temp": {
+          "description": "Use memory-mapped IO for temp feature files",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "boolean"
+            }
+          ]
+        },
+        "point_label_grid": {
+          "type": "object",
+          "properties": {
+            "pixel_size": {
+              "description": "Sets the size of a grid in tile pixels that will be used to compute a \"location hash\" of points rendered in each zoom-level at and below `maxzoom`",
+              "type": "object",
+              "properties": {
+                "maxzoom": {
+                  "description": "Apply label grid pixel size at and below this zoom-level",
+                  "type": "number"
+                },
+                "value": {
+                  "description": "The size of the label grid",
+                  "type": "number"
+                }
+              }
+            },
+            "limit": {
+              "description": "Limits the density of points on an output tile at and below `maxzoom` by only emitting the `limit` features with lowest sort-key in each square of a `size x size` pixel grid",
+              "type": "object",
+              "properties": {
+                "maxzoom": {
+                  "description": "Apply label grid limit at and below this zoom-level",
+                  "type": "number"
+                },
+                "value": {
+                  "description": "The number of lowest-sort-key points to include in each square of the grid",
+                  "type": "number"
+                }
+              }
+            }
+          }
+        },
+        "sort_max_readers": {
+          "description": "Maximum number of concurrent read threads to use when sorting chunks"
+        },
+        "sort_max_writers": {
+          "description": "Maximum number of concurrent write threads to use when sorting chunks"
+        },
+        "nodemap_type": {
+          "description": "Type of node location map",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "enum": [
+                "array",
+                "sparsearray",
+                "sortedtable",
+                "noop"
+              ]
+            }
+          ]
+        },
+        "nodemap_storage": {
+          "description": "Storage for node location map",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "enum": [
+                "ram",
+                "mmap",
+                "direct"
+              ]
+            }
+          ]
+        },
+        "nodemap_madvise": {
+          "description": "Use linux madvise(random) for node locations",
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "multipolygon_geometry_storage": {
+          "description": "Storage for multipolygon geometries",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "enum": [
+                "ram",
+                "mmap",
+                "direct"
+              ]
+            }
+          ]
+        },
+        "multipolygon_geometry_madvise": {
+          "description": "Use linux madvise(random) for multiplygon geometries",
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "http_user_agent": {
+          "description": "User-Agent header to set when downloading files over HTTP"
+        },
+        "http_retries": {
+          "description": "Retries to use when downloading files over HTTP"
+        },
+        "download_chunk_size_mb": {
+          "description": "Size of file chunks to download in parallel in megabytes"
+        },
+        "download_threads": {
+          "description": "Number of parallel threads to use when downloading each file"
+        },
+        "download_max_bandwidth": {
+          "description": "Maximum bandwidth to consume when downloading files in units mb/s, mbps, kbps, etc."
+        },
+        "min_feature_size_at_max_zoom": {
+          "description": "Default value for the minimum size in tile pixels of features to emit at the maximum zoom level to allow for overzooming"
+        },
+        "min_feature_size": {
+          "description": "Default value for the minimum size in tile pixels of features to emit below the maximum zoom level"
+        },
+        "simplify_tolerance_at_max_zoom": {
+          "description": "Default value for the tile pixel tolerance to use when simplifying features at the maximum zoom level to allow for overzooming"
+        },
+        "simplify_tolerance": {
+          "description": "Default value for the tile pixel tolerance to use when simplifying features below the maximum zoom level"
+        },
+        "skip_filled_tiles": {
+          "description": "Skip writing tiles containing only polygon fills to the output",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "boolean"
+            }
+          ]
+        },
+        "tile_warning_size_mb": {
+          "description": "Maximum size in megabytes of a tile to emit a warning about"
+        }
+      },
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "default": {
+                "description": "Default value for this argument (can be an expression).",
+                "$ref": "#/$defs/expression"
+              },
+              "type": {
+                "description": "Data type of this argument.",
+                "$ref": "#/$defs/datatype"
+              },
+              "description": {
+                "description": "Description for this argument.",
+                "type": "string"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "examples": {
+      "description": "Example input features and the vector tile features they map to, or a relative path to a file with those examples in it.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/include"
+        },
+        {
+          "$ref": "planetilerspec.schema.json#/properties/examples"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "datatype": {
+      "type": "string",
+      "enum": [
+        "boolean",
+        "string",
+        "direction",
+        "long",
+        "integer",
+        "double"
+      ]
+    },
+    "feature": {
+      "type": "object",
+      "properties": {
+        "geometry": {
+          "description": "Include objects of a certain geometry type",
+          "type": "string",
+          "enum": [
+            "any",
+            "point",
+            "line",
+            "split_line",
+            "polygon",
+            "polygon_centroid",
+            "line_centroid",
+            "line_midpoint",
+            "centroid",
+            "polygon_centroid_if_convex",
+            "polygon_point_on_surface",
+            "point_on_line",
+            "innermost_point"
+          ]
+        },
+        "source": {
+          "description": "A source ID or list of source IDs from which features should be extracted. If unspecified, all sources are included",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "id": {
+          "description": "An expression that determines ID for the rendered feature.",
+          "$ref": "#/$defs/expression"
+        },
+        "include_when": {
+          "description": "A tag specification which determines the features to include. If unspecified, all features from the specified sources are included",
+          "$ref": "#/$defs/boolean_expression"
+        },
+        "exclude_when": {
+          "description": "A tag specification which determines the features to exclude. This rule is applied after `includeWhen`. If unspecified, no exclusion filter is applied.",
+          "$ref": "#/$defs/boolean_expression"
+        },
+        "min_zoom": {
+          "description": "An expression that returns the minimum zoom to render this feature at.",
+          "$ref": "#/$defs/expression"
+        },
+        "min_size": {
+          "description": "Minimum length of line features or square root of the minimum area of polygon features to emit below the maximum zoom-level of the map. This value is ignored if the layer Tile Post Process is defined.",
+          "$ref": "#/$defs/expression"
+        },
+        "min_size_at_max_zoom": {
+          "description": "Minimum length of line features or square root of the minimum area of polygon features to emit at the maximum zoom-level of the map. This value is ignored if the layer Tile Post Process is defined.",
+          "$ref": "#/$defs/expression"
+        },
+        "sort_key": {
+          "description": "An expression that determines the value by which features are sorted within a layer in the output vector tile.",
+          "$ref": "#/$defs/expression"
+        },
+        "sort_key_descending": {
+          "description": "An expression that determines the value by which features are sorted (descending, e.g. from high to low sort key) within a layer in the output vector tile.",
+          "$ref": "#/$defs/expression"
+        },
+        "tolerance": {
+          "description": "Tile pixel tolerance to use when simplifying features below the maximum zoom level of the map. This value is ignored for lines or polygons if the layerTile Post Process 'tolerance' is defined for 'merge_line_strings' or 'merge_polygons', respectively.",
+          "$ref": "#/$defs/expression"
+        },
+        "tolerance_at_max_zoom": {
+          "description": "Tile pixel tolerance to use when simplifying features at the maximum zoom level of the map. This value is ignored for lines or polygons if the layerTile Post Process 'tolerance' is defined for 'merge_line_strings' or 'merge_polygons', respectively.",
+          "$ref": "#/$defs/expression"
+        },
+        "attributes": {
+          "description": "Specifies the attributes that should be rendered into the tiles for this feature, and how they are constructed.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attribute"
+          }
+        }
+      }
+    },
+    "tile_post_process": {
+      "type": "object",
+      "properties": {
+        "merge_line_strings": {
+          "description": "Combines linestrings with the same set of attributes into a multilinestring where segments with touching endpoints are merged",
+          "type": "object",
+          "properties": {
+            "min_length": {
+              "description": "Minimum tile pixel length of features to emit, or 0 to emit all merged linestrings, below the maximum zoom-level of the map.",
+              "type": "number"
+            },
+            "min_length_at_max_zoom": {
+              "description": "Minimum tile pixel length of features to emit, or 0 to emit all merged linestrings, at the maximum zoom-level of the map.",
+              "type": "number"
+            },
+            "tolerance": {
+              "description": "After merging, simplify linestrings using this pixel tolerance, or -1 to skip simplification step, below the maximum zoom-level of the map.",
+              "type": "number"
+            },
+            "tolerance_at_max_zoom": {
+              "description": "After merging, simplify linestrings using this pixel tolerance, or -1 to skip simplification step, at the maximum zoom-level of the map.",
+              "type": "number"
+            },
+            "buffer": {
+              "description": "Number of pixels outside the visible tile area to include detail for, or -1 to skip clipping step",
+              "type": "number"
+            }
+          }
+        },
+        "merge_polygons": {
+          "description": "Combines polygons with the same set of attributes into a multipolygon where overlapping/touching polygons are combined into fewer polygons covering the same area",
+          "type": "object",
+          "properties": {
+            "min_area": {
+              "description": "Minimum area in square tile pixels of polygons to emit, below the maximum zoom-level of the map.",
+              "type": "number"
+            },
+            "min_area_at_max_zoom": {
+              "description": "Minimum area in square tile pixels of polygons to emit, at the maximum zoom-level of the map.",
+              "type": "number"
+            },
+            "tolerance": {
+              "description": "Before merging, simplify polygons using this pixel tolerance, or 0 to avoid simplification, below the maximum zoom-level of the map.",
+              "type": "number"
+            },
+            "tolerance_at_max_zoom": {
+              "description": "Before merging, simplify polygons using this pixel tolerance, or 0 to avoid simplification, at the maximum zoom-level of the map.",
+              "type": "number"
+            }
+          }
+        }
+      }
+    },
+    "zoom_level": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 15
+    },
+    "attribute": {
+      "type": "object",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/expression_coalesce"
+        },
+        {
+          "$ref": "#/$defs/expression_tag_value"
+        },
+        {
+          "$ref": "#/$defs/expression_arg_value"
+        },
+        {
+          "$ref": "#/$defs/expression_value"
+        },
+        {
+          "$ref": "#/$defs/expression_with_type_or_match_key_value"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "key": {
+              "description": "ID of this attribute in the tile",
+              "type": "string"
+            },
+            "include_when": {
+              "description": "A filter specification which determines whether to include this attribute. If unspecified, the attribute will be included unless excluded by `excludeWhen`",
+              "$ref": "#/$defs/boolean_expression"
+            },
+            "exclude_when": {
+              "description": "A filter specification which determines whether to exclude this attribute. This rule is applied after `includeWhen`. If unspecified, no exclusion filter is applied.",
+              "$ref": "#/$defs/boolean_expression"
+            },
+            "min_zoom": {
+              "description": "The minimum zoom at which to render this attribute",
+              "$ref": "#/$defs/zoom_level"
+            },
+            "min_zoom_by_value": {
+              "description": "Minimum zoom to render this attribute depending on the value. Contains a map of `value: zoom` entries that indicate the minimum zoom for each possible value",
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/zoom_level"
+              }
+            },
+            "min_tile_cover_size": {
+              "description": "Include this attribute only on geometries over a certain size at a given zoom level, where 1.0 means the entire width of a tile for lines, or area of a tile for polygons.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        }
+      ]
+    },
+    "boolean_expression": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/single_boolean_expression"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/single_boolean_expression"
+          }
+        }
+      ]
+    },
+    "single_boolean_expression": {
+      "type": "object",
+      "properties": {
+        "__all__": {
+          "$ref": "#/$defs/boolean_expression"
+        },
+        "__any__": {
+          "$ref": "#/$defs/boolean_expression"
+        },
+        "__not__": {
+          "$ref": "#/$defs/boolean_expression"
+        }
+      },
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "description": "Matches any value for this key",
+            "const": "__any__"
+          },
+          {
+            "description": "Matches when this key is missing or empty",
+            "const": ""
+          },
+          {
+            "type": "array",
+            "description": "A list of possible values for the key",
+            "items": {
+              "description": "One of the possible values for the key"
+            }
+          },
+          {
+            "description": "A single value for the key"
+          }
+        ]
+      }
+    },
+    "expression": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "$ref": "#/$defs/expression_default_overrides"
+        },
+        {
+          "$ref": "#/$defs/expression_match"
+        },
+        {
+          "$ref": "#/$defs/expression_coalesce"
+        },
+        {
+          "$ref": "#/$defs/expression_tag_value"
+        },
+        {
+          "$ref": "#/$defs/expression_arg_value"
+        },
+        {
+          "$ref": "#/$defs/expression_value"
+        },
+        {
+          "$ref": "#/$defs/expression_with_type"
+        },
+        {
+          "$ref": "#/$defs/multiexpression"
+        }
+      ]
+    },
+    "expression_with_type_or_match_key_value": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "Type of the attribute to map to",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "match_key",
+                "match_value"
+              ]
+            },
+            {
+              "$ref": "#/$defs/datatype"
+            }
+          ]
+        }
+      }
+    },
+    "expression_with_type": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "Type of the attribute to map to",
+          "$ref": "#/$defs/datatype"
+        }
+      }
+    },
+    "expression_tag_value": {
+      "type": "object",
+      "properties": {
+        "tag_value": {
+          "description": "Value of the attribute in the tile, as copied from the value of the specified tag key. If neither constantValue nor tagValue are specified, the default behavior is to set the tag value equal to the input value (pass-through)",
+          "$ref": "#/$defs/expression"
+        }
+      }
+    },
+    "expression_arg_value": {
+      "type": "object",
+      "properties": {
+        "arg_value": {
+          "description": "Returns the value associated with an argument",
+          "$ref": "#/$defs/expression"
+        }
+      }
+    },
+    "expression_value": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "description": "An expression that computes the value for this key for each input element",
+          "$ref": "#/$defs/expression"
+        }
+      }
+    },
+    "expression_coalesce": {
+      "type": "object",
+      "properties": {
+        "coalesce": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/expression"
+          }
+        }
+      }
+    },
+    "expression_match": {
+      "type": "object",
+      "properties": {
+        "match": {
+          "$ref": "#/$defs/multiexpression"
+        }
+      }
+    },
+    "expression_default_overrides": {
+      "type": "object",
+      "properties": {
+        "default_value": {
+          "$ref": "#/$defs/expression"
+        },
+        "overrides": {
+          "$ref": "#/$defs/multiexpression"
+        }
+      }
+    },
+    "multiexpression": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/multiexpression_object"
+        },
+        {
+          "$ref": "#/$defs/multiexpression_array"
+        }
+      ]
+    },
+    "multiexpression_object": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/boolean_expression"
+          },
+          {
+            "const": "otherwise"
+          }
+        ]
+      }
+    },
+    "multiexpression_array": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$ref": "#/$defs/expression"
+          },
+          "if": {
+            "$ref": "#/$defs/boolean_expression"
+          },
+          "else": {
+            "$ref": "#/$defs/expression"
+          }
+        }
+      }
+    },
+    "include": {
+      "type": "string"
+    }
+  }
+}

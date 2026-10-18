@@ -69,6 +69,7 @@ See the table at the bottom of this file; update it as modules are completed.
 | `reader::{simple_reader, source_feature_processor, shapefile_reader, geo_package_reader, natural_earth_reader}`, `reader::geojson::*`, `reader::parquet::*` + benchmark `benchmark_simple_readers` | done as *decoders* emitting `ReaderFeature`; wiring into `SimpleFeature`/`Profile`/`FeatureGroup` is `TODO(port)` (see notes) |
 | `archive::tile_archive_writer` (`TileArchiveWriter.writeOutput`), `validator::{schema_specification, base_schema_validator, java_profile_validator}`, `testing` harness + `tests/planetiler_tests*.rs` (the `runWithReaderFeatures` subset of `PlanetilerTests`), benchmark `benchmark_tile_archive_writer` | done (MLT output errors; OSM/orchestrator tests listed as `TODO(port)` in `tests/planetiler_tests.rs`) |
 | `planetiler-openmaptiles`: `Generate` (generator + vendored schema), generated `OpenMapTilesSchema`/`Tables`, `OpenMapTilesProfile`, `OpenMapTilesMain` (setup only), all 16 layers, `OmtLanguageUtils`, `Utils`, `VerifyMonaco`, all unit tests (249) | done (see notes below; deferred: `OpenMapTilesTest` end-to-end + runner call wait on `Planetiler`; uses a FeatureMerge copy until core lands it) |
+| `planetiler-custommap` (configschema, contexts, TagValueProducer, TypeConversion, ConfigExpression/Parser, BooleanExpressionParser/Script, CEL stdlib on the `cel` crate, ConfiguredFeature, ConfiguredProfile, ConfiguredMapMain `configure`, bundled samples + JSON schemas) | done (see notes below); deferred: `post_process_layer_features` merging (needs `FeatureMerge`), the planetiler run in `ConfiguredMapMain` (needs `Planetiler`), `SchemaValidator` CLI (needs `planetiler_core::validator`), `ConfiguredMapTest`/`VerifyMonaco` (full pipeline) |
 
 ### `geo` notes
 
@@ -409,3 +410,52 @@ can add wikidata translations after building `Translations`). Per-layer tests li
 - Re-enable the four `#[cfg(any())]` merge tests in `crates/planetiler-core/tests/` once FeatureMerge merges.
 - MLT tile format (MapLibre Tile) encoder.
 - Full benchmark re-run on a quiet machine (see `bench/RESULTS.md`).
+### custommap notes (`crates/planetiler-custommap`)
+
+**Loading.** `SchemaConfig::load(path)` / `load_str(yaml)` go through `util::yaml` (anchors, aliases, `<<` merge keys)
+then serde with `deny_unknown_fields` (Jackson's default). Java `Object` fields are `Option<Value>` (mapping keys become
+strings like Jackson; YAML `null` == missing). `ConfiguredMapMain` -> `configured_map_main::{configure(&Arguments) ->
+ConfiguredMap { root, profile: Arc<ConfiguredProfile>, sources: Vec<ConfiguredSource> }, load_schema, main}`;
+`main` stops with a `TODO(port)` where it would build the `Planetiler` run. Samples are bundled with `include_str!`
+(`samples::get("shortbread.yml")`, also `/samples/...`), as are `planetiler.schema.json`/`planetilerspec.schema.json`.
+
+**Contexts.** `contexts::build_root_context(&Arguments, schema.args()) -> Result<Root, ParseException>` iterates
+argument definitions until they settle like Java. `Root` is a cheap `Arc` handle (argument values, `PlanetilerConfig`,
+prebuilt CEL bindings for `args`/`args.<name>`). The nested Java context records are one `Copy` struct
+`ScriptContext<'a>` tagged with a `ContextKind` (`Root < ProcessFeature < FeaturePostMatch < FeatureAttribute`):
+`root.create_process_feature_context(&feature, &tvp)`, `.create_post_match_context(&match_keys)`,
+`.create_attr_zoom_context(&value)`, `root.as_context()`. The input is a `FeatureRef` (a `&dyn SourceFeature`, or
+`SplitTest(&Way)` for `split_osm_way_at_intersections` so no tags are cloned). `ScriptContext` implements
+`ExpressionInput`; core custom expressions/getters recover it with `ScriptContext::from_input(&dyn ExpressionInput)`
+(an `as_any` lifetime-erasure trick, see the SAFETY comment) and compare `kind()` to emulate Java's `instanceof`.
+
+**Expressions.** `ScriptEnvironment { kind, root }` replaces the CEL declaration list (`contains_variable`).
+`ConfigExpression` is an enum (`Const`, `Match(Arc<MatchExpression>)` with a prebuilt `MultiExpression` index,
+`Coalesce`, `Variable`, `GetTag`, `GetArg`, `Cast`, `Script(Arc<ConfigExpressionScript>)`) implementing
+`Simplifiable` like Java; Java's output `Class<O>` is `type_conversion::OutType` (`Integer`/`Long` both produce
+`Value::Int`). `expr.into_getter()` wraps it as a core `TypedGetter` for `match_any_typed`.
+`BooleanExpressionScript::script(text, &env) -> Expression::Custom`. `ParseException`/`EvaluationException` are error
+structs; runtime script errors are logged once per script (then at debug) and evaluate to `null`/`false` instead of
+throwing.
+
+**CEL (`expression::stdlib`).** Uses the `cel` 0.15 crate: one shared `Env` (stdlib + strings extension + planetiler
+functions `coalesce` (0..32 args), `nullif`, `replaceRegex`, map `has(key, values...)`/`get`/`getOrDefault`/
+`getOrKeep`, `min`/`max` of lists, geometry `area(unit)`/`length(unit)`/`point_along_line`/`innermost_point`/
+`partial_line` and fields `lat lon min_lat max_lat min_lon max_lon bbox centroid centroid_if_convex validated_polygon
+point_on_surface line_midpoint innermost_point`). Scripts are parsed once into an AST and evaluated with
+`cel::Value::resolve_val` against a `VariableResolver` over the `ScriptContext`; `feature.tags` is a lazy map `Val`
+over the feature's tags (applies `tag_mappings`, `null` for missing keys, no per-feature map building). Static
+scripts (only `args`) are folded to constants at parse time (cached per script). Gaps vs cel-java: no type checker
+(undeclared variables are rejected at parse time by walking the AST, but type errors and unknown functions only
+surface at runtime); `has(m.f)` is rewritten to an internal function so maps with null-for-missing work; `1 == 1.0`
+is true (cel-java: false); `replaceRegex` uses `regex` crate syntax (no look-around/backrefs); geometry values
+can't be returned as results (they become `null`). Geometry functions reach the borrowed source feature by indexing
+the geometry value with an internal `"\0name\0args"` key since overloads can't downcast non-`'static` values.
+
+**Profile.** `ConfiguredProfile::new(schema, root) -> Result<_, ParseException>` implements `Profile`
+(`process_feature` uses a `MultiExpression` index over all features, `split_osm_way_at_intersections`, metadata);
+`sources()` evaluates `url`/`local_path`/`projection` expressions; `find_feature_layer`.
+`post_process_layer_features` is a `TODO(port)` until `FeatureMerge` exists. `configured_profile::can_be_line` ports
+`OsmReader.canBeLine`. Tests: `tests/{configured_feature_test, expression_tests, schema_tests}.rs` (the latter has a
+test-only port of `BaseSchemaValidator.validate` running the full shortbread spec, plus an ignored
+`bench_shortbread` throughput check: ~0.9M features/s/thread in release).

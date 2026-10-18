@@ -1,0 +1,38 @@
+schema_name: Test Case Schema
+schema_description: Test case tile schema
+attribution: Test attribution
+sources:
+  osm:
+    type: osm
+    url: geofabrik:rhode-island
+tag_mappings:
+  lanes: long
+layers:
+- id: testLayer
+  features:
+  - source:
+    - osm
+    geometry: line
+    min_zoom:
+      default_value: 4
+      overrides:
+      - value: 5
+        if:
+          highway: trunk
+      - value: 7
+        if:
+          highway: primary
+    include_when:
+      highway:
+    attributes:
+    - key: highway
+      min_zoom_by_value:
+        trunk: 5
+        primary: 7
+    - key: lanes
+      min_zoom_by_value:
+        4: 9
+        3: 9
+        2: 10
+    - key: toll
+      min_zoom: 8
