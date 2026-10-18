@@ -26,6 +26,7 @@ shapefile.workspace = true
 parquet.workspace = true
 arrow.workspace = true
 csv.workspace = true
+zip.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

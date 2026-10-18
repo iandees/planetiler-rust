@@ -39,6 +39,7 @@ shapefile = "0.9"
 parquet = "60"
 arrow = "60"
 csv = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # infra
 anyhow = "1"
