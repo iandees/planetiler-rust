@@ -1026,7 +1026,7 @@ mod tests {
     #[test]
     fn test_put_sint_matches_rmp() {
         let mut values = vec![0i64, 1, -1, i64::MIN, i64::MAX];
-        for b in [7u32, 8, 15, 16, 31, 32, 63] {
+        for b in [5u32, 6, 7, 8, 15, 16, 31, 32, 62] {
             let p = 1i64 << b;
             values.extend([p - 1, p, p + 1, -p - 1, -p, -p + 1]);
         }
