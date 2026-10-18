@@ -257,7 +257,7 @@ impl GeoPackageReader {
                     continue;
                 };
                 id += 1;
-                let mut tags = Tags::with_capacity(columns.len() - 1);
+                let mut tags = crate::value::tags_with_capacity(columns.len() - 1);
                 for (i, column) in columns.iter().enumerate() {
                     if i != geometry_index {
                         tags.insert(column.clone(), column_value(row.get_ref(i)?, &declared[i]));

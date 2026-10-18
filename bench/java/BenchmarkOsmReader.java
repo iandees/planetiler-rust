@@ -84,6 +84,20 @@ public class BenchmarkOsmReader {
         pass1, pass1.wall().toNanos() / 1e9, pass1.cpu().orElseThrow().toNanos() / 1e9,
         pass2, pass2.wall().toNanos() / 1e9, pass2.cpu().orElseThrow().toNanos() / 1e9,
         group.numFeaturesWritten(), new java.util.TreeMap<>(stats.dataErrors()));
+      String dump = System.getenv("DUMP_TILES");
+      if (dump != null) {
+        // debugging aid: write "z/x/y count" for every tile to compare outputs with the Rust benchmark
+        try (var out = Files.newBufferedWriter(Path.of(dump))) {
+          for (var tile : group) {
+            var c = tile.tileCoord();
+            String name = c.z() + "/" + c.x() + "/" + c.y();
+            out.write(name + " " + tile.getNumFeaturesProcessed() + "\n");
+            if (name.equals(System.getenv("DUMP_TILE"))) {
+              Files.write(Path.of(dump + ".tile"), tile.getVectorTile().encode());
+            }
+          }
+        }
+      }
       FileUtils.delete(tmp);
     }
   }

@@ -135,6 +135,8 @@ Correctness cross-checks seen in the logs: VectorTile hashes match (`8512da4e8a2
 
 ### The bimodal OSM-decoding slowdown
 
+(Fixed since this pass; see "History" for the root cause and before/after distributions.)
+
 `benchmark_osm_read` (and to a lesser degree OsmReader pass 2 with the null profile) runs in one of two modes per
 process, fixed for the process lifetime:
 
@@ -154,6 +156,28 @@ median looks bad.
 
 Older numbers from the provisional (loaded-machine) pass, kept only to show what changed; the tables above supersede
 them.
+- **Bimodal OSM decoding (fixed after the pass above).** Root cause: false sharing on `Arc<str>` refcounts. The PBF
+  decoder hands every element `Arc` clones of per-block strings (the user name for every node, tag values), so each
+  element does an atomic increment + decrement on a string its own thread allocated. macOS's allocator (xzone
+  malloc) packs those small allocations from different threads into the same 128-byte cache lines, so in most
+  processes (depending on placement) the cores fight over lines: `sample` of a slow process showed the element drop
+  (refcount decrement) ~27x slower per pass than in a fast one while libdeflate ran at the same speed; giving the user
+  string a padded 1 KiB allocation removed the slow mode (0/8 vs 1/8 slow), and a single shared `Arc` for all threads
+  was even slower (2.3s/32s). Fix: mimalloc as the global allocator in `planetiler` and every benchmark binary
+  (default `mimalloc` feature; thread-local pages), plus foldhash for `Tags` (SipHash was ~6% of decoding). Interleaved
+  A/B, Switzerland, steady-state passes, one value per process:
+  - `benchmark_osm_read` wall: system malloc 576 / 577 / 579 / 581 / 1386 / 1394 / 1395 / 1412 ms (CPU 7.6-7.8s
+    or 18.9-19.1s); another 6 runs were all slow (1.34-1.40s); jemalloc 516-532 ms (6.9s CPU, 8/8); mimalloc
+    519-528 ms (6.9-7.0s, 8/8); mimalloc + foldhash 474-486 ms (6.3-6.5s CPU, 10/10).
+  - OsmReader `--profile=null` pass 2: 1.20-1.56s wall / 14.8-19.9s CPU -> 0.61-0.65s / 6.4-6.7s (pass 1: 1.38-1.80s /
+    10.5-14.5s -> 1.08-1.34s / 6.5-6.9s); `--profile=emit` pass 2: 2.65-2.80s / 36.8-39.0s -> 2.20-2.23s / 30.6-31.0s.
+  - End-to-end Switzerland (4 interleaved runs each): 26.6-27.1s wall / 206-215s CPU / 5.8-5.9 GB RSS -> 24.7-26.1s /
+    187-189s / 4.2-4.6 GB. Stages: osm_pass1 cpu 9-11s -> 7s, osm_pass2 7.7s -> 7s wall (1m48s -> 1m40s cpu),
+    archive 5s -> 4s (65s -> 53s cpu); natural_earth CPU went up 16s -> 19s with mimalloc (same wall).
+- The `emit` profile's one extra feature (10,665,942 vs Java's 10,665,941) was relation 9683714, a sliver
+  multipolygon whose shell collapses when simplified at z14. JTS keeps the surviving hole as a `LinearRing`, which
+  Java renders as a polygon filtered by the unsquared min size and drops; Rust treated it as a closed line and emitted
+  it. The renderer now reproduces the `LinearRing` handling (see PORTING.md); the counts match.
 - TileCoord: the straight port ran at 604M/s (0.72x Java); closed-form zoom start `(4^z - 1) / 3`, `leading_zeros`,
   shifts/masks instead of `/` and `%` gave 1.3-1.4B/s.
 - VectorTile: the straight port ran at 11.6-12.0M features/s and ~1.5k tiles/s (0.86-0.9x Java). Writing protobuf

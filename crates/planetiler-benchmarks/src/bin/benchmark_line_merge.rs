@@ -6,6 +6,11 @@
 //! `crates/planetiler-core/src/test/resources/mergelines`, then `$PLANETILER_REF/planetiler-core/...`
 //! (defaults to `../planetiler-ref/planetiler`).
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

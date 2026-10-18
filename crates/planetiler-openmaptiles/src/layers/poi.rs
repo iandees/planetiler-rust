@@ -67,7 +67,7 @@ use planetiler_core::reader::source_feature::SourceFeature;
 use planetiler_core::stats::stats::StatsRef;
 use planetiler_core::util::parse;
 use planetiler_core::util::translations::Translations;
-use planetiler_core::value::{Tags, Value};
+use planetiler_core::value::Value;
 use planetiler_core::vector_tile;
 use tracing::info;
 
@@ -158,7 +158,7 @@ impl Poi {
     }
 
     fn lookup_class(&self, subclass: &str, mapping_key: &str) -> Option<&'static str> {
-        let mut tags = Tags::with_capacity(2);
+        let mut tags = planetiler_core::value::tags_with_capacity(2);
         tags.insert("subclass".into(), Value::from(subclass));
         tags.insert("mapping_key".into(), Value::from(mapping_key));
         self.class_mapping.get_first(&tags).copied()

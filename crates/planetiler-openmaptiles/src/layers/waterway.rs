@@ -282,7 +282,7 @@ mod tests {
         let relation_infos = t.profile.preprocess_osm_relation(&rel).unwrap_or_default();
         let feature = SimpleFeature::create_fake_osm_feature(
             new_line_string(&[0.0, 0.0, 0.0, if is_long_enough { 3.0 } else { 1.0 }]),
-            Tags::new(),
+            Tags::default(),
             Some(OSM_SOURCE),
             None::<&str>,
             0,

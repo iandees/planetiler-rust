@@ -113,7 +113,7 @@ mod tests {
     fn point() {
         test_parse(
             r#"{"type": "Feature", "geometry": {"type": "Point", "coordinates": [1, 2]}}"#,
-            vec![feature(new_point(1.0, 2.0), Tags::new())],
+            vec![feature(new_point(1.0, 2.0), Tags::default())],
         );
     }
 
@@ -121,7 +121,7 @@ mod tests {
     fn line_string() {
         test_parse(
             r#"{"type": "Feature", "geometry": {"type": "LineString", "coordinates": [[1, 2], [3, 4]]}}"#,
-            vec![feature(new_line_string(&[1.0, 2.0, 3.0, 4.0]), Tags::new())],
+            vec![feature(new_line_string(&[1.0, 2.0, 3.0, 4.0]), Tags::default())],
         );
     }
 
@@ -129,7 +129,7 @@ mod tests {
     fn polygon() {
         test_parse(
             r#"{"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]}}"#,
-            vec![feature(new_polygon(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0]), Tags::new())],
+            vec![feature(new_polygon(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0]), Tags::default())],
         );
     }
 
@@ -144,7 +144,7 @@ mod tests {
     fn polygon_with_hole() {
         test_parse(
             r#"{"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [3, 0], [3, 3], [0, 3], [0, 0]], [[1, 1], [2, 1], [2, 2], [1, 2], [1, 1]]]}}"#,
-            vec![feature(square_with_hole(), Tags::new())],
+            vec![feature(square_with_hole(), Tags::default())],
         );
     }
 
@@ -152,7 +152,7 @@ mod tests {
     fn multi_point() {
         test_parse(
             r#"{"type": "Feature", "geometry": {"type": "MultiPoint", "coordinates": [[1, 2], [3, 4]]}}"#,
-            vec![feature(new_multi_point(vec![new_point(1.0, 2.0), new_point(3.0, 4.0)]), Tags::new())],
+            vec![feature(new_multi_point(vec![new_point(1.0, 2.0), new_point(3.0, 4.0)]), Tags::default())],
         );
     }
 
@@ -165,7 +165,7 @@ mod tests {
                     new_line_string(&[1.0, 2.0, 3.0, 4.0]),
                     new_line_string(&[5.0, 6.0, 7.0, 8.0]),
                 ]),
-                Tags::new(),
+                Tags::default(),
             )],
         );
     }
@@ -179,7 +179,7 @@ mod tests {
                     new_polygon(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0]),
                     new_polygon(&[0.0, 0.0, 2.0, 0.0, 2.0, 2.0, 0.0, 2.0, 0.0, 0.0]),
                 ]),
-                Tags::new(),
+                Tags::default(),
             )],
         );
     }
@@ -188,7 +188,7 @@ mod tests {
     fn multi_polygon_with_holes() {
         test_parse(
             r#"{"type": "Feature", "geometry": {"type": "MultiPolygon", "coordinates": [[[[0, 0], [3, 0], [3, 3], [0, 3], [0, 0]], [[1, 1], [2, 1], [2, 2], [1, 2], [1, 1]]], [[[0, 0], [3, 0], [3, 3], [0, 3], [0, 0]], [[1, 1], [2, 1], [2, 2], [1, 2], [1, 1]]]]}}"#,
-            vec![feature(new_multi_polygon(vec![square_with_hole(), square_with_hole()]), Tags::new())],
+            vec![feature(new_multi_polygon(vec![square_with_hole(), square_with_hole()]), Tags::default())],
         );
     }
 
@@ -196,7 +196,7 @@ mod tests {
     fn empty_point() {
         test_parse(
             r#"{"type": "Feature", "geometry": {"type": "Point", "coordinates": []}}"#,
-            vec![feature(geo_utils::empty_point(), Tags::new())],
+            vec![feature(geo_utils::empty_point(), Tags::default())],
         );
     }
 
@@ -205,7 +205,7 @@ mod tests {
         for coords in ["[]", "[[]]"] {
             test_parse(
                 &format!(r#"{{"type": "Feature", "geometry": {{"type": "LineString", "coordinates": {coords}}}}}"#),
-                vec![feature(geo_utils::empty_line(), Tags::new())],
+                vec![feature(geo_utils::empty_line(), Tags::default())],
             );
         }
     }
@@ -215,7 +215,7 @@ mod tests {
         for coords in ["[]", "[[]]", "[[[]]]"] {
             test_parse(
                 &format!(r#"{{"type": "Feature", "geometry": {{"type": "Polygon", "coordinates": {coords}}}}}"#),
-                vec![feature(geo_utils::empty_polygon(), Tags::new())],
+                vec![feature(geo_utils::empty_polygon(), Tags::default())],
             );
         }
     }
@@ -231,7 +231,7 @@ mod tests {
                       "properties": {properties}
                     }}"#
                 ),
-                vec![feature(new_point(1.0, 2.0), Tags::new())],
+                vec![feature(new_point(1.0, 2.0), Tags::default())],
             );
         }
     }
@@ -275,9 +275,9 @@ mod tests {
 {"type": "Feature", "geometry": {"type": "Point", "coordinates": [5, 6]}}
 "#,
             vec![
-                feature(new_point(1.0, 2.0), Tags::new()),
-                feature(new_point(3.0, 4.0), Tags::new()),
-                feature(new_point(5.0, 6.0), Tags::new()),
+                feature(new_point(1.0, 2.0), Tags::default()),
+                feature(new_point(3.0, 4.0), Tags::default()),
+                feature(new_point(5.0, 6.0), Tags::default()),
             ],
         );
     }
@@ -294,9 +294,9 @@ mod tests {
               ]
             }"#,
             vec![
-                feature(new_point(1.0, 2.0), Tags::new()),
-                feature(new_point(3.0, 4.0), Tags::new()),
-                feature(new_point(5.0, 6.0), Tags::new()),
+                feature(new_point(1.0, 2.0), Tags::default()),
+                feature(new_point(3.0, 4.0), Tags::default()),
+                feature(new_point(5.0, 6.0), Tags::default()),
             ],
         );
     }
@@ -315,9 +315,9 @@ mod tests {
 {"type": "FeatureCollection", "features": {}}
 "#,
             vec![
-                feature(new_point(1.0, 2.0), Tags::new()),
-                feature(new_point(3.0, 4.0), Tags::new()),
-                feature(geo_utils::empty_geometry(), Tags::new()),
+                feature(new_point(1.0, 2.0), Tags::default()),
+                feature(new_point(3.0, 4.0), Tags::default()),
+                feature(geo_utils::empty_geometry(), Tags::default()),
             ],
             3,
         );
@@ -356,7 +356,7 @@ mod tests {
             ),
         ] {
             let expected = geo_utils::read_wkt(expected).unwrap();
-            test_parse(json, vec![feature(expected, Tags::new())]);
+            test_parse(json, vec![feature(expected, Tags::default())]);
         }
     }
 

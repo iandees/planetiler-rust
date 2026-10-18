@@ -139,6 +139,6 @@ mod tests {
         run(&resource("monaco-latest.osm.pbf"), tmp.path(), &db_path).unwrap();
         let mbtiles = Mbtiles::new_read_only_database(&db_path).unwrap();
         assert_metadata(&mbtiles, "Toilets Overlay");
-        assert_num_features(&mbtiles, "toilets", 14, &Tags::new(), 34, GeometryType::Point);
+        assert_num_features(&mbtiles, "toilets", 14, &Tags::default(), 34, GeometryType::Point);
     }
 }

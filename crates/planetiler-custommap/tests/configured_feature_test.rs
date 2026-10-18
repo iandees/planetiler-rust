@@ -213,7 +213,7 @@ fn point_tile_feature() -> vector_tile::Feature {
         "testLayer",
         1,
         vector_tile::encode_geometry(&Geometry::Point(geo_utils::point(0.0, 0.0))),
-        Tags::new(),
+        Tags::default(),
     )
 }
 
@@ -243,7 +243,7 @@ fn test_merge_line_string_min_length_sets_buffer_pixels() {
             "{}\n  tile_post_process:\n    merge_line_strings:\n      min_length: 10\n      min_length_at_max_zoom: 2\n      tolerance: 5\n      buffer: 6\n",
             layer_config("  - source: osm\n    geometry: line")
         ),
-        Tags::new(),
+        Tags::default(),
         |f| {
             assert_eq!(10.0, f.get_buffer_pixels_at_zoom(12));
             assert_eq!(6.0, f.get_buffer_pixels_at_zoom(14));
@@ -837,7 +837,7 @@ layers:
     );
     harness.test_feature(
         &config,
-        &point_feature(Tags::new()),
+        &point_feature(Tags::default()),
         |f| {
             assert_eq!(Some(Value::Int(1)), attr(f, 14, "arg1"));
             assert_eq!(Some(Value::Int(1)), attr(f, 14, "arg2"));
@@ -1009,9 +1009,9 @@ fn test_line_centroid() {
 fn test_any_geometry() {
     for expression in ["geometry: any", ""] {
         let config = layer_config(&format!("  - source: osm\n    {expression}\n"));
-        test_linestring(&config, Tags::new(), |f| assert_eq!(GeometryType::Line, geometry_type(f)), 1);
-        test_point(&config, Tags::new(), |f| assert_eq!(GeometryType::Point, geometry_type(f)), 1);
-        test_polygon(&config, Tags::new(), |f| assert_eq!(GeometryType::Polygon, geometry_type(f)), 1);
+        test_linestring(&config, Tags::default(), |f| assert_eq!(GeometryType::Line, geometry_type(f)), 1);
+        test_point(&config, Tags::default(), |f| assert_eq!(GeometryType::Point, geometry_type(f)), 1);
+        test_polygon(&config, Tags::default(), |f| assert_eq!(GeometryType::Polygon, geometry_type(f)), 1);
     }
 }
 
@@ -1022,7 +1022,7 @@ fn test_any_source() {
         for source in ["osm", "other"] {
             let sf = SimpleFeature::create_fake_osm_feature(
                 new_point(0.0, 0.0),
-                Tags::new(),
+                Tags::default(),
                 source,
                 None::<&str>,
                 1,
@@ -1057,7 +1057,7 @@ fn test_wikidata_parse() {
 fn left_hand_side_features() -> (SimpleFeature, SimpleFeature) {
     let sf_match = SimpleFeature::create_fake_osm_feature(
         rectangle(0.0, 1.0),
-        Tags::new(),
+        Tags::default(),
         "osm",
         "layer",
         1,
@@ -1066,7 +1066,7 @@ fn left_hand_side_features() -> (SimpleFeature, SimpleFeature) {
     );
     let sf_no_match = SimpleFeature::create_fake_osm_feature(
         new_point(0.0, 0.0),
-        Tags::new(),
+        Tags::default(),
         "osm",
         "other layer",
         2,
@@ -1103,7 +1103,7 @@ fn test_left_hand_side_expression() {
 fn match_none_features() -> (SimpleFeature, SimpleFeature) {
     let sf_match = SimpleFeature::create_fake_osm_feature(
         rectangle(0.0, 1.0),
-        Tags::new(),
+        Tags::default(),
         "osm",
         "layer",
         1,
@@ -1112,7 +1112,7 @@ fn match_none_features() -> (SimpleFeature, SimpleFeature) {
     );
     let sf_no_match = SimpleFeature::create_fake_osm_feature(
         new_point(0.0, 0.0),
-        Tags::new(),
+        Tags::default(),
         "osm",
         None::<&str>,
         2,
@@ -1189,7 +1189,7 @@ fn test_geometry_attributes_line() {
     for (expression, expected) in cases {
         let sf = SimpleFeature::create_fake_osm_feature(
             new_line_string(&[1.0, 2.0, 3.0, 4.0]),
-            Tags::new(),
+            Tags::default(),
             "osm",
             "layer",
             1,
@@ -1215,7 +1215,7 @@ fn test_geometry_attributes_line_boolean() {
     for (expression, expected) in cases {
         let sf = SimpleFeature::create_fake_osm_feature(
             new_line_string(&[1.0, 2.0, 3.0, 4.0, 1.0, 2.0]),
-            Tags::new(),
+            Tags::default(),
             "osm",
             "layer",
             1,
@@ -1256,7 +1256,7 @@ fn test_geometry_attributes_area() {
     for (expression, expected) in cases {
         let sf = SimpleFeature::create_fake_osm_feature(
             rectangle(0.0, 1.0),
-            Tags::new(),
+            Tags::default(),
             "osm",
             "layer",
             1,
@@ -1331,7 +1331,7 @@ fn test_split_ways() {
             if split { "split_line" } else { "line" }
         ));
         let profile = Harness::new().load_config(&config);
-        assert!(!profile.split_osm_way_at_intersections(&way(Tags::new(), None)));
+        assert!(!profile.split_osm_way_at_intersections(&way(Tags::default(), None)));
         assert!(!profile.split_osm_way_at_intersections(&way(tags! {"waterway" => "river"}, None)));
         assert_eq!(split, profile.split_osm_way_at_intersections(&way(tags! {"highway" => "motorway"}, None)));
         assert_eq!(split, profile.split_osm_way_at_intersections(&way(tags! {"highway" => "footway"}, None)));
@@ -1443,7 +1443,9 @@ fn test_split_with_expression() {
     ] {
         let config = layer_config(&format!("  - source: osm\n    geometry: split_line\n    include_when: {filter}\n"));
         let profile = Harness::new().load_config(&config);
-        assert!(!profile.split_osm_way_at_intersections(&way(Tags::new(), Some(Info::new(1, 2, 3, 4, "other_user")))));
+        assert!(
+            !profile.split_osm_way_at_intersections(&way(Tags::default(), Some(Info::new(1, 2, 3, 4, "other_user"))))
+        );
         assert!(
             profile.split_osm_way_at_intersections(&way(tags! {"key" => "value"}, Some(Info::new(1, 2, 3, 4, "user"))))
         );
@@ -1467,7 +1469,7 @@ fn test_id() {
     for (input, output) in [("100", 100), ("${ feature.id }", 1)] {
         test_polygon(
             &layer_config(&format!("  - source: osm\n    geometry: polygon\n    id: {input}\n")),
-            Tags::new(),
+            Tags::default(),
             |f| assert_eq!(output, f.get_id()),
             1,
         );
@@ -1480,7 +1482,7 @@ fn test_point_label_grid() {
         &format!(
             "{OSM_SOURCE}layers:\n- id: testLayer\n  buffer: 64\n  features:\n  - source: osm\n    geometry: point\n    point_label_grid:\n      pixel_size:\n        maxzoom: 8\n        value: 32\n      limit:\n        maxzoom: 8\n        value: 64\n"
         ),
-        Tags::new(),
+        Tags::default(),
         |f| {
             assert_eq!(32.0, f.get_point_label_grid_pixel_size_at_zoom(8));
             assert_eq!(0.0, f.get_point_label_grid_pixel_size_at_zoom(9));
@@ -1501,7 +1503,7 @@ fn test_sort_key() {
     ] {
         test_polygon(
             &layer_config(&format!("  - source: osm\n    geometry: polygon\n    {input}\n")),
-            Tags::new(),
+            Tags::default(),
             |f| assert_eq!(output, f.get_sort_key(), "{input}"),
             1,
         );

@@ -12,3 +12,11 @@ planetiler-examples.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+mimalloc = { workspace = true, optional = true }
+
+[features]
+# Use mimalloc as the global allocator. macOS's system allocator packs small objects from different threads into the
+# same cache lines, so per-thread Arc<str> refcount updates in the OSM reader false-share across cores (see
+# bench/RESULTS.md, "The bimodal OSM-decoding slowdown"); mimalloc's thread-local pages avoid that.
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]

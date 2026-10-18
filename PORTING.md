@@ -220,6 +220,13 @@ helpers `*_fn`).
 Option<Group> }`; filled tiles of one polygon/zoom share one `Arc` so the encoder only encodes it once.
 `TiledGeometry` (`slice_into_tiles`, `slice_points_into_tiles`, `get_covered_tiles`, `CoveredTiles`) and
 `geometry_coordinate_sequences` (`Groups = Vec<Vec<Vec<Coord>>>`) are public for other users (e.g. `Bounds` shapes).
+JTS `LinearRing` semantics: when simplification collapses a polygon's shell, JTS's `GeometryTransformer` returns the
+surviving rings as `LinearRing`s, and Java's renderer then treats them as non-polygonal (line slicing, unsquared min
+size) but `extractGroups` turns each `LinearRing` into a polygon filtered by area. geo has no `LinearRing`, so
+`FeatureRenderer` passes `linear_rings = input was polygonal && output is not` down to
+`gcs::extract_groups_with_rings`, which treats closed linestrings with >= 4 points as such rings. (This was the one
+extra feature Rust emitted for Switzerland with the `emit` benchmark profile: relation 9683714, a sliver whose shell
+collapses at z14 leaving only its hole.)
 
 **FeatureGroup (TileArchiveWriter side).** `FeatureGroup::new_in_memory(tile_order, profile: Arc<dyn Profile>,
 config: Arc<PlanetilerConfig>, stats)` / `new_disk_backed(tile_order, dir, profile, config, stats, reuse)`. Sort key
@@ -348,6 +355,14 @@ reader.close();                            // drops node locations / relation in
 - `OsmPhaser`: mutex+condvar port of Java's `Phaser` usage; per-worker counts are plain atomic stores (no RMW per
   element); `arrive`/`arrive_and_wait_for_others`/`close` return `anyhow::Result` (out-of-order elements);
   dropping a `ForWorker` that did not reach `Done` closes it so other workers don't deadlock on errors.
+- `Tags` is `IndexMap<String, Value, TagsHasher>` (foldhash with a per-process random seed): SipHash was ~6% of OSM
+  decoding and every `tags.get(..)` in profiles. Create maps with `Tags::default()` /
+  `value::tags_with_capacity(n)` (`IndexMap::new()` only exists for std's hasher).
+- Binaries (`planetiler`, all benchmarks) use mimalloc as the global allocator (default `mimalloc` cargo feature;
+  `--no-default-features` for the system allocator). With macOS's allocator, the per-thread `Arc<str>` strings the
+  PBF decoder hands out (user names, tag values; refcounted once per element) sometimes share 128-byte cache lines with
+  other threads' allocations, and the resulting false sharing made multi-threaded decoding run at ~40% IPC in most
+  processes (see bench/RESULTS.md history). Library users should pick a thread-caching allocator too.
 - Benchmarks: `cargo run --release -p planetiler-benchmarks --bin benchmark_osm_reader -- --osm_path=... 
   --profile=null|emit` and `java -cp planetiler-dist-*-with-deps.jar bench/java/BenchmarkOsmReader.java
   --osm_path=... --profile=null|emit` (same profiles, same storage defaults, print `RESULT pass1/pass2` wall/CPU).

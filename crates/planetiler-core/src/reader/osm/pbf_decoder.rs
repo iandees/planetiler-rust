@@ -536,7 +536,7 @@ impl Strings<'_> {
     }
 
     fn tags(&mut self, keys: &[u32], vals: &[u32]) -> Tags {
-        let mut tags = Tags::with_capacity(keys.len().min(vals.len()));
+        let mut tags = crate::value::tags_with_capacity(keys.len().min(vals.len()));
         for (&k, &v) in keys.iter().zip(vals) {
             self.insert_tag(&mut tags, k as usize, v as usize);
         }
@@ -721,7 +721,7 @@ impl PbfElements {
 
         // The key and value string indexes are sequential in the same PBF array. Each set of tags is delimited by an
         // index with a value of 0.
-        let mut tags = Tags::new();
+        let mut tags = Tags::default();
         if state.keys_vals.pos < state.keys_vals.end && src[state.keys_vals.pos] == 0 {
             // most nodes have no tags
             state.keys_vals.pos += 1;

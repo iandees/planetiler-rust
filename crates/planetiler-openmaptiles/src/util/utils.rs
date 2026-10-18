@@ -55,7 +55,7 @@ fn java_round(d: f64) -> i32 {
 /// Returns a map with `ele` (meters) and `ele_ft` attributes from an elevation in meters.
 pub fn elevation_tags(meters: f64) -> Tags {
     let (ele, ele_ft) = elevation(meters);
-    let mut result = Tags::with_capacity(2);
+    let mut result = planetiler_core::value::tags_with_capacity(2);
     result.insert("ele".into(), ele.into());
     result.insert("ele_ft".into(), ele_ft.into());
     result
@@ -66,7 +66,7 @@ pub fn elevation_tags(meters: f64) -> Tags {
 pub fn elevation_tags_str(meters: Option<&str>) -> Tags {
     match meters.and_then(parse::meters_str) {
         Some(ele) => elevation_tags(ele),
-        None => Tags::new(),
+        None => Tags::default(),
     }
 }
 

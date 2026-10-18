@@ -6,6 +6,11 @@
 //!
 //! Run with `cargo run --release -p planetiler-benchmarks --bin benchmark_simplify`.
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 

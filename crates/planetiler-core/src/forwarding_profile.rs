@@ -828,7 +828,7 @@ mod tests {
             "layer",
             1,
             vector_tile::encode_geometry(&geo_types::Geometry::Point(geo_utils::point(0.0, 0.0))),
-            Tags::new(),
+            Tags::default(),
         )
     }
 

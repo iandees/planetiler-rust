@@ -22,7 +22,7 @@ use planetiler_core::reader::source_feature::SourceFeature;
 use planetiler_core::stats::stats::StatsRef;
 use planetiler_core::util::translations::Translations;
 use planetiler_core::util::zoom_function::ZoomFunction;
-use planetiler_core::value::{Tags, Value};
+use planetiler_core::value::Value;
 use planetiler_core::vector_tile;
 
 use crate::feature_merge;
@@ -73,7 +73,7 @@ impl ClassMapping {
         match self {
             ClassMapping::Exact(map) => map.get(subclass).copied(),
             ClassMapping::Index(index) => {
-                let mut tags = Tags::with_capacity(1);
+                let mut tags = planetiler_core::value::tags_with_capacity(1);
                 tags.insert(fields::SUBCLASS.to_string(), Value::from(subclass));
                 index.get_first(&tags).copied()
             }
@@ -230,7 +230,7 @@ mod tests {
     fn ne_feature(layer: &str) -> SimpleFeature {
         SimpleFeature::create(
             geo_utils::world_to_lat_lon_coords(&rectangle(0.0, 1.0).into()),
-            Tags::new(),
+            Tags::default(),
             Some(NATURAL_EARTH_SOURCE),
             Some(layer),
             0,

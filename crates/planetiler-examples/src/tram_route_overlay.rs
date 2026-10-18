@@ -161,7 +161,7 @@ mod tests {
         // test points: (1 west 2 south), (3 east 5 north)
         let way = SimpleFeature::create_fake_osm_feature(
             new_line_string(&[-1.0, -2.0, 3.0, 5.0]),
-            Tags::new(),
+            Tags::default(),
             None::<&str>,
             None::<&str>,
             35,
@@ -207,7 +207,7 @@ mod tests {
         .unwrap();
         let mbtiles = Mbtiles::new_read_only_database(&db_path).unwrap();
         assert_metadata(&mbtiles, "Tram Routes and Stops Overlay");
-        let none = Tags::new();
+        let none = Tags::default();
         assert_num_features(&mbtiles, "tram_stop", 12, &none, 352, GeometryType::Point);
         assert_num_features(&mbtiles, "tram_route", 12, &none, 1333, GeometryType::Line);
         assert_num_features(&mbtiles, "tram_way", 12, &none, 386, GeometryType::Line);

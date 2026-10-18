@@ -72,9 +72,6 @@ use crate::worker::worker_pipeline::WorkerPipeline;
 
 type HashMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
 
-static EMPTY_TAGS_HASHER: std::sync::LazyLock<std::hash::RandomState> =
-    std::sync::LazyLock::new(std::hash::RandomState::new);
-
 const ROLE_BITS: u32 = 16;
 const MAX_ROLES: usize = (1 << ROLE_BITS) - 10;
 const ROLE_SHIFT: u32 = 64 - ROLE_BITS;
@@ -1259,14 +1256,8 @@ impl OsmSourceFeature {
     ) -> OsmSourceFeature {
         let id = element.id();
         OsmSourceFeature {
-            // tags live on the element; Tags::new() would read the thread-local hash keys for every feature
-            base: SourceFeatureBase::new(
-                Tags::with_hasher(EMPTY_TAGS_HASHER.clone()),
-                Some(name),
-                None,
-                relation_infos,
-                id,
-            ),
+            // tags live on the element
+            base: SourceFeatureBase::new(Tags::default(), Some(name), None, relation_infos, id),
             element,
             kind,
             point,
@@ -1635,7 +1626,7 @@ mod tests {
     }
 
     fn way(id: i64, nodes: &[i64]) -> Way {
-        Way::with_tags(id, Tags::new(), nodes.to_vec())
+        Way::with_tags(id, Tags::default(), nodes.to_vec())
     }
 
     fn pass1(reader: &OsmReader, elements: &[OsmElement]) {
@@ -2138,7 +2129,7 @@ mod tests {
         let reader = reader_with(test_info_profile());
         let node_cache = reader.new_node_location_provider();
         let way = Way::with_tags(3, tags! {"key" => "value"}, vec![1, 2]);
-        let relation = Relation::with_tags(4, Tags::new(), vec![Member::new(OsmElementType::Way, 3, "rolename")]);
+        let relation = Relation::with_tags(4, Tags::default(), vec![Member::new(OsmElementType::Way, 3, "rolename")]);
         pass1(
             &reader,
             &[Node::new(1, 0.0, 0.0).into(), node(2, 0.75, 0.75).into(), way.clone().into(), relation.into()],
@@ -2159,7 +2150,7 @@ mod tests {
         let way = Way::with_tags(3, tags! {"key" => "value"}, vec![1, 2]);
         let relation = Relation::with_tags(
             4,
-            Tags::new(),
+            Tags::default(),
             vec![
                 Member::new(OsmElementType::Relation, 3, "rolename"),
                 Member::new(OsmElementType::Node, 3, "rolename"),
@@ -2181,7 +2172,7 @@ mod tests {
     }
 
     fn rel(id: i64, members: &[(OsmElementType, i64, &str)]) -> Relation {
-        Relation::with_tags(id, Tags::new(), members.iter().map(|&(t, r, role)| Member::new(t, r, role)).collect())
+        Relation::with_tags(id, Tags::default(), members.iter().map(|&(t, r, role)| Member::new(t, r, role)).collect())
     }
 
     fn super_relation_elements() -> (Vec<OsmElement>, Way, Way) {

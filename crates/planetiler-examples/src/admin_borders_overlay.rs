@@ -299,7 +299,7 @@ mod tests {
         .unwrap();
         let mbtiles = Mbtiles::new_read_only_database(&db_path).unwrap();
         assert_metadata(&mbtiles, "Administrative Borders Overlay");
-        let none = Tags::new();
+        let none = Tags::default();
         assert!(num_features(&mbtiles, "admin_borders-country", 5, &none, GeometryType::Line) > 0);
         assert!(
             num_features(&mbtiles, "admin_borders-city", 11, &none, GeometryType::Line) > 0,

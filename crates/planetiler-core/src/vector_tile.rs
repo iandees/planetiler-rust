@@ -423,7 +423,7 @@ pub fn decode(encoded: &[u8]) -> anyhow::Result<Vec<Feature>> {
         debug_assert_eq!(4096, layer.extent.unwrap_or(4096));
         let values: Vec<Value> = layer.values.iter().map(decode_value).collect();
         for feature in &layer.features {
-            let mut attrs = Tags::with_capacity(feature.tags.len() / 2);
+            let mut attrs = crate::value::tags_with_capacity(feature.tags.len() / 2);
             for pair in feature.tags.chunks(2) {
                 let key_idx = pair[0] as usize;
                 let value_idx = *pair.get(1).ok_or_else(|| anyhow::anyhow!("odd number of tags"))? as usize;
@@ -806,7 +806,7 @@ impl VectorTile {
                     .iter()
                     .map(|feature| {
                         let tags = layer.tags_of(feature);
-                        let mut properties = Tags::with_capacity(tags.len() / 2);
+                        let mut properties = crate::value::tags_with_capacity(tags.len() / 2);
                         for pair in tags.as_chunks::<2>().0 {
                             properties
                                 .insert(layer.keys[pair[0] as usize].clone(), layer.values[pair[1] as usize].clone());
@@ -1977,7 +1977,12 @@ mod tests {
         for (i, id) in [1i64, 0, -1, i64::MAX, 300].into_iter().enumerate() {
             let x = 3.0 + i as f64 * 50.0;
             features.push(Feature::new("a", id, encode_geometry(&new_point(x, 6.0)), attrs.clone()));
-            features.push(Feature::new("a", id, encode_geometry(&rectangle(x, x, x + 100.0, x + 120.0)), Tags::new()));
+            features.push(Feature::new(
+                "a",
+                id,
+                encode_geometry(&rectangle(x, x, x + 100.0, x + 120.0)),
+                Tags::default(),
+            ));
             features.push(Feature::new(
                 "a",
                 id,
@@ -2077,7 +2082,7 @@ mod tests {
     }
 
     fn test_round_trip_geometry(input: Geometry<f64>) {
-        test_round_trip(&input, "layer", Tags::new(), 1);
+        test_round_trip(&input, "layer", Tags::default(), 1);
     }
 
     #[test]
@@ -2356,7 +2361,7 @@ mod tests {
             (3, new_multi_polygon(&[rectangle_sq(0.0, 1.0), rectangle_sq(3.0, 4.0), rectangle_sq(6.0, 8.0)])),
         ];
         for (expected, geom) in cases {
-            let feature = Feature::new("layer", 1, encode_geometry(&geom), Tags::new());
+            let feature = Feature::new("layer", 1, encode_geometry(&geom), Tags::default());
             let proto = VectorTile::new().add_layer_features("layer", &[feature]).to_proto(true);
             assert_eq!(expected, count_geometries(&proto.layers[0].features[0]), "{geom:?}");
         }
@@ -2483,7 +2488,7 @@ mod tests {
         let mut tile = VectorTile::new();
         assert!(tile.is_empty());
         assert!(tile.likely_to_be_duplicated());
-        tile.add_layer_features("water", &[Feature::new("water", 1, encode_fill(1.0), Tags::new())]);
+        tile.add_layer_features("water", &[Feature::new("water", 1, encode_fill(1.0), Tags::default())]);
         assert!(tile.contains_only_fills());
         assert!(tile.contains_only_fills_or_edges());
         assert!(tile.likely_to_be_duplicated());

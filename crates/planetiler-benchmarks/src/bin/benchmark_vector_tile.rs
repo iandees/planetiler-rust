@@ -5,6 +5,11 @@
 //!
 //! Usage: `cargo run --release -p planetiler-benchmarks --bin benchmark_vector_tile -- [iterations]`
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -43,7 +48,7 @@ fn workload() -> Vec<(&'static str, Geometry<f64>, Tags)> {
             coords.push(Coord { x: cx + rr * a.cos(), y: cy + rr * a.sin() });
         }
         coords.push(coords[0]);
-        let mut tags = Tags::new();
+        let mut tags = Tags::default();
         tags.insert("kind".into(), Value::str(KINDS[rng.next_int(10) as usize]));
         tags.insert("rank".into(), Value::Int(rng.next_int(20)));
         tags.insert("area".into(), Value::Double((rng.next_double() * 1000.0).floor() / 10.0));
@@ -59,7 +64,7 @@ fn workload() -> Vec<(&'static str, Geometry<f64>, Tags)> {
             x += rng.next_double() * 8.0 - 4.0;
             y += rng.next_double() * 8.0 - 4.0;
         }
-        let mut tags = Tags::new();
+        let mut tags = Tags::default();
         tags.insert("kind".into(), Value::str(KINDS[rng.next_int(10) as usize]));
         tags.insert("rank".into(), Value::Int(rng.next_int(20)));
         tags.insert("oneway".into(), Value::Bool(rng.next_int(2) == 1));
@@ -69,7 +74,7 @@ fn workload() -> Vec<(&'static str, Geometry<f64>, Tags)> {
     for i in 0..1000 {
         let x = rng.next_double() * 256.0;
         let y = rng.next_double() * 256.0;
-        let mut tags = Tags::new();
+        let mut tags = Tags::default();
         tags.insert("kind".into(), Value::str(KINDS[rng.next_int(10) as usize]));
         tags.insert("rank".into(), Value::Int(rng.next_int(20)));
         tags.insert("name".into(), Value::str(format!("name{i}")));

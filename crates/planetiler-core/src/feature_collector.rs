@@ -664,7 +664,7 @@ impl<'a> Feature<'a> {
             geometry_type,
             empty,
             omitted: empty,
-            attrs: Arc::new(Tags::new()),
+            attrs: Arc::new(Tags::default()),
             zoom_attrs: Vec::new(),
             must_unwrap_values: false,
             attr_cache: OnceCell::new(),
@@ -1024,7 +1024,7 @@ impl<'a> Feature<'a> {
     }
 
     fn compute_attrs_at_zoom(&self, zoom: u32) -> Arc<Tags> {
-        let mut result = Tags::with_capacity(self.attrs.len() + self.zoom_attrs.len());
+        let mut result = crate::value::tags_with_capacity(self.attrs.len() + self.zoom_attrs.len());
         let keep = |v: &Value| match v {
             Value::Null => false,
             Value::String(s) => !s.is_empty(),
@@ -1801,7 +1801,7 @@ mod tests {
     #[test]
     fn test_many_attr() {
         let factory = factory();
-        let mut tags = Tags::new();
+        let mut tags = Tags::default();
         for i in 0..500 {
             tags.insert(format!("key{i}"), format!("val{i}").into());
         }

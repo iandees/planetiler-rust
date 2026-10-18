@@ -95,7 +95,7 @@ impl Json {
 }
 
 fn into_tags(entries: Vec<(String, Json)>) -> Tags {
-    let mut tags = Tags::with_capacity(entries.len());
+    let mut tags = crate::value::tags_with_capacity(entries.len());
     for (k, v) in entries {
         tags.insert(k, v.into_value());
     }

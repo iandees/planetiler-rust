@@ -18,6 +18,11 @@
 //! writes), a nodes -> ways -> relations phaser, computing each node's encoded location, tracking the max way id, and
 //! collecting way members of multipolygon relations.
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};

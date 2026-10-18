@@ -70,6 +70,10 @@ pub struct FeatureRenderer {
     extents: Arc<TileExtents>,
 }
 
+fn is_polygonal(geom: &Geometry<f64>) -> bool {
+    matches!(geom, Geometry::Polygon(_) | Geometry::MultiPolygon(_) | Geometry::Rect(_) | Geometry::Triangle(_))
+}
+
 fn is_puntal(geom: &Geometry<f64>) -> bool {
     matches!(geom, Geometry::Point(_) | Geometry::MultiPoint(_))
 }
@@ -175,6 +179,7 @@ impl FeatureRenderer {
     ) {
         let scale = (1u64 << zoom) as f64;
         let scaled = geom.map_coords(|c| Coord { x: c.x * scale, y: c.y * scale });
+        let input_polygonal = is_polygonal(&scaled);
         let geom = if let Some(pipeline) = feature.get_scaled_geometry_transform_at_zoom(zoom) {
             pipeline.apply(&scaled)
         } else if !is_puntal(&scaled) {
@@ -182,15 +187,21 @@ impl FeatureRenderer {
         } else {
             scaled
         };
-        self.render_geometry(zoom, geom, attrs, feature, consumer);
+        // When simplification collapses a polygon's shell, JTS's GeometryTransformer returns the surviving rings as
+        // `LinearRing`s, which Java renders as polygons filtered by the (unsquared) line min size. geo has no
+        // LinearRing type, so remember that closed linestrings here are rings (see `gcs::extract_groups_with_rings`).
+        let linear_rings = input_polygonal && !is_polygonal(&geom);
+        self.render_geometry(zoom, geom, attrs, feature, linear_rings, consumer);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_geometry(
         &self,
         zoom: u32,
         geom: Geometry<f64>,
         attrs: &Arc<Tags>,
         feature: &Feature<'_>,
+        linear_rings: bool,
         consumer: &mut dyn FnMut(RenderedFeature),
     ) {
         if geom.is_empty() {
@@ -215,20 +226,23 @@ impl FeatureRenderer {
             g @ (Geometry::Polygon(_)
             | Geometry::MultiPolygon(_)
             | Geometry::LineString(_)
-            | Geometry::MultiLineString(_)) => self.render_line_or_polygon(zoom, attrs, feature, g, consumer),
+            | Geometry::MultiLineString(_)) => {
+                self.render_line_or_polygon(zoom, attrs, feature, g, linear_rings, consumer)
+            }
             Geometry::GeometryCollection(collection) => {
                 for g in collection.0 {
-                    self.render_geometry(zoom, g, attrs, feature, consumer);
+                    self.render_geometry(zoom, g, attrs, feature, linear_rings, consumer);
                 }
             }
             Geometry::Line(line) => {
-                self.render_line_or_polygon(zoom, attrs, feature, Geometry::LineString(line.into()), consumer)
+                self.render_line_or_polygon(zoom, attrs, feature, Geometry::LineString(line.into()), false, consumer)
             }
             Geometry::Rect(rect) => {
-                self.render_line_or_polygon(zoom, attrs, feature, Geometry::Polygon(rect.to_polygon()), consumer)
+                self.render_line_or_polygon(zoom, attrs, feature, Geometry::Polygon(rect.to_polygon()), false, consumer)
             }
             Geometry::Triangle(triangle) => {
-                self.render_line_or_polygon(zoom, attrs, feature, Geometry::Polygon(triangle.to_polygon()), consumer)
+                let polygon = Geometry::Polygon(triangle.to_polygon());
+                self.render_line_or_polygon(zoom, attrs, feature, polygon, false, consumer)
             }
         }
     }
@@ -298,16 +312,18 @@ impl FeatureRenderer {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn slice(
         &self,
         geom: &Geometry<f64>,
         min_size: f64,
         buffer: f64,
         area: bool,
+        linear_rings: bool,
         zoom: u32,
     ) -> GeometryResult<TiledGeometry> {
         let extents = self.extents.get_for_zoom(zoom);
-        let groups = gcs::extract_groups(geom, min_size);
+        let groups = gcs::extract_groups_with_rings(geom, min_size, linear_rings);
         TiledGeometry::slice_into_tiles(&groups, buffer, area, zoom, extents)
     }
 
@@ -317,6 +333,7 @@ impl FeatureRenderer {
         attrs: &Arc<Tags>,
         feature: &Feature<'_>,
         mut geom: Geometry<f64>,
+        linear_rings: bool,
         consumer: &mut dyn FnMut(RenderedFeature),
     ) {
         let area = matches!(geom, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
@@ -326,11 +343,11 @@ impl FeatureRenderer {
             // treat minPixelSize as the edge of a square that defines minimum area for features
             min_size *= min_size;
         }
-        let sliced = match self.slice(&geom, min_size, buffer, area, zoom) {
+        let sliced = match self.slice(&geom, min_size, buffer, area, linear_rings, zoom) {
             Ok(sliced) => Some(sliced),
             Err(_) => {
                 match geo_utils::fix_polygon(&geom).and_then(|fixed| {
-                    let sliced = self.slice(&fixed, min_size, buffer, area, zoom)?;
+                    let sliced = self.slice(&fixed, min_size, buffer, area, linear_rings, zoom)?;
                     Ok((fixed, sliced))
                 }) {
                     Ok((fixed, sliced)) => {
@@ -502,7 +519,7 @@ mod tests {
     ) -> BTreeMap<TileCoord, Vec<RenderedFeature>> {
         let lat_lon = geo_utils::world_to_lat_lon_coords(&world_geom.into());
         let factory = Factory::new(config.clone(), in_memory());
-        let source = SimpleFeature::create(lat_lon, Tags::new(), None::<&str>, None::<&str>, 1);
+        let source = SimpleFeature::create(lat_lon, Tags::default(), None::<&str>, None::<&str>, 1);
         let mut collector = factory.get(&source);
         let feature = match kind {
             Kind::Point => collector.point("layer"),
@@ -1275,7 +1292,7 @@ mod tests {
         let factory = Factory::new(config.clone(), in_memory());
         let source = SimpleFeature::create(
             geo_utils::world_to_lat_lon_coords(&rect(Z14_WIDTH / 2.0, 1.0 - Z14_WIDTH / 2.0)),
-            Tags::new(),
+            Tags::default(),
             None::<&str>,
             None::<&str>,
             1,
@@ -1413,6 +1430,34 @@ mod tests {
             f.set_min_pixel_size(2.0).set_zoom_range(13, 13).set_buffer_pixels(1.0);
         });
         assert_eq!(1, rendered.len());
+    }
+
+    #[test]
+    fn test_collapsed_shell_leaves_hole_filtered_as_linear_ring() {
+        // OSM relation 9683714 (a sliver multipolygon in Switzerland): simplifying at z14 collapses the shell to 3
+        // points, so JTS returns just the hole as a LinearRing. Java renders that as a polygon whose area must exceed
+        // the *unsquared* min pixel size (since a LinearRing isn't Polygonal), which drops it.
+        let ring = |c: &[(f64, f64)]| LineString::from(c.to_vec());
+        let polygon = Polygon::new(
+            ring(&[
+                (0.52075588516891, 0.3519382206723094),
+                (0.5207561878487468, 0.35193831007927656),
+                (0.5207561831921339, 0.3519383240491152),
+                (0.5207558814436197, 0.351938234642148),
+                (0.52075588516891, 0.3519382206723094),
+            ]),
+            vec![ring(&[
+                (0.5207558870315552, 0.3519382234662771),
+                (0.5207558842375875, 0.35193823277950287),
+                (0.5207561813294888, 0.35193832125514746),
+                (0.520756185054779, 0.3519383119419217),
+                (0.5207558870315552, 0.3519382234662771),
+            ])],
+        );
+        let rendered = render_geometry(polygon, Kind::Polygon, |f| {
+            f.set_zoom_range(14, 14);
+        });
+        assert_eq!(0, rendered.len(), "{rendered:?}");
     }
 
     #[test]

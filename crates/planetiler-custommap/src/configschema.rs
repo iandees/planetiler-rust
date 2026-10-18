@@ -376,7 +376,7 @@ impl SchemaConfig {
 
     /// Argument definitions from the schema (empty if missing).
     pub fn args(&self) -> &Tags {
-        static EMPTY: std::sync::LazyLock<Tags> = std::sync::LazyLock::new(Tags::new);
+        static EMPTY: std::sync::LazyLock<Tags> = std::sync::LazyLock::new(Tags::default);
         self.args.as_ref().unwrap_or(&EMPTY)
     }
 

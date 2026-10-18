@@ -1,6 +1,11 @@
 //! Port of `BenchmarkTileCoord.java`: encodes and decodes every tile coordinate from z0 to z14, 3 times, printing
 //! throughput to stderr.
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use planetiler_core::geo::tile_coord::TileCoord;
 use planetiler_core::stats::timer::Timer;
 use planetiler_core::util::format;

@@ -61,7 +61,7 @@ pub struct Node {
 
 impl Node {
     pub fn new(id: i64, lat: f64, lon: f64) -> Node {
-        Node { id, tags: Tags::new(), lat, lon, info: None }
+        Node { id, tags: Tags::default(), lat, lon, info: None }
     }
 
     pub fn with_tags(id: i64, tags: Tags, lat: f64, lon: f64) -> Node {
@@ -85,7 +85,7 @@ pub struct Way {
 
 impl Way {
     pub fn new(id: i64) -> Way {
-        Way { id, tags: Tags::new(), nodes: Vec::with_capacity(5), info: None }
+        Way { id, tags: Tags::default(), nodes: Vec::with_capacity(5), info: None }
     }
 
     pub fn with_tags(id: i64, tags: Tags, nodes: Vec<i64>) -> Way {

@@ -1,6 +1,11 @@
 //! Port of `BenchmarkPmtiles.java`: round-trips 60M PMTiles directory entries through
 //! `directory_to_bytes`/`directory_from_bytes` three times and prints throughput.
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::time::Instant;
 
 use planetiler_core::pmtiles::pmtiles::{self, Entry};

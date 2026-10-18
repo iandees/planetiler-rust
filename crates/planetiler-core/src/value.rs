@@ -12,7 +12,30 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 
 /// Insertion-ordered map of attribute key to value, equivalent to Java's `Map<String, Object>`.
-pub type Tags = IndexMap<String, Value>;
+///
+/// Create with `Tags::default()` or [`tags_with_capacity`] (`IndexMap::new` only exists for std's SipHash hasher).
+pub type Tags = IndexMap<String, Value, TagsHasher>;
+
+/// Hasher for [`Tags`] keys: foldhash with a per-process random seed. Tag maps are small and hashed on every
+/// lookup (profiles call `tags.get(..)` many times per feature), so SipHash was a measurable share of OSM decoding and
+/// profile time; and unlike `std::hash::RandomState::new()`, creating one is free (no thread-local access).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TagsHasher;
+
+impl std::hash::BuildHasher for TagsHasher {
+    type Hasher = foldhash::fast::FoldHasher<'static>;
+
+    #[inline(always)]
+    fn build_hasher(&self) -> Self::Hasher {
+        foldhash::fast::FoldHasher::with_seed(0x243f_6a88_85a3_08d3, foldhash::SharedSeed::global_random())
+    }
+}
+
+/// An empty [`Tags`] map with room for `capacity` entries.
+#[inline]
+pub fn tags_with_capacity(capacity: usize) -> Tags {
+    Tags::with_capacity_and_hasher(capacity, TagsHasher)
+}
 
 /// A dynamically-typed attribute value, equivalent to the `Object` values used for tags in Java Planetiler.
 ///
@@ -293,9 +316,9 @@ impl<T: Into<Value>> From<Vec<T>> for Value {
 /// Build a [`Tags`] map: `tags!{"highway" => "primary", "lanes" => 2}`.
 #[macro_export]
 macro_rules! tags {
-  () => { $crate::value::Tags::new() };
+  () => { $crate::value::Tags::default() };
   ($($k:expr => $v:expr),+ $(,)?) => {{
-    let mut m = $crate::value::Tags::new();
+    let mut m = $crate::value::Tags::default();
     $(m.insert(::std::string::String::from($k), $crate::value::Value::from($v));)+
     m
   }};

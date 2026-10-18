@@ -853,7 +853,7 @@ pub(crate) mod tests {
 
     /// Java `ExpressionTestUtil.featureWithTags`: a point feature with string tags.
     pub(crate) fn feature_with_tags(kvs: &[(&str, Option<&str>)]) -> TestFeature {
-        let mut tags = Tags::new();
+        let mut tags = Tags::default();
         for (k, v) in kvs {
             tags.insert(k.to_string(), v.map_or(Value::Null, Value::str));
         }

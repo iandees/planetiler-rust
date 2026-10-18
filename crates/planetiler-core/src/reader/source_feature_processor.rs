@@ -546,7 +546,7 @@ mod tests {
         fn read_features(&self, next: &mut crate::reader::simple_reader::FeatureSink<'_>) -> anyhow::Result<()> {
             let layer = self.path.to_string_lossy().into_owned();
             let empty = geo_types::Geometry::MultiPoint(geo_types::MultiPoint(vec![]));
-            next(ReaderFeature::new(empty, Tags::new(), Some(layer.as_str().into()), 0))?;
+            next(ReaderFeature::new(empty, Tags::default(), Some(layer.as_str().into()), 0))?;
             self.emitted.lock().push(layer);
             Ok(())
         }
@@ -610,7 +610,7 @@ mod tests {
             self.finished.lock().push(source_name.to_string());
             let feature = crate::reader::simple_feature::SimpleFeature::create(
                 geo_types::Point::new(0.0, 0.0),
-                Tags::new(),
+                Tags::default(),
                 source_name,
                 "finish",
                 -1,

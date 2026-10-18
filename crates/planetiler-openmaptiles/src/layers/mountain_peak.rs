@@ -434,7 +434,7 @@ mod tests {
 
         assert_eq!(
             vec![vt_point_feature(LAYER_NAME, tags! {"rank" => 1}, 1)],
-            t.post_process(LAYER_NAME, 13, vec![vt_point_feature(LAYER_NAME, Tags::new(), 1)])
+            t.post_process(LAYER_NAME, 13, vec![vt_point_feature(LAYER_NAME, Tags::default(), 1)])
         );
 
         assert_eq!(
@@ -466,10 +466,10 @@ mod tests {
                 LAYER_NAME,
                 13,
                 vec![
-                    feature(1, -64.0, Tags::new(), 1),
-                    feature(2, -65.0, Tags::new(), 1),
-                    feature(3, 256.0 + 64.0, Tags::new(), 2),
-                    feature(4, 256.0 + 65.0, Tags::new(), 2),
+                    feature(1, -64.0, Tags::default(), 1),
+                    feature(2, -65.0, Tags::default(), 1),
+                    feature(3, 256.0 + 64.0, Tags::default(), 2),
+                    feature(4, 256.0 + 65.0, Tags::default(), 2),
                 ]
             )
         );

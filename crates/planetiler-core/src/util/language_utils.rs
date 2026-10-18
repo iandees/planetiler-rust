@@ -322,7 +322,7 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn test_helpers() {
-        let mut tags = Tags::new();
+        let mut tags = Tags::default();
         put_if_not_empty(&mut tags, "a", "");
         put_if_not_empty(&mut tags, "b", Value::Null);
         put_if_not_empty(&mut tags, "c", "x");

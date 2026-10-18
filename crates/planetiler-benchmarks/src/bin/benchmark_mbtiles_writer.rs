@@ -5,6 +5,11 @@
 //! --bench_distinct_tile_data_size=800 --bench_dupe_tile_data_size=100 --bench_dupe_spread=10`, plus any mbtiles
 //! options like `--compact=false`, `--no_index=true` or sqlite pragmas.
 
+// see the `mimalloc` feature in Cargo.toml
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::time::Instant;
 
 use indexmap::IndexMap;

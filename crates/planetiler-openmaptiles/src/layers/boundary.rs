@@ -754,9 +754,9 @@ mod tests {
             4,
             "boundary",
             &[
-                &t.process(&ne_line(Tags::new(), "ne_110m_admin_0_boundary_lines_land", 0)),
-                &t.process(&ne_line(Tags::new(), "ne_50m_admin_0_boundary_lines_land", 1)),
-                &t.process(&ne_line(Tags::new(), "ne_10m_admin_0_boundary_lines_land", 2)),
+                &t.process(&ne_line(Tags::default(), "ne_110m_admin_0_boundary_lines_land", 0)),
+                &t.process(&ne_line(Tags::default(), "ne_50m_admin_0_boundary_lines_land", 1)),
+                &t.process(&ne_line(Tags::default(), "ne_10m_admin_0_boundary_lines_land", 2)),
             ],
         );
 
@@ -867,7 +867,7 @@ mod tests {
             &t.process(&ne_line(tags! {"min_zoom" => 7.6}, layer, 0)),
         );
         assert_features(0, &[], &t.process(&ne_line(tags! {"min_zoom" => 7.9}, layer, 0)));
-        assert_features(0, &[], &t.process(&ne_line(Tags::new(), layer, 0)));
+        assert_features(0, &[], &t.process(&ne_line(Tags::default(), layer, 0)));
     }
 
     #[test]
@@ -887,7 +887,7 @@ mod tests {
                 "_layer" => "boundary", "_type" => "line", "disputed" => 0, "maritime" => 0, "admin_level" => 10,
                 "_minzoom" => 12, "_maxzoom" => 14, "_buffer" => 4.0, "_minpixelsize" => 0.0,
             }],
-            &t.process(&line_feature_with_relation(infos(&t, &rel), Tags::new())),
+            &t.process(&line_feature_with_relation(infos(&t, &rel), Tags::default())),
         );
     }
 
@@ -901,7 +901,7 @@ mod tests {
                 "_layer" => "boundary", "_type" => "line", "disputed" => 0, "maritime" => 0, "admin_level" => 3,
                 "_minzoom" => 5, "_maxzoom" => 14, "_buffer" => 4.0, "_minpixelsize" => 0.0,
             }],
-            &t.process(&line_feature_with_relation(infos(&t, &rel), Tags::new())),
+            &t.process(&line_feature_with_relation(infos(&t, &rel), Tags::default())),
         );
     }
 
@@ -921,7 +921,7 @@ mod tests {
         assert_features(
             14,
             &[tags! {"_layer" => "boundary", "_type" => "line", "disputed" => 0, "maritime" => 0, "admin_level" => 4}],
-            &t.process(&line_feature_with_relation(all, Tags::new())),
+            &t.process(&line_feature_with_relation(all, Tags::default())),
         );
     }
 
@@ -974,7 +974,7 @@ mod tests {
                 "_layer" => "boundary", "_type" => "line", "disputed_name" => "BorderA-B", "claimed_by" => "A",
                 "disputed" => 1, "maritime" => 0, "admin_level" => 5,
             }],
-            &t.process(&line_feature_with_relation(infos(&t, &rel), Tags::new())),
+            &t.process(&line_feature_with_relation(infos(&t, &rel), Tags::default())),
         );
     }
 
@@ -1021,7 +1021,7 @@ mod tests {
         assert_features(
             14,
             &[tags! {"_layer" => "boundary", "_type" => "line", "disputed" => 0, "maritime" => 0, "admin_level" => 2}],
-            &t.process(&line_feature_with_relation(infos(&t, &rel), Tags::new())),
+            &t.process(&line_feature_with_relation(infos(&t, &rel), Tags::default())),
         );
     }
 
@@ -1059,7 +1059,7 @@ mod tests {
     #[test]
     fn test_country_left_right_name() {
         let t = LayerTest::new();
-        let features = setup_country_left_right_name_test(&t, Tags::new());
+        let features = setup_country_left_right_name_test(&t, Tags::default());
         assert_eq!(3, features.len());
 
         // ensure shared edge has country labels on right sides, from z5
@@ -1110,7 +1110,7 @@ mod tests {
         let t = LayerTest::new();
         let country1 = country(1, "C1");
         let line = new_line_string(&[0.0, 0.0, 0.0, 10.0, 5.0, 5.0]);
-        assert_features(14, &[], &t.process(&fake_osm(line, Tags::new(), 3, infos(&t, &country1))));
+        assert_features(14, &[], &t.process(&fake_osm(line, Tags::default(), 3, infos(&t, &country1))));
         let features = finish(&t);
         assert_submaps_any_order(
             &[tags! {
@@ -1127,7 +1127,7 @@ mod tests {
         let country1 = country(1, "C1");
         for (min, max) in [(0.0, 10.0), (1.0, 9.0)] {
             let ring = geo_utils::polygon_to_line_string(&rectangle(min, max).into()).unwrap();
-            assert_features(14, &[], &t.process(&fake_osm(ring, Tags::new(), 3, infos(&t, &country1))));
+            assert_features(14, &[], &t.process(&fake_osm(ring, Tags::default(), 3, infos(&t, &country1))));
         }
         let features = finish(&t);
         assert_submaps_any_order(
@@ -1143,7 +1143,7 @@ mod tests {
         let line = geo_utils::world_to_lat_lon_coords(
             &new_line_string(&[0.0, 0.0, 0.1, 0.0, 0.1, 0.1, 0.02, 0.1, 0.02, -0.02]).into(),
         );
-        assert_features(14, &[], &t.process(&fake_osm(line, Tags::new(), 3, infos(&t, &country1))));
+        assert_features(14, &[], &t.process(&fake_osm(line, Tags::default(), 3, infos(&t, &country1))));
         let features = finish(&t);
         assert_submaps_any_order(
             &[tags! {"adm0_l" => "<null>", "adm0_r" => "<null>"}],
@@ -1158,11 +1158,11 @@ mod tests {
         let bad = geo_utils::world_to_lat_lon_coords(
             &new_line_string(&[0.0, 0.0, 0.1, 0.0, 0.1, 0.1, 0.2, 0.1, 0.2, -0.2]).into(),
         );
-        assert_features(14, &[], &t.process(&fake_osm(bad, Tags::new(), 3, infos(&t, &country1))));
+        assert_features(14, &[], &t.process(&fake_osm(bad, Tags::default(), 3, infos(&t, &country1))));
         let good = geo_utils::world_to_lat_lon_coords(
             &geo_utils::polygon_to_line_string(&rectangle(0.2, 0.3).into()).unwrap(),
         );
-        assert_features(14, &[], &t.process(&fake_osm(good, Tags::new(), 3, infos(&t, &country1))));
+        assert_features(14, &[], &t.process(&fake_osm(good, Tags::default(), 3, infos(&t, &country1))));
         let features = finish(&t);
         assert_submaps_any_order(
             &[tags! {"adm0_l" => "<null>", "adm0_r" => "<null>"}, tags! {"adm0_l" => "<null>", "adm0_r" => "C1"}],
@@ -1194,7 +1194,7 @@ mod tests {
         assert_features(
             14,
             &[tags! {"_minzoom" => 0}],
-            &osm_only.process(&line_feature_with_relation(infos(&t, &rel), Tags::new())),
+            &osm_only.process(&line_feature_with_relation(infos(&t, &rel), Tags::default())),
         );
         assert_features(
             14,
@@ -1205,7 +1205,7 @@ mod tests {
         assert_features(
             14,
             &[tags! {"_minzoom" => 1}],
-            &osm_only.process(&line_feature_with_relation(infos(&t, &rel), Tags::new())),
+            &osm_only.process(&line_feature_with_relation(infos(&t, &rel), Tags::default())),
         );
     }
 

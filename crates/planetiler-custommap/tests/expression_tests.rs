@@ -198,7 +198,7 @@ fn test_variable() {
     let feature =
         SimpleFeature::create(new_point(0.0, 0.0), tags! {"a" => "b", "c" => 1}, "source", "source_layer", 99);
     let r = root();
-    let tvp = tvp(Tags::new());
+    let tvp = tvp(Tags::default());
     let context = r.create_process_feature_context(&feature, &tvp);
     let sig = feature_signature();
     assert_eq!(
@@ -235,7 +235,7 @@ fn test_dynamic() {
 fn test_match() {
     let feature = SimpleFeature::create_tags(new_point(0.0, 0.0), tags! {"a" => "b", "c" => 1});
     let r = root();
-    let tvp = tvp(Tags::new());
+    let tvp = tvp(Tags::default());
     let context = r.create_process_feature_context(&feature, &tvp);
     let sig = feature_signature();
     // simple match
@@ -593,7 +593,7 @@ fn test_get_tag() {
     let feature = SimpleFeature::create(new_point(0.0, 0.0), tags! {"abc" => "123"}, "source", "source_layer", 99);
     let r = root();
     let sig = feature_signature().with_output(OutType::Object);
-    let empty = tvp(Tags::new());
+    let empty = tvp(Tags::default());
     let int_tvp = tvp(tags! {"abc" => "integer"});
     assert_eq!(
         Value::str("123"),
@@ -616,7 +616,7 @@ fn test_get_tag() {
 fn test_cast_get_tag() {
     let feature = SimpleFeature::create(new_point(0.0, 0.0), tags! {"abc" => "123"}, "source", "source_layer", 99);
     let r = root();
-    let empty = tvp(Tags::new());
+    let empty = tvp(Tags::default());
     let context = r.create_process_feature_context(&feature, &empty);
     let sig = feature_signature();
     let expression = cast(
@@ -653,7 +653,7 @@ fn test_simplify_cast() {
 #[test]
 fn test_simplify_get_arg() {
     let args = Arguments::of_pairs([("arg", "12")]);
-    let root = build_root_context(&args, &Tags::new()).unwrap();
+    let root = build_root_context(&args, &Tags::default()).unwrap();
     let context = signature(&root.description(), OutType::Integer);
     assert_eq!(const_of(12), get_arg(context.clone(), const_of("arg")).simplify());
     assert_eq!(const_of(12), script(context.clone(), "args.arg").unwrap().simplify());
@@ -717,7 +717,7 @@ fn map(pairs: Vec<(&str, Value)>) -> Value {
 
 #[test]
 fn test_parse_empty_args() {
-    build_root_context(&args(&[]), &Tags::new()).unwrap();
+    build_root_context(&args(&[]), &Tags::default()).unwrap();
 }
 
 #[test]

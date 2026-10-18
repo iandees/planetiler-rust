@@ -56,7 +56,7 @@ fn list_items(values: &ArrayRef, item: &Field, range: std::ops::Range<usize>) ->
 }
 
 fn struct_value(array: &StructArray, row: usize) -> Value {
-    let mut map = Tags::with_capacity(array.num_columns());
+    let mut map = crate::value::tags_with_capacity(array.num_columns());
     for (field, column) in array.fields().iter().zip(array.columns()) {
         if let Some(v) = array_value(column, row) {
             map.insert(field.name().clone(), v);
@@ -70,7 +70,7 @@ fn map_value(array: &MapArray, row: usize) -> Value {
     let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
     let keys = array.keys();
     let values = array.values();
-    let mut map = Tags::with_capacity(end - start);
+    let mut map = crate::value::tags_with_capacity(end - start);
     for i in start..end {
         if let (Some(k), Some(v)) = (array_value(keys, i), array_value(values, i))
             && !v.is_null()
@@ -163,7 +163,7 @@ impl ParquetRecordConverter {
     /// Converts `row` of `batch` to tags, skipping null columns and column `skip`.
     pub fn convert_row_skipping(&self, batch: &RecordBatch, row: usize, skip: Option<usize>) -> Tags {
         let schema = batch.schema_ref();
-        let mut tags = Tags::with_capacity(batch.num_columns());
+        let mut tags = crate::value::tags_with_capacity(batch.num_columns());
         for (i, column) in batch.columns().iter().enumerate() {
             if Some(i) == skip {
                 continue;

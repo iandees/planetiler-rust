@@ -353,7 +353,7 @@ impl HighwayClassTable {
         for a in &domains[0] {
             for b in &domains[1] {
                 for c in &domains[2] {
-                    let mut tags = Tags::new();
+                    let mut tags = Tags::default();
                     for (k, v) in CLASS_KEYS.iter().zip([a, b, c]) {
                         if let Some(v) = v {
                             tags.insert((*k).to_string(), Value::from(*v));

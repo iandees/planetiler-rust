@@ -135,7 +135,7 @@ mod tests {
         .unwrap();
         let mbtiles = Mbtiles::new_read_only_database(&db_path).unwrap();
         assert_metadata(&mbtiles, "Parks Overlay");
-        assert_num_features(&mbtiles, "parks", 14, &Tags::new(), 53, GeometryType::Polygon);
+        assert_num_features(&mbtiles, "parks", 14, &Tags::default(), 53, GeometryType::Polygon);
         assert_tile_duplicates(&mbtiles, 0);
     }
 }

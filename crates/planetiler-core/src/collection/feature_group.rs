@@ -747,7 +747,7 @@ impl TileFeatures {
         let geom_type = decode_geom_type(geom_type_and_scale);
         let scale = decode_scale(geom_type_and_scale);
         let map_size = r.map_len()?;
-        let mut attrs = Tags::with_capacity(map_size);
+        let mut attrs = crate::value::tags_with_capacity(map_size);
         let strings = &self.shared.common_value_strings;
         for _ in 0..map_size {
             let key = strings.decode(r.int()? as u32)?;
@@ -1576,7 +1576,20 @@ mod tests {
             );
             pipeline.await_done().unwrap();
             drop(pipeline);
-            let mut group = Arc::into_inner(group).expect("unique");
+            // worker threads may still be dropping their clones of the processing closure (and its `g2`) right after
+            // the pipeline reports done
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut shared = group;
+            let mut group = loop {
+                match Arc::try_unwrap(shared) {
+                    Ok(group) => break group,
+                    Err(still_shared) if std::time::Instant::now() < deadline => {
+                        shared = still_shared;
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => panic!("feature group still shared"),
+                }
+            };
             let tiles: Vec<u64> = group.iter().unwrap().map(|t| t.tile_coord().encoded).collect();
             assert_eq!(vec![1, 2, 3], tiles, "inline={inline}");
         }
