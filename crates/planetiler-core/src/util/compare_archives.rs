@@ -2,19 +2,36 @@
 //!
 //! To run: `planetiler compare [options] {path/to/archive1} {path/to/archive2}`
 //!
-//! Difference from Java: when two tiles have different bytes, this decodes them and only reports a tile diff if the
-//! decoded contents differ. Layers are paired by name (not position), feature tags are compared as decoded key/value
-//! pairs (so a different order of the layer `keys`/`values` tables or of the layers themselves doesn't count), and
-//! geometries whose command streams differ but decode to the same geometry are equal. Tiles that only differ in
-//! encoding are counted in [`CompareResult::equivalent_tiles`].
+//! Options: `--verbose` (log every differing feature), `--ignore-ids` (don't compare feature IDs), `--examples=N`
+//! (example differing features to log per layer, default 5), `--strict` (default true: also fail on archive-level
+//! differences such as metadata).
+//!
+//! Difference from Java: tiles with identical bytes (or identical decompressed bytes) are skipped without decoding.
+//! Other tiles are decoded and compared as a *normalized multiset of features* per layer instead of command by
+//! command (the check used to compare this port's output against Java planetiler):
+//!
+//! - layers are paired by name, so the order of layers in a tile doesn't matter;
+//! - features in a layer are compared as a multiset keyed on `(geometry type, normalized geometry, tags[, id])`, so
+//!   feature order doesn't matter;
+//! - tags are resolved through the layer key/value tables and compared as a map (table order and tag order don't
+//!   matter; integers compare by value whatever their encoding);
+//! - geometries are decoded to absolute tile coordinates (so different command streams for the same geometry are
+//!   equal); points of a multipoint and lines of a multilinestring are sorted; polygons are split into polygons by
+//!   ring orientation (exterior rings have positive MVT area), every ring is rotated to start at its smallest vertex
+//!   (orientation is kept, it is meaningful in MVT), holes are sorted within their polygon and polygons are sorted;
+//! - feature IDs are part of the key unless `--ignore-ids`; differing features that match once the ID is dropped are
+//!   reported separately as "id only".
+//!
+//! The result reports, per layer, how many features are only in archive 1 / only in archive 2, per zoom, plus a few
+//! examples. Tiles whose bytes differ but whose normalized contents are equal are counted in
+//! [`CompareResult::equivalent_tiles`].
 
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::Debug;
+use std::collections::{BTreeMap, HashSet};
+use std::fmt::{Debug, Write as _};
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use geo_types::{Geometry, Polygon};
 use parking_lot::Mutex;
 use prost::Message;
 use thiserror::Error;
@@ -25,12 +42,10 @@ use crate::archive::tile_archive_config::{Format, TileArchiveConfig};
 use crate::archive::tile_archives;
 use crate::archive::tile_compression::TileCompression;
 use crate::config::planetiler_config::PlanetilerConfig;
-use crate::geo::geometry_type::GeometryType;
 use crate::geo::tile_coord::TileCoord;
 use crate::pmtiles::readable_pmtiles::ReadablePmtiles;
 use crate::proto::vector_tile as vt;
 use crate::util::gzip::gunzip;
-use crate::vector_tile::VectorGeometry;
 
 /// A comparison failure that prevents comparing the whole archives.
 #[derive(Debug, Error)]
@@ -46,16 +61,60 @@ pub struct CompareResult {
     pub equivalent_tiles: u64,
     pub archive_diffs: Vec<String>,
     pub tile_diff_types: BTreeMap<String, u64>,
+    /// Layer-level issues other than differing features (`version`, `extent`): number of tiles per issue.
     pub tile_diffs_by_layer: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Differing features per layer (after normalization).
+    pub feature_diffs: BTreeMap<String, LayerFeatureDiffs>,
+}
+
+impl CompareResult {
+    /// Total number of features only in archive 1 and only in archive 2 over all layers.
+    pub fn differing_features(&self) -> (u64, u64) {
+        self.feature_diffs.values().fold((0, 0), |(a, b), d| (a + d.only_in_1, b + d.only_in_2))
+    }
+}
+
+/// Features of one layer that have no equal (normalized) feature in the same tile of the other archive.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct LayerFeatureDiffs {
+    pub only_in_1: u64,
+    pub only_in_2: u64,
+    /// Pairs of differing features (one from each side, same tile) that are equal except for the feature ID. Always 0
+    /// with `ignore_ids`.
+    pub id_only: u64,
+    /// Number of tiles where this layer has a differing feature.
+    pub tiles: u64,
+    /// `zoom -> (only_in_1, only_in_2)`.
+    pub by_zoom: BTreeMap<u32, (u64, u64)>,
+    /// Up to [`CompareOptions::examples`] descriptions of differing features from the first tiles (in tile order).
+    pub examples: Vec<(TileCoord, String)>,
+}
+
+/// Options for [`compare`].
+#[derive(Clone, Debug)]
+pub struct CompareOptions {
+    /// Log each tile diff and each differing feature.
+    pub verbose: bool,
+    /// Don't compare feature IDs.
+    pub ignore_ids: bool,
+    /// Example differing features to keep per layer.
+    pub examples: usize,
+}
+
+impl Default for CompareOptions {
+    fn default() -> Self {
+        CompareOptions { verbose: false, ignore_ids: false, examples: 5 }
+    }
 }
 
 struct CompareArchives<'a> {
     diff_types: Mutex<BTreeMap<String, u64>>,
     diffs_by_layer: Mutex<BTreeMap<String, BTreeMap<String, u64>>>,
+    feature_diffs: Mutex<BTreeMap<String, LayerFeatureDiffs>>,
     archive_diffs: Mutex<Vec<String>>,
     input1: &'a TileArchiveConfig,
     input2: &'a TileArchiveConfig,
-    verbose: bool,
+    options: &'a CompareOptions,
 }
 
 /// Compares two archives.
@@ -66,22 +125,30 @@ pub fn compare(
     archive_config1: &TileArchiveConfig,
     archive_config2: &TileArchiveConfig,
     config: &PlanetilerConfig,
-    verbose: bool,
+    options: &CompareOptions,
 ) -> anyhow::Result<CompareResult> {
     CompareArchives {
         diff_types: Mutex::new(BTreeMap::new()),
         diffs_by_layer: Mutex::new(BTreeMap::new()),
+        feature_diffs: Mutex::new(BTreeMap::new()),
         archive_diffs: Mutex::new(Vec::new()),
         input1: archive_config1,
         input2: archive_config2,
-        verbose,
+        options,
     }
     .get_result(config)
 }
 
-/// Logs a comparison result like Java `CompareArchives.main` and returns the process exit code.
+/// Formats `zoom -> (a, b)` as `z13 578/578, z14 1/1`.
+fn format_zooms(by_zoom: &BTreeMap<u32, (u64, u64)>) -> String {
+    by_zoom.iter().map(|(z, (a, b))| format!("z{z} {a}/{b}")).collect::<Vec<_>>().join(", ")
+}
+
+/// Logs a comparison result and returns the process exit code.
 pub fn log_result(result: &CompareResult, strict: bool) -> i32 {
-    info!("Detailed diffs:");
+    if !result.tile_diffs_by_layer.is_empty() {
+        info!("Layer diffs (tiles):");
+    }
     for (layer, diffs) in &result.tile_diffs_by_layer {
         info!("  \"{layer}\" layer");
         let mut entries: Vec<_> = diffs.iter().collect();
@@ -90,23 +157,52 @@ pub fn log_result(result: &CompareResult, strict: bool) -> i32 {
             info!("    {k}: {v}");
         }
     }
+    if !result.tile_diff_types.is_empty() {
+        info!("Tile diffs by type:");
+    }
     let mut entries: Vec<_> = result.tile_diff_types.iter().collect();
     entries.sort_by_key(|(_, v)| **v);
     for (k, v) in entries {
         info!("  {k}: {v}");
     }
+    if !result.archive_diffs.is_empty() {
+        info!("Archive diffs:");
+    }
     for diff in &result.archive_diffs {
         info!("  {diff}");
     }
+    if !result.feature_diffs.is_empty() {
+        info!("Examples of differing features:");
+        for (layer, d) in &result.feature_diffs {
+            for (coord, example) in &d.examples {
+                info!("  {layer} {}/{}/{} {example}", coord.z, coord.x, coord.y);
+            }
+        }
+        info!("Differing features per layer (only in archive 1 / only in archive 2):");
+        let width = result.feature_diffs.keys().map(String::len).max().unwrap_or(0).max(5);
+        info!("  {:width$} {:>9} {:>9} {:>9} {:>7}  by zoom", "layer", "only in 1", "only in 2", "id only", "tiles");
+        for (layer, d) in &result.feature_diffs {
+            info!(
+                "  {layer:width$} {:>9} {:>9} {:>9} {:>7}  {}",
+                d.only_in_1,
+                d.only_in_2,
+                d.id_only,
+                d.tiles,
+                format_zooms(&d.by_zoom)
+            );
+        }
+    }
+    let (only1, only2) = result.differing_features();
     info!("Total tiles: {}", result.total);
     if result.equivalent_tiles > 0 {
-        info!("Tiles with different bytes but equivalent decoded contents: {}", result.equivalent_tiles);
+        info!("Tiles with different bytes but equivalent normalized contents: {}", result.equivalent_tiles);
     }
     info!(
         "Tile diffs: {} ({:.1}% of all tiles)",
         result.tile_diffs,
         result.tile_diffs as f64 * 100.0 / result.total.max(1) as f64
     );
+    info!("Differing features: {only1} only in archive 1, {only2} only in archive 2");
     if result.tile_diffs > 0 || (strict && !result.archive_diffs.is_empty()) { 1 } else { 0 }
 }
 
@@ -120,10 +216,16 @@ pub fn main<S: AsRef<str>>(args: &[S]) -> anyhow::Result<i32> {
     let input1 = TileArchiveConfig::from(args[args.len() - 2].as_ref())?;
     let input2 = TileArchiveConfig::from(args[args.len() - 1].as_ref())?;
     let arguments = crate::config::arguments::Arguments::from_args_or_config_file(&args[..args.len() - 2])?;
-    let verbose = arguments.get_boolean("verbose", "log each tile diff", false);
+    let options = CompareOptions {
+        verbose: arguments.get_boolean("verbose", "log each tile diff and differing feature", false),
+        ignore_ids: arguments.get_boolean("ignore_ids", "don't compare feature IDs", false),
+        examples: arguments.get_integer("examples", "example differing features to log per layer", 5)?.max(0) as usize,
+    };
     let strict = arguments.get_boolean("strict", "set to false to only fail on tile diffs", true);
     let config = PlanetilerConfig::from(&arguments)?;
-    match compare(&input1, &input2, &config, verbose) {
+    info!("archive 1: {}", input1.uri);
+    info!("archive 2: {}", input2.uri);
+    match compare(&input1, &input2, &config, &options) {
         Ok(result) => Ok(log_result(&result, strict)),
         Err(e) if e.is::<FatalComparisonFailure>() => {
             tracing::error!("Error comparing archives {e}");
@@ -266,7 +368,7 @@ impl CompareArchives<'_> {
                                                 decode(&decompressed2)?,
                                             )
                                         };
-                                        let issues = compare_tiles(&tile1, &tile2);
+                                        let issues = compare_tiles(&tile1, &tile2, self.options.ignore_ids);
                                         if issues.is_empty() {
                                             equivalent.fetch_add(1, Ordering::Relaxed);
                                         } else {
@@ -321,6 +423,7 @@ impl CompareArchives<'_> {
             archive_diffs: self.archive_diffs.lock().clone(),
             tile_diff_types: self.diff_types.lock().clone(),
             tile_diffs_by_layer: self.diffs_by_layer.lock().clone(),
+            feature_diffs: std::mem::take(&mut *self.feature_diffs.lock()),
         })
     }
 
@@ -383,18 +486,54 @@ impl CompareArchives<'_> {
         for (layer, issue) in issues.layer {
             self.record_layer_diff(coord, &layer, &issue);
         }
+        if issues.features.is_empty() {
+            return;
+        }
+        let max_examples = self.options.examples;
+        let mut all = self.feature_diffs.lock();
+        for (layer, d) in issues.features {
+            if self.options.verbose {
+                for f in d.only_in_1.iter().map(|f| ("1", f)).chain(d.only_in_2.iter().map(|f| ("2", f))) {
+                    debug!("{coord} layer {layer} only in archive {}: {}", f.0, f.1.describe());
+                }
+            }
+            let entry = all.entry(layer).or_default();
+            let (n1, n2) = (d.only_in_1.len() as u64, d.only_in_2.len() as u64);
+            entry.only_in_1 += n1;
+            entry.only_in_2 += n2;
+            entry.id_only += d.id_only;
+            entry.tiles += 1;
+            let zoom = entry.by_zoom.entry(coord.z).or_default();
+            zoom.0 += n1;
+            zoom.1 += n2;
+            // keep the examples from the first tiles in tile order so the output is deterministic
+            if max_examples > 0
+                && (entry.examples.len() < max_examples || entry.examples.last().is_some_and(|(c, _)| coord < c))
+            {
+                // alternate sides so a tile with many differences shows both versions
+                for i in 0..d.only_in_1.len().max(d.only_in_2.len()).min(max_examples) {
+                    for (n, fs) in [("1", &d.only_in_1), ("2", &d.only_in_2)] {
+                        if let Some(f) = fs.get(i) {
+                            entry.examples.push((*coord, format!("only in {n}: {}", f.describe())));
+                        }
+                    }
+                }
+                entry.examples.sort_by_key(|(c, _)| *c);
+                entry.examples.truncate(max_examples);
+            }
+        }
     }
 
     fn record_layer_diff(&self, coord: &TileCoord, layer: &str, issue: &str) {
         *self.diffs_by_layer.lock().entry(layer.to_string()).or_default().entry(issue.to_string()).or_default() += 1;
-        if self.verbose {
+        if self.options.verbose {
             debug!("{coord} layer {layer} {issue}");
         }
     }
 
     fn record_tile_diff(&self, coord: &TileCoord, issue: &str) {
         *self.diff_types.lock().entry(issue.to_string()).or_default() += 1;
-        if self.verbose {
+        if self.options.verbose {
             debug!("{coord} {issue}");
         }
     }
@@ -405,32 +544,35 @@ impl CompareArchives<'_> {
 struct TileIssues {
     /// Tile-level issues (missing layers).
     tile: Vec<String>,
-    /// `(layer, issue)` pairs.
+    /// `(layer, issue)` pairs for layer-level differences other than features (`version`, `extent`).
     layer: Vec<(String, String)>,
+    /// `(layer, differing features)` for layers with differing features.
+    features: Vec<(String, LayerDiff)>,
 }
 
 impl TileIssues {
     fn is_empty(&self) -> bool {
-        self.tile.is_empty() && self.layer.is_empty()
+        self.tile.is_empty() && self.layer.is_empty() && self.features.is_empty()
     }
 
-    fn push(&mut self, layer: &str, name: &str) {
-        self.layer.push((layer.to_string(), name.to_string()));
-    }
-
-    /// Records a layer diff if `value1 != value2` and returns true if they are equal.
-    fn compare_values<T: PartialEq + ?Sized>(&mut self, layer: &str, name: &str, value1: &T, value2: &T) -> bool {
+    /// Records a layer diff if `value1 != value2`.
+    fn compare_values<T: PartialEq + ?Sized>(&mut self, layer: &str, name: &str, value1: &T, value2: &T) {
         if value1 != value2 {
-            self.push(layer, name);
-            return false;
+            self.layer.push((layer.to_string(), name.to_string()));
         }
-        true
     }
 }
 
+/// The differing features of one layer in one tile.
+struct LayerDiff {
+    only_in_1: Vec<FeatureKey>,
+    only_in_2: Vec<FeatureKey>,
+    id_only: u64,
+}
+
 /// A decoded vector tile value. Integers are compared by value regardless of whether they were encoded as `int`,
-/// `uint` or `sint` (Java decodes all three to a `Long`).
-#[derive(Debug, PartialEq)]
+/// `uint` or `sint` (Java decodes all three to a `Long`); floats compare by bits.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum DecodedValue {
     String(String),
     Float(u32),
@@ -462,10 +604,23 @@ impl From<&vt::tile::Value> for DecodedValue {
     }
 }
 
+impl std::fmt::Display for DecodedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodedValue::String(s) => write!(f, "{s:?}"),
+            DecodedValue::Float(b) => write!(f, "{}", f32::from_bits(*b)),
+            DecodedValue::Double(b) => write!(f, "{}", f64::from_bits(*b)),
+            DecodedValue::Int(i) => write!(f, "{i}"),
+            DecodedValue::Bool(b) => write!(f, "{b}"),
+            DecodedValue::Null => f.write_str("null"),
+        }
+    }
+}
+
 type DecodedTags = Vec<(Option<String>, Option<DecodedValue>)>;
 
-/// The tags of `feature` resolved through the layer's key/value tables and sorted by key, so features compare equal
-/// regardless of how the tables are ordered. Out-of-range indices decode to `None`.
+/// The tags of `feature` resolved through the layer's key/value tables and sorted, so features compare equal
+/// regardless of how the tables or the tags are ordered. Out-of-range indices decode to `None`.
 fn decoded_tags(layer: &vt::tile::Layer, feature: &vt::tile::Feature) -> DecodedTags {
     let mut tags: DecodedTags = feature
         .tags
@@ -476,128 +631,277 @@ fn decoded_tags(layer: &vt::tile::Layer, feature: &vt::tile::Feature) -> Decoded
             (key, value)
         })
         .collect();
-    tags.sort_by(|a, b| a.0.cmp(&b.0));
+    tags.sort();
     tags
 }
 
-fn compare_tiles(proto1: &vt::Tile, proto2: &vt::Tile) -> TileIssues {
+type Point = (i64, i64);
+
+/// A geometry in a canonical form: absolute tile coordinates, independent of ring start points, ring order, and the
+/// order of the parts of multi-geometries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum NormGeometry {
+    /// Sorted points.
+    Points(Vec<Point>),
+    /// Sorted lines (each line keeps its direction).
+    Lines(Vec<Vec<Point>>),
+    /// Sorted polygons, each `[exterior, holes...]` with holes sorted and every ring rotated to start at its smallest
+    /// vertex (orientation is kept).
+    Polygons(Vec<Vec<Vec<Point>>>),
+    /// Unknown geometry type or a command stream that doesn't decode: compared as raw commands.
+    Raw(Vec<u32>),
+}
+
+fn zigzag(v: u32) -> i64 {
+    ((v >> 1) as i64) ^ -((v & 1) as i64)
+}
+
+/// Decodes an MVT command stream into its parts (`MoveTo` starts a part), or `None` if it is malformed.
+fn decode_parts(commands: &[u32]) -> Option<Vec<Vec<Point>>> {
+    let mut parts: Vec<Vec<Point>> = Vec::new();
+    let (mut x, mut y) = (0i64, 0i64);
+    let mut i = 0;
+    while i < commands.len() {
+        let (id, count) = (commands[i] & 7, (commands[i] >> 3) as usize);
+        i += 1;
+        match id {
+            1 | 2 => {
+                let coords = commands.get(i..i + count * 2)?;
+                i += count * 2;
+                for &[dx, dy] in coords.as_chunks::<2>().0 {
+                    x += zigzag(dx);
+                    y += zigzag(dy);
+                    if id == 1 {
+                        parts.push(vec![(x, y)]);
+                    } else {
+                        parts.last_mut()?.push((x, y));
+                    }
+                }
+            }
+            7 => {}
+            _ => return None,
+        }
+    }
+    Some(parts)
+}
+
+/// Twice the signed area of a ring in MVT tile coordinates (y down): positive for exterior rings.
+fn signed_area2(ring: &[Point]) -> i128 {
+    let n = ring.len();
+    (0..n)
+        .map(|i| {
+            let (a, b) = (ring[i], ring[(i + 1) % n]);
+            a.0 as i128 * b.1 as i128 - b.0 as i128 * a.1 as i128
+        })
+        .sum()
+}
+
+/// Rotates a (implicitly closed) ring to its lexicographically smallest rotation that starts at its smallest vertex.
+fn rotate_ring(ring: &mut Vec<Point>) {
+    // an explicit closing point would make rotations unequal
+    if ring.len() > 1 && ring.first() == ring.last() {
+        ring.pop();
+    }
+    let n = ring.len();
+    let Some(&min) = ring.iter().min() else { return };
+    let best = {
+        let r: &[Point] = ring;
+        let rotation = |start: usize| (0..n).map(move |k| r[(start + k) % n]);
+        let mut best: Option<usize> = None;
+        for start in (0..n).filter(|&i| r[i] == min) {
+            best = match best {
+                Some(b) if !rotation(start).lt(rotation(b)) => Some(b),
+                _ => Some(start),
+            };
+        }
+        best.unwrap_or(0)
+    };
+    ring.rotate_left(best);
+}
+
+fn normalize_geometry(geom_type: i32, commands: &[u32]) -> NormGeometry {
+    let Some(mut parts) = decode_parts(commands) else { return NormGeometry::Raw(commands.to_vec()) };
+    match vt::tile::GeomType::try_from(geom_type) {
+        Ok(vt::tile::GeomType::Point) => {
+            let mut points: Vec<Point> = parts.into_iter().flatten().collect();
+            points.sort_unstable();
+            NormGeometry::Points(points)
+        }
+        Ok(vt::tile::GeomType::Linestring) => {
+            parts.sort_unstable();
+            NormGeometry::Lines(parts)
+        }
+        Ok(vt::tile::GeomType::Polygon) => {
+            let mut polygons: Vec<Vec<Vec<Point>>> = Vec::new();
+            for mut ring in parts {
+                let exterior = signed_area2(&ring) > 0;
+                rotate_ring(&mut ring);
+                match polygons.last_mut() {
+                    Some(polygon) if !exterior => polygon.push(ring),
+                    _ => polygons.push(vec![ring]),
+                }
+            }
+            for polygon in &mut polygons {
+                polygon[1..].sort_unstable();
+            }
+            polygons.sort_unstable();
+            NormGeometry::Polygons(polygons)
+        }
+        _ => NormGeometry::Raw(commands.to_vec()),
+    }
+}
+
+/// The normalized identity of a feature: two features are the same if their keys are equal. Ordered by tags first so
+/// sorted differing features from both sides line up.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct FeatureKey {
+    tags: DecodedTags,
+    geom_type: i32,
+    id: Option<u64>,
+    geometry: NormGeometry,
+}
+
+impl FeatureKey {
+    fn new(layer: &vt::tile::Layer, feature: &vt::tile::Feature, ignore_ids: bool) -> FeatureKey {
+        FeatureKey {
+            tags: decoded_tags(layer, feature),
+            geom_type: feature.r#type() as i32,
+            id: if ignore_ids { None } else { Some(feature.id()) },
+            geometry: normalize_geometry(feature.r#type() as i32, &feature.geometry),
+        }
+    }
+
+    /// A one-line summary: type, ID, size of the geometry, and tags.
+    fn describe(&self) -> String {
+        let mut s = vt::tile::GeomType::try_from(self.geom_type)
+            .map(|t| t.as_str_name().to_lowercase())
+            .unwrap_or_else(|_| format!("type {}", self.geom_type));
+        if let Some(id) = self.id {
+            let _ = write!(s, " id={id}");
+        }
+        let _ = match &self.geometry {
+            NormGeometry::Points(p) => write!(s, " {} points", p.len()),
+            NormGeometry::Lines(l) => {
+                write!(s, " {} lines {} points", l.len(), l.iter().map(Vec::len).sum::<usize>())
+            }
+            NormGeometry::Polygons(p) => write!(
+                s,
+                " {} polygons {} rings {} points",
+                p.len(),
+                p.iter().map(Vec::len).sum::<usize>(),
+                p.iter().flatten().map(Vec::len).sum::<usize>()
+            ),
+            NormGeometry::Raw(c) => write!(s, " {} raw commands", c.len()),
+        };
+        let first = match &self.geometry {
+            NormGeometry::Points(p) => p.first(),
+            NormGeometry::Lines(l) => l.first().and_then(|l| l.first()),
+            NormGeometry::Polygons(p) => p.first().and_then(|p| p.first()).and_then(|r| r.first()),
+            NormGeometry::Raw(_) => None,
+        };
+        if let Some((x, y)) = first {
+            let _ = write!(s, " first ({x} {y})");
+        }
+        let tags: Vec<String> = self
+            .tags
+            .iter()
+            .map(|(k, v)| {
+                let v = v.as_ref().map_or("?".to_string(), DecodedValue::to_string);
+                format!("{}={v}", k.as_deref().unwrap_or("?"))
+            })
+            .collect();
+        let _ = write!(s, " {{{}}}", tags.join(", "));
+        s
+    }
+}
+
+fn compare_tiles(proto1: &vt::Tile, proto2: &vt::Tile, ignore_ids: bool) -> TileIssues {
     let mut issues = TileIssues::default();
-    let layers1: Vec<&String> = proto1.layers.iter().map(|l| &l.name).collect();
-    let layers2: Vec<&String> = proto2.layers.iter().map(|l| &l.name).collect();
-    for layer in &layers1 {
-        if !layers2.contains(layer) {
-            issues.tile.push(format!("tile layers 2 missing {layer}"));
+    let names1: HashSet<&str> = proto1.layers.iter().map(|l| l.name.as_str()).collect();
+    let names2: HashSet<&str> = proto2.layers.iter().map(|l| l.name.as_str()).collect();
+    for layer in &proto1.layers {
+        if !names2.contains(layer.name.as_str()) {
+            issues.tile.push(format!("tile layers 2 missing {}", layer.name));
         }
     }
-    for layer in &layers2 {
-        if !layers1.contains(layer) {
-            issues.tile.push(format!("tile layers 1 missing {layer}"));
-        }
-    }
-    // pair layers by name: the order of layers within a tile doesn't affect rendering
-    let mut by_name: HashMap<&str, &vt::tile::Layer> = HashMap::new();
     for layer in &proto2.layers {
-        by_name.entry(&layer.name).or_insert(layer);
+        if !names1.contains(layer.name.as_str()) {
+            issues.tile.push(format!("tile layers 1 missing {}", layer.name));
+        }
     }
-    for layer1 in &proto1.layers {
-        if let Some(layer2) = by_name.remove(layer1.name.as_str()) {
-            compare_layer(&mut issues, layer1, layer2);
+    // pair layers by name: the order of layers within a tile doesn't affect rendering. A layer present on one side
+    // only is compared against an empty layer so its features count as differing features.
+    let mut layers: BTreeMap<&str, (Vec<&vt::tile::Layer>, Vec<&vt::tile::Layer>)> = BTreeMap::new();
+    for layer in &proto1.layers {
+        layers.entry(&layer.name).or_default().0.push(layer);
+    }
+    for layer in &proto2.layers {
+        layers.entry(&layer.name).or_default().1.push(layer);
+    }
+    for (name, (layers1, layers2)) in layers {
+        if let ([layer1], [layer2]) = (&layers1[..], &layers2[..]) {
+            if layer1 == layer2 {
+                continue;
+            }
+            issues.compare_values(name, "version", &layer1.version, &layer2.version);
+            issues.compare_values(name, "extent", &layer1.extent(), &layer2.extent());
+        }
+        if let Some(diff) = compare_layer_features(&layers1, &layers2, ignore_ids) {
+            issues.features.push((name.to_string(), diff));
         }
     }
     issues
 }
 
-fn compare_layer(issues: &mut TileIssues, layer1: &vt::tile::Layer, layer2: &vt::tile::Layer) {
-    let name = &layer1.name;
-    issues.compare_values(name, "version", &layer1.version, &layer2.version);
-    issues.compare_values(name, "extent", &layer1.extent(), &layer2.extent());
-    if issues.compare_values(name, "features count", &layer1.features.len(), &layer2.features.len()) {
-        let ids1: Vec<u64> = layer1.features.iter().map(|f| f.id()).collect();
-        let ids2: Vec<u64> = layer2.features.iter().map(|f| f.id()).collect();
-        let (mut sorted1, mut sorted2) = (ids1.clone(), ids2.clone());
-        sorted1.sort_unstable();
-        sorted2.sort_unstable();
-        if issues.compare_values(name, "feature ids", &sorted1, &sorted2)
-            && issues.compare_values(name, "feature order", &ids1, &ids2)
-        {
-            for (feature1, feature2) in layer1.features.iter().zip(layer2.features.iter()) {
-                issues.compare_values(name, "feature id", &feature1.id(), &feature2.id());
-                compare_geometry(issues, name, feature1, feature2);
-                let (tags1, tags2) = (decoded_tags(layer1, feature1), decoded_tags(layer2, feature2));
-                issues.compare_values(name, "feature tags", &tags1, &tags2);
-            }
-        }
-    }
-}
-
-fn compare_geometry(issues: &mut TileIssues, layer: &str, f1: &vt::tile::Feature, f2: &vt::tile::Feature) {
-    if !issues.compare_values(layer, "feature type", &f1.r#type(), &f2.r#type()) || f1.geometry == f2.geometry {
-        return;
-    }
-    let geom_type = GeometryType::from_protobuf(f1.r#type());
-    let to_geometry = |f: &vt::tile::Feature| {
-        VectorGeometry::new(f.geometry.iter().map(|c| *c as i32).collect::<Vec<_>>(), geom_type, 0).decode()
+/// Compares the features of the layers with the same name as multisets of [`FeatureKey`]s.
+fn compare_layer_features(
+    layers1: &[&vt::tile::Layer],
+    layers2: &[&vt::tile::Layer],
+    ignore_ids: bool,
+) -> Option<LayerDiff> {
+    let features = |layers: &[&vt::tile::Layer]| -> Vec<FeatureKey> {
+        let mut keys: Vec<FeatureKey> =
+            layers.iter().flat_map(|l| l.features.iter().map(|f| FeatureKey::new(l, f, ignore_ids))).collect();
+        keys.sort_unstable();
+        keys
     };
-    let commands_diff = format!("feature {} geometry commands", f1.r#type().as_str_name().to_lowercase());
-    match (to_geometry(f1), to_geometry(f2)) {
-        // different commands that decode to the same geometry (for example split repeated commands) are equivalent
-        (Ok(geom1), Ok(geom2)) if geom1 == geom2 => {}
-        (Ok(geom1), Ok(geom2)) => {
-            issues.push(layer, &commands_diff);
-            compare_decoded_geometry(issues, layer, &geom1, &geom2);
-        }
-        (Err(e), _) | (_, Err(e)) => {
-            tracing::error!("Error decoding geometry: {e}");
-            issues.push(layer, &commands_diff);
-        }
+    let (keys1, keys2) = (features(layers1), features(layers2));
+    if keys1 == keys2 {
+        return None;
     }
+    let (only_in_1, only_in_2) = sorted_difference(keys1, keys2);
+    // pairs of differing features that only differ in their ID
+    let id_only = if ignore_ids {
+        0
+    } else {
+        let strip = |keys: &[FeatureKey]| -> Vec<FeatureKey> {
+            let mut stripped: Vec<FeatureKey> = keys.iter().map(|k| FeatureKey { id: None, ..k.clone() }).collect();
+            stripped.sort_unstable();
+            stripped
+        };
+        let (rest1, _) = sorted_difference(strip(&only_in_1), strip(&only_in_2));
+        (only_in_1.len() - rest1.len()) as u64
+    };
+    Some(LayerDiff { only_in_1, only_in_2, id_only })
 }
 
-/// JTS `Geometry.getGeometryType()` names.
-fn jts_type(g: &Geometry<f64>) -> &'static str {
-    match g {
-        Geometry::Point(_) => "Point",
-        Geometry::MultiPoint(_) => "MultiPoint",
-        Geometry::LineString(_) | Geometry::Line(_) => "LineString",
-        Geometry::MultiLineString(_) => "MultiLineString",
-        Geometry::Polygon(_) | Geometry::Rect(_) | Geometry::Triangle(_) => "Polygon",
-        Geometry::MultiPolygon(_) => "MultiPolygon",
-        Geometry::GeometryCollection(_) => "GeometryCollection",
-    }
-}
-
-fn num_geometries(g: &Geometry<f64>) -> usize {
-    match g {
-        Geometry::MultiPoint(m) => m.0.len(),
-        Geometry::MultiLineString(m) => m.0.len(),
-        Geometry::MultiPolygon(m) => m.0.len(),
-        Geometry::GeometryCollection(c) => c.0.len(),
-        _ => 1,
-    }
-}
-
-/// Port of Java's `compareGeometry(Geometry, Geometry)`: geometry type, number of geometries, and polygon rings.
-fn compare_decoded_geometry(issues: &mut TileIssues, layer: &str, geom1: &Geometry<f64>, geom2: &Geometry<f64>) {
-    let geometry_type = jts_type(geom1);
-    issues.compare_values(layer, "feature JTS geometry type", geometry_type, jts_type(geom2));
-    issues.compare_values(layer, "feature num geometries", &num_geometries(geom1), &num_geometries(geom2));
-    match (geom1, geom2) {
-        (Geometry::MultiPolygon(m1), Geometry::MultiPolygon(m2)) => {
-            for (p1, p2) in m1.0.iter().zip(m2.0.iter()) {
-                compare_polygon(issues, layer, geometry_type, p1, p2);
-            }
-        }
-        (Geometry::Polygon(p1), Geometry::Polygon(p2)) => compare_polygon(issues, layer, geometry_type, p1, p2),
-        _ => {}
-    }
-}
-
-fn compare_polygon(issues: &mut TileIssues, layer: &str, geom_type: &str, p1: &Polygon<f64>, p2: &Polygon<f64>) {
-    issues.compare_values(layer, &format!("{geom_type} exterior ring geometry"), p1.exterior(), p2.exterior());
-    let (holes1, holes2) = (p1.interiors(), p2.interiors());
-    if issues.compare_values(layer, &format!("{geom_type} num interior rings"), &holes1.len(), &holes2.len()) {
-        for (r1, r2) in holes1.iter().zip(holes2.iter()) {
-            issues.compare_values(layer, &format!("{geom_type} interior ring geometry"), r1, r2);
+/// Multiset differences `(a - b, b - a)` of two sorted vectors.
+fn sorted_difference<T: Ord>(a: Vec<T>, b: Vec<T>) -> (Vec<T>, Vec<T>) {
+    let (mut only_a, mut only_b) = (Vec::new(), Vec::new());
+    let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
+    loop {
+        match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) => match x.cmp(y) {
+                std::cmp::Ordering::Less => only_a.push(a.next().unwrap()),
+                std::cmp::Ordering::Greater => only_b.push(b.next().unwrap()),
+                std::cmp::Ordering::Equal => {
+                    a.next();
+                    b.next();
+                }
+            },
+            (Some(_), None) => only_a.push(a.next().unwrap()),
+            (None, Some(_)) => only_b.push(b.next().unwrap()),
+            (None, None) => return (only_a, only_b),
         }
     }
 }
@@ -670,7 +974,7 @@ mod tests {
         let (a, b) = (tmp.path().join("a.pmtiles"), tmp.path().join("b.pmtiles"));
         write(&a, &[(0, gzip(&tile1.encode_to_vec()).unwrap())], TileCompression::Gzip);
         write(&b, &[(0, gzip(&tile2.encode_to_vec()).unwrap())], TileCompression::Gzip);
-        compare(&config_for(&a), &config_for(&b), &PlanetilerConfig::defaults(), false).unwrap()
+        compare(&config_for(&a), &config_for(&b), &PlanetilerConfig::defaults(), &CompareOptions::default()).unwrap()
     }
 
     fn write(path: &Path, tiles: &[(u64, Vec<u8>)], compression: TileCompression) {
@@ -691,9 +995,62 @@ mod tests {
         TileArchiveConfig::from(&path.to_string_lossy()).unwrap()
     }
 
-    fn expected_layer_diffs() -> BTreeMap<String, BTreeMap<String, u64>> {
-        BTreeMap::from([("layer1".to_string(), BTreeMap::from([("feature ids".to_string(), 1)]))])
+    fn compare_tiles_with(tile1: &vt::Tile, tile2: &vt::Tile, options: &CompareOptions) -> CompareResult {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a.pmtiles"), tmp.path().join("b.pmtiles"));
+        write(&a, &[(0, gzip(&tile1.encode_to_vec()).unwrap())], TileCompression::Gzip);
+        write(&b, &[(0, gzip(&tile2.encode_to_vec()).unwrap())], TileCompression::Gzip);
+        compare(&config_for(&a), &config_for(&b), &PlanetilerConfig::defaults(), options).unwrap()
     }
+
+    /// `(only_in_1, only_in_2, id_only)` per layer.
+    fn feature_counts(result: &CompareResult) -> BTreeMap<String, (u64, u64, u64)> {
+        result.feature_diffs.iter().map(|(l, d)| (l.clone(), (d.only_in_1, d.only_in_2, d.id_only))).collect()
+    }
+
+    fn counts(entries: &[(&str, (u64, u64, u64))]) -> BTreeMap<String, (u64, u64, u64)> {
+        entries.iter().map(|(l, c)| (l.to_string(), *c)).collect()
+    }
+
+    fn zz(v: i32) -> u32 {
+        ((v << 1) ^ (v >> 31)) as u32
+    }
+
+    /// Encodes parts given in absolute coordinates as MVT commands, with a `ClosePath` after each part if `close`.
+    fn encode(parts: &[&[(i32, i32)]], close: bool) -> Vec<u32> {
+        let (mut x, mut y) = (0, 0);
+        let mut out = vec![];
+        for part in parts {
+            for (i, &(px, py)) in part.iter().enumerate() {
+                match i {
+                    0 => out.push(9),
+                    1 => out.push(((part.len() as u32 - 1) << 3) | 2),
+                    _ => {}
+                }
+                out.extend([zz(px - x), zz(py - y)]);
+                (x, y) = (px, py);
+            }
+            if close {
+                out.push(15);
+            }
+        }
+        out
+    }
+
+    fn polygon_tile(features: Vec<Vec<&[(i32, i32)]>>) -> vt::Tile {
+        use vt::tile::GeomType::Polygon;
+        let features = features.iter().map(|rings| feature(1, vec![], Polygon, encode(rings, true))).collect();
+        vt::Tile { layers: vec![layer("l", &[], &[], features)] }
+    }
+
+    // exterior rings are clockwise on screen (positive area with y down), holes counterclockwise
+    const SQUARE: &[(i32, i32)] = &[(0, 0), (10, 0), (10, 10), (0, 10)];
+    const SQUARE_ROTATED: &[(i32, i32)] = &[(10, 10), (0, 10), (0, 0), (10, 0)];
+    const SQUARE_REVERSED: &[(i32, i32)] = &[(0, 0), (0, 10), (10, 10), (10, 0)];
+    const HOLE1: &[(i32, i32)] = &[(1, 1), (1, 2), (2, 2), (2, 1)];
+    const HOLE2: &[(i32, i32)] = &[(5, 5), (5, 6), (6, 6), (6, 5)];
+    const HOLE2_ROTATED: &[(i32, i32)] = &[(6, 6), (6, 5), (5, 5), (5, 6)];
+    const SQUARE2: &[(i32, i32)] = &[(20, 0), (30, 0), (30, 10), (20, 10)];
 
     #[test]
     fn test_compare_archives() {
@@ -707,7 +1064,9 @@ mod tests {
             &[(1, vec![0xa, 0x2]), (2, gzip(&tile2).unwrap()), (3, vec![0xa, 0x2]), (4, vec![0xa, 0x2])],
             TileCompression::Gzip,
         );
-        let result = compare(&config_for(&a), &config_for(&b), &PlanetilerConfig::defaults(), false).unwrap();
+        let result =
+            compare(&config_for(&a), &config_for(&b), &PlanetilerConfig::defaults(), &CompareOptions::default())
+                .unwrap();
         assert_eq!(
             CompareResult {
                 total: 5,
@@ -719,10 +1078,17 @@ mod tests {
                     ("archive 1 missing tile".into(), 2),
                     ("different contents".into(), 1),
                 ]),
-                tile_diffs_by_layer: expected_layer_diffs(),
+                tile_diffs_by_layer: BTreeMap::new(),
+                feature_diffs: result.feature_diffs.clone(),
             },
             result
         );
+        assert_eq!(counts(&[("layer1", (1, 1, 1))]), feature_counts(&result));
+        let d = &result.feature_diffs["layer1"];
+        assert_eq!((1, BTreeMap::from([(1, (1, 1))])), (d.tiles, d.by_zoom.clone()));
+        assert_eq!(2, d.examples.len(), "{:?}", d.examples);
+        assert!(d.examples[0].1.starts_with("only in 1: unknown id=1 0 raw commands {}"), "{d:?}");
+        assert_eq!(1, log_result(&result, false));
     }
 
     #[test]
@@ -735,22 +1101,20 @@ mod tests {
         let b2 = gzip(&vt_tile("value2", 2)).unwrap();
         write(&a, &[(0, a1.clone()), (2, a2), (4, a1.clone())], TileCompression::None);
         write(&b, &[(1, b1.clone()), (2, b2), (3, b1.clone()), (4, b1)], TileCompression::Gzip);
-        let result = compare(&config_for(&a), &config_for(&b), &PlanetilerConfig::defaults(), false).unwrap();
+        let result =
+            compare(&config_for(&a), &config_for(&b), &PlanetilerConfig::defaults(), &CompareOptions::default())
+                .unwrap();
+        assert_eq!(vec!["metadata", "pmtiles header", "tile compression"], result.archive_diffs);
         assert_eq!(
-            CompareResult {
-                total: 5,
-                tile_diffs: 4,
-                equivalent_tiles: 0,
-                archive_diffs: vec!["metadata".into(), "pmtiles header".into(), "tile compression".into()],
-                tile_diff_types: BTreeMap::from([
-                    ("archive 2 missing tile".into(), 1),
-                    ("archive 1 missing tile".into(), 2),
-                    ("different decompressed contents".into(), 1),
-                ]),
-                tile_diffs_by_layer: expected_layer_diffs(),
-            },
-            result
+            BTreeMap::from([
+                ("archive 2 missing tile".into(), 1),
+                ("archive 1 missing tile".into(), 2),
+                ("different decompressed contents".into(), 1),
+            ]),
+            result.tile_diff_types
         );
+        assert_eq!((5, 4), (result.total, result.tile_diffs));
+        assert_eq!(counts(&[("layer1", (1, 1, 1))]), feature_counts(&result));
     }
 
     #[test]
@@ -760,7 +1124,9 @@ mod tests {
         let a1 = vec![0xa, 0x2];
         write(&a, &[(0, a1.clone()), (2, a1.clone())], TileCompression::Gzip);
         write(&b, &[(0, a1.clone()), (2, a1)], TileCompression::Gzip);
-        let result = compare(&config_for(&a), &config_for(&b), &PlanetilerConfig::defaults(), false).unwrap();
+        let result =
+            compare(&config_for(&a), &config_for(&b), &PlanetilerConfig::defaults(), &CompareOptions::default())
+                .unwrap();
         assert_eq!(CompareResult { total: 2, ..Default::default() }, result);
     }
 
@@ -774,8 +1140,18 @@ mod tests {
         assert_eq!(1, result.equivalent_tiles);
         assert!(result.tile_diff_types.is_empty(), "{result:?}");
         assert!(result.tile_diffs_by_layer.is_empty(), "{result:?}");
+        assert!(result.feature_diffs.is_empty(), "{result:?}");
         assert!(!result.archive_diffs.iter().any(|d| d.starts_with("mismatch")), "{result:?}");
         assert_eq!(0, log_result(&result, false));
+    }
+
+    #[test]
+    fn test_tag_order_is_equivalent() {
+        // same tables, tags listed in a different order in the feature
+        let tile1 = vt::Tile { layers: vec![layer("l", &["a", "b"], &["x", "y"], vec![point(1, vec![0, 0, 1, 1])])] };
+        let tile2 = vt::Tile { layers: vec![layer("l", &["a", "b"], &["x", "y"], vec![point(1, vec![1, 1, 0, 0])])] };
+        let result = compare_tile_bytes(&tile1, &tile2);
+        assert_eq!((0, 1), (result.tile_diffs, result.equivalent_tiles), "{result:?}");
     }
 
     #[test]
@@ -785,9 +1161,14 @@ mod tests {
         let result = compare_tile_bytes(&tile1, &tile2);
         assert_eq!(1, result.tile_diffs);
         assert_eq!(0, result.equivalent_tiles);
-        assert_eq!(BTreeMap::from([("l".to_string(), BTreeMap::from([("feature tags".to_string(), 1)]))]), {
-            result.tile_diffs_by_layer
-        });
+        assert_eq!(counts(&[("l", (1, 1, 0))]), feature_counts(&result));
+        assert_eq!(
+            vec![
+                "only in 1: point id=1 1 points first (1 1) {a=\"x\"}",
+                "only in 2: point id=1 1 points first (1 1) {a=\"z\"}"
+            ],
+            result.feature_diffs["l"].examples.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -808,17 +1189,15 @@ mod tests {
         );
         assert_eq!(1, result.tile_diffs);
         assert_eq!(BTreeMap::from([("different contents".to_string(), 1)]), result.tile_diff_types);
-        assert_eq!(
-            BTreeMap::from([("roads".to_string(), BTreeMap::from([("feature tags".to_string(), 1)]))]),
-            result.tile_diffs_by_layer
-        );
-        // missing layers are still reported
+        assert_eq!(counts(&[("roads", (1, 1, 0))]), feature_counts(&result));
+        // missing layers are still reported, and their features count as differing features
         let result =
             compare_tile_bytes(&vt::Tile { layers: vec![water(), roads("a")] }, &vt::Tile { layers: vec![water()] });
         assert_eq!(
             BTreeMap::from([("tile layers 2 missing roads".to_string(), 1), ("different contents".to_string(), 1)]),
-            { result.tile_diff_types }
+            { result.tile_diff_types.clone() }
         );
+        assert_eq!(counts(&[("roads", (1, 0, 0))]), feature_counts(&result));
     }
 
     #[test]
@@ -845,32 +1224,158 @@ mod tests {
         // a different geometry is a diff
         let result = compare_tile_bytes(&line(vec![9, 0, 0, 18, 2, 0, 0, 2]), &line(vec![9, 0, 0, 18, 2, 0, 0, 4]));
         assert_eq!(1, result.tile_diffs);
+        assert_eq!(counts(&[("l", (1, 1, 0))]), feature_counts(&result));
+        // the order of the lines of a multilinestring doesn't matter, their direction does
+        let a: &[(i32, i32)] = &[(0, 0), (5, 5)];
+        let b: &[(i32, i32)] = &[(10, 0), (10, 5), (12, 7)];
+        let b_reversed: &[(i32, i32)] = &[(12, 7), (10, 5), (10, 0)];
+        let result = compare_tile_bytes(&line(encode(&[a, b], false)), &line(encode(&[b, a], false)));
+        assert_eq!((0, 1), (result.tile_diffs, result.equivalent_tiles), "{result:?}");
+        let result = compare_tile_bytes(&line(encode(&[a, b], false)), &line(encode(&[a, b_reversed], false)));
+        assert_eq!(1, result.tile_diffs, "{result:?}");
+    }
+
+    #[test]
+    fn test_multipoint_order_is_equivalent() {
+        use vt::tile::GeomType::Point;
+        let points = |geometry: Vec<u32>| vt::Tile {
+            layers: vec![layer("l", &[], &[], vec![feature(1, vec![], Point, geometry)])],
+        };
+        // MoveTo x2: (1,1) (3,3) vs (3,3) (1,1)
+        let result = compare_tile_bytes(&points(vec![17, 2, 2, 4, 4]), &points(vec![17, 6, 6, 3, 3]));
+        assert_eq!((0, 1), (result.tile_diffs, result.equivalent_tiles), "{result:?}");
+    }
+
+    #[test]
+    fn test_ring_start_point_is_equivalent() {
+        let result = compare_tile_bytes(&polygon_tile(vec![vec![SQUARE]]), &polygon_tile(vec![vec![SQUARE_ROTATED]]));
+        assert_eq!((0, 1), (result.tile_diffs, result.equivalent_tiles), "{result:?}");
+        // holes too
+        let result = compare_tile_bytes(
+            &polygon_tile(vec![vec![SQUARE, HOLE2]]),
+            &polygon_tile(vec![vec![SQUARE_ROTATED, HOLE2_ROTATED]]),
+        );
+        assert_eq!((0, 1), (result.tile_diffs, result.equivalent_tiles), "{result:?}");
+    }
+
+    #[test]
+    fn test_ring_orientation_matters() {
+        // a reversed ring is a hole in MVT, not the same polygon
+        let result = compare_tile_bytes(&polygon_tile(vec![vec![SQUARE]]), &polygon_tile(vec![vec![SQUARE_REVERSED]]));
+        assert_eq!(1, result.tile_diffs, "{result:?}");
+        assert_eq!(counts(&[("l", (1, 1, 0))]), feature_counts(&result));
+    }
+
+    #[test]
+    fn test_ring_order_is_equivalent() {
+        // holes in a different order
+        let result = compare_tile_bytes(
+            &polygon_tile(vec![vec![SQUARE, HOLE1, HOLE2]]),
+            &polygon_tile(vec![vec![SQUARE_ROTATED, HOLE2_ROTATED, HOLE1]]),
+        );
+        assert_eq!((0, 1), (result.tile_diffs, result.equivalent_tiles), "{result:?}");
+        // polygons of a multipolygon in a different order
+        let result = compare_tile_bytes(
+            &polygon_tile(vec![vec![SQUARE, HOLE1, SQUARE2]]),
+            &polygon_tile(vec![vec![SQUARE2, SQUARE_ROTATED, HOLE1]]),
+        );
+        assert_eq!((0, 1), (result.tile_diffs, result.equivalent_tiles), "{result:?}");
+        // a hole attached to a different exterior is a different geometry
+        let result = compare_tile_bytes(
+            &polygon_tile(vec![vec![SQUARE, HOLE1, SQUARE2]]),
+            &polygon_tile(vec![vec![SQUARE, SQUARE2, HOLE1]]),
+        );
+        assert_eq!(1, result.tile_diffs, "{result:?}");
+    }
+
+    #[test]
+    fn test_feature_order_is_equivalent() {
+        let result = compare_tile_bytes(
+            &polygon_tile(vec![vec![SQUARE], vec![SQUARE2], vec![SQUARE]]),
+            &polygon_tile(vec![vec![SQUARE2], vec![SQUARE_ROTATED], vec![SQUARE]]),
+        );
+        assert_eq!((0, 1), (result.tile_diffs, result.equivalent_tiles), "{result:?}");
+        // features are a multiset: a duplicate counts
+        let result = compare_tile_bytes(
+            &polygon_tile(vec![vec![SQUARE], vec![SQUARE2], vec![SQUARE]]),
+            &polygon_tile(vec![vec![SQUARE2], vec![SQUARE]]),
+        );
+        assert_eq!(counts(&[("l", (1, 0, 0))]), feature_counts(&result));
+    }
+
+    #[test]
+    fn test_feature_ids() {
+        let tile = |ids: &[u64]| vt::Tile {
+            layers: vec![layer("l", &["a"], &["x", "y"], ids.iter().map(|id| point(*id, vec![0, 0])).collect())],
+        };
+        let result = compare_tile_bytes(&tile(&[1, 2]), &tile(&[3, 2]));
+        assert_eq!(1, result.tile_diffs);
+        assert_eq!(counts(&[("l", (1, 1, 1))]), feature_counts(&result));
+        // id order alone doesn't matter
+        let result = compare_tile_bytes(&tile(&[1, 2]), &tile(&[2, 1]));
+        assert_eq!((0, 1), (result.tile_diffs, result.equivalent_tiles), "{result:?}");
+        // with ignore_ids
+        let options = CompareOptions { ignore_ids: true, ..Default::default() };
+        let result = compare_tiles_with(&tile(&[1, 2]), &tile(&[3, 2]), &options);
+        assert_eq!((0, 1), (result.tile_diffs, result.equivalent_tiles), "{result:?}");
+        // an id difference together with a geometry difference is not "id only"
+        let other =
+            vt::Tile { layers: vec![layer("l", &["a"], &["x"], vec![point(1, vec![0, 0]), point(5, vec![0, 0])])] };
+        let moved = vt::Tile {
+            layers: vec![layer(
+                "l",
+                &["a"],
+                &["x"],
+                vec![point(1, vec![0, 0]), feature(6, vec![0, 0], vt::tile::GeomType::Point, vec![9, 4, 4])],
+            )],
+        };
+        assert_eq!(counts(&[("l", (1, 1, 0))]), feature_counts(&compare_tile_bytes(&other, &moved)));
+    }
+
+    #[test]
+    fn test_examples() {
+        let tile = |ids: &[u64]| vt::Tile {
+            layers: vec![layer("l", &["a"], &["x"], ids.iter().map(|id| point(*id, vec![0, 0])).collect())],
+        };
+        let options = CompareOptions { examples: 3, ..Default::default() };
+        let result = compare_tiles_with(&tile(&[1, 2, 3, 4]), &tile(&[5, 6, 7, 8]), &options);
+        let examples: Vec<&str> = result.feature_diffs["l"].examples.iter().map(|(_, e)| e.as_str()).collect();
         assert_eq!(
-            BTreeMap::from([(
-                "l".to_string(),
-                BTreeMap::from([("feature linestring geometry commands".to_string(), 1)])
-            )]),
-            result.tile_diffs_by_layer
+            vec![
+                "only in 1: point id=1 1 points first (1 1) {a=\"x\"}",
+                "only in 2: point id=5 1 points first (1 1) {a=\"x\"}",
+                "only in 1: point id=2 1 points first (1 1) {a=\"x\"}",
+            ],
+            examples
         );
     }
 
     #[test]
-    fn test_polygon_ring_diffs() {
-        use vt::tile::GeomType::Polygon;
-        let square = |size: u32| vec![9, 0, 0, 26, size * 2, 0, 0, size * 2, size * 2 - 1, 0, 15];
-        let tile = |geometry: Vec<u32>| vt::Tile {
-            layers: vec![layer("l", &[], &[], vec![feature(1, vec![], Polygon, geometry)])],
+    fn test_rotate_ring() {
+        let rotated = |ring: &[Point]| {
+            let mut ring = ring.to_vec();
+            rotate_ring(&mut ring);
+            ring
         };
-        let result = compare_tile_bytes(&tile(square(1)), &tile(square(2)));
-        assert_eq!(
-            BTreeMap::from([(
-                "l".to_string(),
-                BTreeMap::from([
-                    ("feature polygon geometry commands".to_string(), 1),
-                    ("Polygon exterior ring geometry".to_string(), 1)
-                ])
-            )]),
-            result.tile_diffs_by_layer
-        );
+        assert_eq!(vec![(0, 0), (1, 0), (1, 1)], rotated(&[(1, 1), (0, 0), (1, 0)]));
+        // explicit closing point is dropped
+        assert_eq!(vec![(0, 0), (1, 0), (1, 1)], rotated(&[(1, 0), (1, 1), (0, 0), (1, 0)]));
+        // a vertex visited twice: the smallest rotation among those starting there
+        let a = [(0, 0), (5, 1), (3, 3), (0, 0), (2, 5), (1, 3)];
+        let b = [(0, 0), (2, 5), (1, 3), (0, 0), (5, 1), (3, 3)];
+        assert_eq!(rotated(&a), rotated(&b));
+        assert!(rotated(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_malformed_geometry_is_compared_raw() {
+        use vt::tile::GeomType::Linestring;
+        let line = |geometry: Vec<u32>| vt::Tile {
+            layers: vec![layer("l", &[], &[], vec![feature(1, vec![], Linestring, geometry)])],
+        };
+        // LineTo without MoveTo
+        let result = compare_tile_bytes(&line(vec![10, 2, 2]), &line(vec![10, 4, 4]));
+        assert_eq!(counts(&[("l", (1, 1, 0))]), feature_counts(&result));
+        assert!(result.feature_diffs["l"].examples[0].1.contains("3 raw commands"), "{result:?}");
     }
 }

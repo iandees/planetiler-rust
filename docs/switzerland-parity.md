@@ -9,14 +9,19 @@ country polygons.
 
 ## How
 
-- `target/release/planetiler compare java.mbtiles rust.mbtiles` (port of Java `CompareArchives`). It pairs layers by
-  name and decodes tiles, reporting tiles whose bytes differ but whose decoded contents are equivalent separately
-  (key/value table order no longer counts). It still compares geometry commands strictly, so a polygon ring with a
-  different start point or a different ring / feature order counts as a difference.
-- Normalized comparison with the scripts used for the earlier orchestrator comparison (`/tmp/pt_scripts`, not in the
-  repo): `mvt.py` decodes every tile; `counts.py` counts features per layer; `mvtnorm2.py` compares each tile as a
-  multiset of `(layer, geometry type, sorted tags, normalized geometry)` (polygon rings compared ignoring start point
-  and ring order), ignoring feature IDs; `mvtnorm.py` is the same but includes feature IDs.
+- `target/release/planetiler compare java.mbtiles rust.mbtiles` is the check (`util::compare_archives`, port of Java
+  `CompareArchives` with a normalized feature comparison). Tiles with equal bytes are skipped; the others are decoded
+  in parallel, layers are paired by name and each layer is compared as a multiset of features keyed on `(geometry
+  type, normalized geometry, tags[, id])`: tags compared as a map, geometry in absolute tile coordinates with the
+  points of a multipoint and the lines of a multilinestring sorted, polygon rings rotated to start at their smallest
+  vertex (orientation kept, it marks holes), holes sorted within their polygon and polygons sorted. It prints, per
+  layer, the features only in archive 1 / only in archive 2 (total and by zoom), how many of those pairs differ only
+  in feature ID, and a few examples. `--ignore-ids` drops feature IDs from the key, `--examples=N` sets the number
+  of examples per layer, `--verbose` logs every differing feature. It replaces the Python scripts previously used
+  for this check (`/tmp/pt_scripts/mvtnorm{,2}.py`, not in the repo) and gives the same counts in ~1 s for
+  Switzerland (vs ~1.5-3 min and ~12 GB of RAM per script).
+- Per-layer feature counts (the table below) come from `/tmp/pt_scripts/counts.py`: `compare` skips identical tiles
+  without decoding them, so it doesn't count features.
 - Inputs: `bench/out/20261018-054434/e2e_{switzerland,monaco}/{java,rust}.mbtiles` (kept by `bench/run_all.sh` for
   the last trial).
 
@@ -53,7 +58,7 @@ z12 1,280, z13 4,623, z14 17,453), no tile present on only one side. Archive siz
 The extra Rust building at the 4 px² merge area threshold that the previous comparison found (tile 13/4281/2891) is
 gone with the JTS buffer port.
 
-**Differing features** (normalized comparison; a feature differs if no feature with the same layer, type, tags and
+**Differing features** (`planetiler compare`; a feature differs if no feature with the same layer, type, tags and
 normalized geometry exists in the other side's tile; counts are Java-only / Rust-only):
 
 | Layer | Now (`627d901`) | Previous pass (`cb984fd`) | Where | Cause |
@@ -69,25 +74,22 @@ normalized geometry exists in the other side's tile; counts are Java-only / Rust
 These numbers are the same as the one-off check made right after the Fix B port, so the later commits changed
 nothing in the output.
 
-**`planetiler compare`** reports 20,735 of 23,922 tiles as different and 2,994 more as "different bytes but
-equivalent decoded contents" (the previous version reported 23,729, nearly all from key/value table order). The
-remaining reports are ring start point / ring order / feature order differences that the normalized comparison
-treats as equal, plus the real differences above: `landcover` 65,778 polygon commands, `building` 4,551, `landuse`
-4,470, `water` 1,643, `park` 602, `transportation` 180 polygon / 10 linestring commands, `aeroway` 33, and
-`housenumber` feature IDs in 1,062 / feature order in 8,220 tiles. On Monaco it reports 20 of 23 tiles (polygon ring
-geometry in `building`, `water` and `landcover`, `housenumber` feature order) although the decoded contents are
-equivalent up to ring start point and order. So `compare` is still not a pass/fail signal for this port; the
-normalized comparison is.
+**`planetiler compare`** output on these files (the differing-feature numbers above): 1,697 of 23,922 tiles differ
+(635 with `--ignore-ids`); the other 22,032 have different bytes but equivalent normalized contents (key/value table
+order, ring start point, ring / feature order). Per layer it reports `building` 578 / 578 (z13), `landuse` 35 / 35,
+`landcover` 17 / 17, `transportation` 10 / 10 and `housenumber` 1,730 / 1,730, all 1,730 in its "id only" column (gone
+with `--ignore-ids`). On Monaco it reports 0 differing features, with or without IDs (all 23 tiles differ in bytes
+only). The command exits 1 when a tile differs, and by default also on archive-level differences such as the
+metadata (build time, version and commit differ between Java and Rust); `--strict=false` ignores those.
 
 ## Reproduce
 
 ```sh
 bench/run_all.sh e2e_switzerland            # or TRIALS=1; keeps the last trial's outputs
 D=bench/out/<run>/e2e_switzerland
-target/release/planetiler compare $D/java.mbtiles $D/rust.mbtiles
-python3 -I /tmp/pt_scripts/counts.py $D/java.mbtiles $D/rust.mbtiles
-python3 -I /tmp/pt_scripts/mvtnorm2.py $D/java.mbtiles $D/rust.mbtiles   # ignoring IDs
-python3 -I /tmp/pt_scripts/mvtnorm.py $D/java.mbtiles $D/rust.mbtiles 3  # including IDs
+target/release/planetiler compare $D/java.mbtiles $D/rust.mbtiles               # including IDs
+target/release/planetiler compare --ignore-ids $D/java.mbtiles $D/rust.mbtiles  # ignoring IDs
+python3 -I /tmp/pt_scripts/counts.py $D/java.mbtiles $D/rust.mbtiles           # feature counts per layer
 ```
 
-Each Python script needs ~12 GB of RAM and ~1.5-3 minutes for Switzerland.
+`compare` takes ~1 s for Switzerland (15 cores); `counts.py` needs ~12 GB of RAM and ~1.5 minutes.
