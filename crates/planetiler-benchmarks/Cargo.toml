@@ -11,3 +11,4 @@ tracing.workspace = true
 indexmap.workspace = true
 geo.workspace = true
 geo-types.workspace = true
+flate2.workspace = true
