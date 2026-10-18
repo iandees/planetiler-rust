@@ -195,7 +195,7 @@ Previous pass: `benchmark_osm_read` 0.57s/7.7s CPU (fast) or 1.39s/19.1s CPU (sl
     (after all earlier blocks finished preprocessing nodes).
   - Archive: building `merge_nearby_polygons` is ~86% of z13 encode time (buffer/union in `geo`/`i_overlay`, not
     changed here); the proximity grouping skips self-distances, computes each pair once and shortcuts pairs that
-    share a vertex or contain each other's first vertex (12% -> 6% of z13 encode time). Command decoding and the
+    share a vertex or contain each other's first vertex (~15% -> ~12% of z12-z14 encode samples). Command decoding and the
     housenumber Java-HashMap-order sort were tightened.
   - Monaco RSS: the parallel inflater's in-flight chunks were not the main cost (capping them to 4-8 chunks saves
     0.1-0.16 GB but slows water_polygons linearly, 0.38s -> 0.62s at 8 and 0.94s at 5). Most of the 1.2 GB peak
