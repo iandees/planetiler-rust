@@ -498,7 +498,20 @@ impl ObliqueMercator {
                 (aasin(d * gamma.sin()), gamma, gamma)
             }
         };
-        let lam0 = lamc - aasin(0.5 * (f - 1.0 / f) * gamma0.tan()) / big_b;
+        // PROJ computes `asin(0.5 * (F - 1/F) * tan(gamma0))`. With the alpha form that argument is
+        // `±sqrt(D^2 - 1) * sin(alpha) / sqrt(D^2 - sin^2(alpha))` in closed form, which is exactly 1 for an azimuth of
+        // 90 degrees (the Swiss and Hungarian grids). Evaluated through `tan(gamma0)` it is 1 ± a few ulps, and `asin`
+        // near 1 turns that into ~1e-6 degrees of platform-dependent longitude error (glibc vs Apple libm `tan`).
+        let lam0_arg = match alpha {
+            Some(alpha_c) if phi0.abs() > EPS10 && d * d - alpha_c.sin().powi(2) > 0.0 => {
+                let sin_a = alpha_c.sin();
+                let root = (d * d - 1.0).max(0.0).sqrt();
+                let root = if phi0 < 0.0 { -root } else { root };
+                root * sin_a / (d * d - sin_a * sin_a).sqrt()
+            }
+            _ => 0.5 * (f - 1.0 / f) * gamma0.tan(),
+        };
+        let lam0 = lamc - aasin(lam0_arg) / big_b;
         let arb = big_a / big_b;
         let bra = 1.0 / arb;
         let u_0 = if no_off {
@@ -1568,6 +1581,31 @@ mod tests {
                 lam.to_degrees(),
                 phi.to_degrees()
             );
+        }
+    }
+
+    /// Variant B with an azimuth of 90 degrees (Swiss LV03/LV95, Hungarian EOV) maps the projection center to (0, 0).
+    /// The longitude used to depend on platform `tan` rounding (~2e-8 rad between glibc and Apple libm).
+    #[test]
+    fn oblique_mercator_azimuth_90_center_is_exact() {
+        let bessel = Ellipsoid { a: 6377397.155, es: 0.006674372230614 };
+        let cases: [(&str, f64, f64); 2] = [
+            (
+                "+proj=omerc +lat_0=46.952405555555565 +lonc=7.439583333333332 +alpha=90 +gamma=90 +k=1",
+                7.439583333333332,
+                46.952405555555565,
+            ),
+            (
+                "+proj=omerc +lat_0=47.14439372222222 +lonc=19.04857177777778 +alpha=90 +gamma=90 +k=0.99993",
+                19.04857177777778,
+                47.14439372222222,
+            ),
+        ];
+        for (def, lonc, lat0) in cases {
+            let proj = CustomProjection::new(&ProjParams::parse(def), bessel).unwrap();
+            let (lam, phi) = proj.inverse(0.0, 0.0).unwrap();
+            assert!((lam - lonc.to_radians()).abs() < 1e-13, "{def}: lon {} vs {lonc}", lam.to_degrees());
+            assert!((phi - lat0.to_radians()).abs() < 1e-13, "{def}: lat {} vs {lat0}", phi.to_degrees());
         }
     }
 
