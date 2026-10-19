@@ -41,6 +41,8 @@ struct Inner<T> {
     /// One token per finished thread is sent when the last working thread finishes, to wake up draining threads.
     wake_sender: Sender<()>,
     wake_receiver: Receiver<()>,
+    /// How long a draining thread waits before re-checking whether all workers are done ([`POLL_INTERVAL`]).
+    poll_interval: Duration,
 }
 
 /// Shares work between threads when some finish early. Clones share the same state.
@@ -57,6 +59,11 @@ impl<T> Clone for Distributor<T> {
 impl<T> Distributor<T> {
     /// Returns a new `Distributor` that can hold up to `capacity` pending elements.
     pub fn create_with_capacity(capacity: usize) -> Distributor<T> {
+        Self::create_with_capacity_and_poll_interval(capacity, POLL_INTERVAL)
+    }
+
+    /// Same as [`Distributor::create_with_capacity`] with a custom drain poll interval (for tests).
+    fn create_with_capacity_and_poll_interval(capacity: usize, poll_interval: Duration) -> Distributor<T> {
         let (sender, receiver) = crossbeam_channel::bounded(capacity.max(1));
         let (wake_sender, wake_receiver) = crossbeam_channel::unbounded();
         Distributor {
@@ -67,6 +74,7 @@ impl<T> Distributor<T> {
                 receiver,
                 wake_sender,
                 wake_receiver,
+                poll_interval,
             }),
         }
     }
@@ -134,7 +142,7 @@ impl<T, F: FnMut(T)> ForThread<T, F> {
                     Err(_) => break,
                 },
                 recv(inner.wake_receiver) -> _ => {}
-                default(POLL_INTERVAL) => {}
+                default(self.inner.poll_interval) => {}
             }
         }
     }
@@ -256,28 +264,35 @@ mod tests {
         assert_eq!(vec![1, 2, 3, 4, 6, 5], *processed.lock());
     }
 
-    /// A draining thread returns as soon as the last worker finishes, rather than after the next 100ms poll.
+    /// A draining thread returns as soon as the last worker finishes, rather than after the next poll. The poll
+    /// interval is set very long so the check doesn't depend on scheduler timing (CI runners can oversleep by tens
+    /// of milliseconds).
     #[test]
     fn drain_wakes_up_when_last_worker_finishes() {
-        let distributor = Distributor::<i32>::create_with_capacity(10);
+        use std::sync::atomic::AtomicBool;
+        let distributor = Distributor::<i32>::create_with_capacity_and_poll_interval(10, Duration::from_secs(60));
         let mut worker = distributor.for_thread(|_| {});
         let started = Arc::new(Barrier::new(2));
+        let closed = Arc::new(AtomicBool::new(false));
         let drainer = {
-            let (distributor, started) = (distributor.clone(), started.clone());
+            let (distributor, started, closed) = (distributor.clone(), started.clone(), closed.clone());
             std::thread::spawn(move || {
                 let mut this = distributor.for_thread(|_| {});
                 this.finish();
                 started.wait();
                 let start = std::time::Instant::now();
                 this.drain();
-                start.elapsed()
+                (start.elapsed(), closed.load(Ordering::SeqCst))
             })
         };
         started.wait();
         std::thread::sleep(Duration::from_millis(30));
+        closed.store(true, Ordering::SeqCst);
         worker.close();
-        let waited = drainer.join().unwrap();
-        assert!(waited >= Duration::from_millis(25) && waited < Duration::from_millis(90), "{waited:?}");
+        let (waited, closed_before_return) = drainer.join().unwrap();
+        // drain didn't return until the worker closed, and it returned long before the next 60s poll
+        assert!(closed_before_return, "drain returned before the last worker finished");
+        assert!(waited < Duration::from_secs(20), "{waited:?}");
     }
 
     /// Every item is processed exactly once when workers with very different amounts of input hand work off to each
