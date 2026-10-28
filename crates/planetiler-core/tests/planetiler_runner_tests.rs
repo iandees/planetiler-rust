@@ -144,7 +144,7 @@ fn run_osm(args: &str) {
         };
         assert_eq!(Some(expected_format), metadata.get("format").map(String::as_str));
         assert_eq!(
-            Some(env!("CARGO_PKG_VERSION")),
+            Some(planetiler_core::util::build_info::BuildInfo::get().version.as_deref().unwrap()),
             metadata.get("planetiler:version").map(String::as_str),
             "{metadata:?}"
         );

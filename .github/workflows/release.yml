@@ -36,6 +36,7 @@ jobs:
           key: ${{ matrix.target }}
       - name: Record build info
         run: |
+          echo "PLANETILER_VERSION=$(.github/scripts/build-version.sh)" >> "$GITHUB_ENV"
           echo "PLANETILER_GITHASH=$GITHUB_SHA" >> "$GITHUB_ENV"
           echo "PLANETILER_BUILD_TIMESTAMP=$(date +%s)000" >> "$GITHUB_ENV"
       - run: cargo build --release --locked -p planetiler --target ${{ matrix.target }}
