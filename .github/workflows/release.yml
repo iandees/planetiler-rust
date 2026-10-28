@@ -34,6 +34,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Record build info
+        run: |
+          echo "PLANETILER_GITHASH=$GITHUB_SHA" >> "$GITHUB_ENV"
+          echo "PLANETILER_BUILD_TIMESTAMP=$(date +%s)000" >> "$GITHUB_ENV"
       - run: cargo build --release --locked -p planetiler --target ${{ matrix.target }}
       - name: Package
         run: |

@@ -34,10 +34,15 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - id: timestamp
+        run: echo "ms=$(date +%s)000" >> "$GITHUB_OUTPUT"
       - id: build
         uses: docker/build-push-action@v6
         with:
           context: .
+          build-args: |
+            PLANETILER_GITHASH=${{ github.sha }}
+            PLANETILER_BUILD_TIMESTAMP=${{ steps.timestamp.outputs.ms }}
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}
