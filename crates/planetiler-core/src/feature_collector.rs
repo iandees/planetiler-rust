@@ -24,8 +24,9 @@
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
+use std::collections::HashSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use geo_types::Geometry;
 
@@ -43,6 +44,9 @@ use crate::util::cache_by_zoom::CacheByZoom;
 use crate::util::merging_range_map::MergingRangeMap;
 use crate::util::zoom_function::{self, ZoomFunction};
 use crate::value::{Tags, Value};
+
+/// Layers for which an out-of-range sort key has already been reported, so the error is logged once per layer.
+static LAYERS_WITH_CLAMPED_SORT_KEY: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
 const DEFAULT_LABEL_GRID_SIZE: f64 = 0.0;
 const DEFAULT_LABEL_GRID_LIMIT: i32 = 0;
@@ -768,15 +772,32 @@ impl<'a> Feature<'a> {
     /// into [`SORT_KEY_BITS`](crate::collection::feature_group::SORT_KEY_BITS) bits so the range is limited to
     /// `SORT_KEY_MIN..=SORT_KEY_MAX`.
     ///
+    /// A sort key outside that range is clamped to the nearest end of the range, and an error is logged the first
+    /// time that happens for each layer.
+    ///
     /// Circles, lines, and polygons are rendered in the order they appear in each layer, so features that appear
     /// later (higher sort key) show up on top of features with a lower sort key. For symbols (text/icons), features
     /// that appear earlier (lower sort key) will show up at lower zoom levels than features that appear later.
     pub fn set_sort_key(&mut self, sort_key: i32) -> &mut Self {
+        let clamped = sort_key.clamp(SORT_KEY_MIN, SORT_KEY_MAX);
+        if clamped != sort_key
+            && LAYERS_WITH_CLAMPED_SORT_KEY.lock().unwrap_or_else(|e| e.into_inner()).insert(self.layer.clone())
+        {
+            tracing::error!(
+                "Sort key {} in layer {} is outside of allowed range [{}, {}], clamping to {} (logged once per layer)",
+                sort_key,
+                self.layer,
+                SORT_KEY_MIN,
+                SORT_KEY_MAX,
+                clamped
+            );
+        }
+        // ensure unit tests fail fast in this case
         debug_assert!(
-            (SORT_KEY_MIN..=SORT_KEY_MAX).contains(&sort_key),
+            clamped == sort_key,
             "Sort key {sort_key} outside of allowed range [{SORT_KEY_MIN}, {SORT_KEY_MAX}]"
         );
-        self.sort_key = sort_key;
+        self.sort_key = clamped;
         self
     }
 
@@ -1346,6 +1367,47 @@ mod tests {
 
     fn round_trip(world: impl Into<Geometry<f64>>) -> Geometry<f64> {
         geo_utils::lat_lon_to_world_coords(&geo_utils::world_to_lat_lon_coords(&world.into()))
+    }
+
+    #[test]
+    fn test_sort_key_in_range_unchanged() {
+        let factory = factory();
+        let source = new_reader_feature(new_point(0.0, 0.0), tags! {});
+        let mut collector = factory.get(&source);
+        let f = collector.point("sortkey_in_range");
+        f.set_sort_key(SORT_KEY_MIN);
+        assert_eq!(SORT_KEY_MIN, f.get_sort_key());
+        f.set_sort_key(SORT_KEY_MAX);
+        assert_eq!(SORT_KEY_MAX, f.get_sort_key());
+        f.set_sort_key(0);
+        assert_eq!(0, f.get_sort_key());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "outside of allowed range")]
+    fn test_sort_key_out_of_range_panics_in_debug() {
+        let factory = factory();
+        let source = new_reader_feature(new_point(0.0, 0.0), tags! {});
+        let mut collector = factory.get(&source);
+        collector.point("sortkey_debug_panic").set_sort_key(SORT_KEY_MAX + 1);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn test_sort_key_out_of_range_clamps_in_release() {
+        let factory = factory();
+        let source = new_reader_feature(new_point(0.0, 0.0), tags! {});
+        let mut collector = factory.get(&source);
+        let f = collector.point("sortkey_clamp");
+        f.set_sort_key(SORT_KEY_MAX + 1);
+        assert_eq!(SORT_KEY_MAX, f.get_sort_key());
+        f.set_sort_key(SORT_KEY_MIN - 1);
+        assert_eq!(SORT_KEY_MIN, f.get_sort_key());
+        f.set_sort_key(i32::MIN);
+        assert_eq!(SORT_KEY_MIN, f.get_sort_key());
+        f.set_sort_key_descending(SORT_KEY_MIN - 1);
+        assert_eq!(SORT_KEY_MAX, f.get_sort_key());
     }
 
     #[test]
