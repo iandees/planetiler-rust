@@ -1,8 +1,9 @@
 //! Port of `util/BuildInfo.java`: accessor for build-time information.
 //!
-//! Java reads a `buildinfo.properties` file that maven fills in. Here the version comes from `CARGO_PKG_VERSION`, and
-//! the git hash and build timestamp come from the optional compile-time environment variables `PLANETILER_GITHASH`
-//! and `PLANETILER_BUILD_TIMESTAMP` (milliseconds since the epoch), which a build script or CI can set.
+//! Java reads a `buildinfo.properties` file that maven fills in. Here the version comes from the optional compile-time
+//! environment variable `PLANETILER_VERSION` (CI sets it from the release tag), falling back to `CARGO_PKG_VERSION`.
+//! The git hash and build timestamp come from `PLANETILER_GITHASH` and `PLANETILER_BUILD_TIMESTAMP` (milliseconds since
+//! the epoch), which a build script or CI can set.
 
 use std::sync::LazyLock;
 
@@ -18,7 +19,7 @@ pub struct BuildInfo {
 static INSTANCE: LazyLock<BuildInfo> = LazyLock::new(|| {
     BuildInfo::from_parts(
         option_env!("PLANETILER_GITHASH"),
-        Some(env!("CARGO_PKG_VERSION")),
+        option_env!("PLANETILER_VERSION").or(Some(env!("CARGO_PKG_VERSION"))),
         option_env!("PLANETILER_BUILD_TIMESTAMP"),
     )
 });
@@ -55,7 +56,8 @@ mod tests {
     #[test]
     fn test_build_info() {
         let info = BuildInfo::get();
-        assert_eq!(Some(env!("CARGO_PKG_VERSION")), info.version.as_deref());
+        let expected = option_env!("PLANETILER_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+        assert_eq!(Some(expected), info.version.as_deref());
         let parsed = BuildInfo::from_parts(Some("abc"), Some("1.0"), Some("1672531200000"));
         assert_eq!(Some("2023-01-01T00:00:00Z".to_string()), parsed.build_time_string());
         assert_eq!(None, BuildInfo::from_parts(None, None, Some("x1")).build_time);

@@ -4,6 +4,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
+# reported by `planetiler --version` and in the startup log
+ARG PLANETILER_VERSION
+ARG PLANETILER_GITHASH
+ARG PLANETILER_BUILD_TIMESTAMP
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p planetiler \

@@ -162,7 +162,28 @@ fn dispatch(mut args: Vec<String>) -> Result<(EntryPoint, Vec<String>), String> 
     Ok((task, args))
 }
 
+/// One-line description of this build, printed by `--version`.
+fn version_line() -> String {
+    let info = planetiler_core::util::build_info::BuildInfo::get();
+    let mut line = format!("planetiler {}", info.version.as_deref().unwrap_or("unknown"));
+    let details: Vec<String> = [
+        info.githash.as_ref().map(|hash| format!("git {hash}")),
+        info.build_time_string().map(|time| format!("built {time}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !details.is_empty() {
+        line.push_str(&format!(" ({})", details.join(", ")));
+    }
+    line
+}
+
 fn main() -> ExitCode {
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        println!("{}", version_line());
+        return ExitCode::SUCCESS;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_target(false)
@@ -192,6 +213,11 @@ mod tests {
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_version_line() {
+        assert!(version_line().starts_with(&format!("planetiler {}", env!("CARGO_PKG_VERSION"))));
     }
 
     #[test]

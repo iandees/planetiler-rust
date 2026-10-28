@@ -28,12 +28,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # tags, for git describe
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Record build info
+        run: |
+          echo "PLANETILER_VERSION=$(git describe --tags --match 'v*' --always | sed 's/^v//')" >> "$GITHUB_ENV"
+          echo "PLANETILER_GITHASH=$GITHUB_SHA" >> "$GITHUB_ENV"
+          echo "PLANETILER_BUILD_TIMESTAMP=$(date +%s)000" >> "$GITHUB_ENV"
       - run: cargo build --release --locked -p planetiler --target ${{ matrix.target }}
       - name: Package
         run: |

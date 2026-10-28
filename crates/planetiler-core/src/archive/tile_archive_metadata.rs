@@ -375,7 +375,10 @@ mod tests {
         let map = metadata.to_map();
         assert_eq!("My Name", map["name"]);
         assert_eq!("2.0", map["FooVersion"]);
-        assert_eq!(Some(env!("CARGO_PKG_VERSION")), map.get("planetiler:version").map(String::as_str));
+        assert_eq!(
+            Some(BuildInfo::get().version.as_deref().unwrap()),
+            map.get("planetiler:version").map(String::as_str)
+        );
     }
 
     #[test]
