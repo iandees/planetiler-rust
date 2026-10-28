@@ -124,6 +124,9 @@ const SURFACE_UNPAVED_VALUES: &[&str] = &[
     "sand",
     "snow",
     "woodchips",
+    "rock",
+    "clay",
+    "laterite",
 ];
 const SURFACE_PAVED_VALUES: &[&str] = &[
     "paved",
