@@ -1,0 +1,9 @@
+target
+.git
+.github
+.claude
+data
+*.mbtiles
+*.pmtiles
+bench/mlt-core-check/target
+fuzz/target
