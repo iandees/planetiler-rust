@@ -1,8 +1,8 @@
 # Porting Planetiler to Rust
 
 This repo is a port of [onthegomap/planetiler](https://github.com/onthegomap/planetiler) (Java) to Rust.
-The upstream reference checkout lives at `../planetiler-ref/planetiler` (commit `d88cf89`, OpenMapTiles submodule
-`373030b`).
+The upstream reference checkout lives at `../planetiler-ref/planetiler` (commit `5688e0d`, OpenMapTiles submodule
+`60b0ea8`).
 
 ## Port status
 
