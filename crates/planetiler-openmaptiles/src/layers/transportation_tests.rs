@@ -123,6 +123,20 @@ fn test_unnamed_path() {
 }
 
 #[test]
+fn test_rock_clay_laterite_surfaces() {
+    let t = LayerTest::new();
+    for surface in ["rock", "clay", "laterite"] {
+        assert_features(
+            14,
+            &[
+                tags! {"_layer" => "transportation", "class" => "path", "subclass" => "path", "surface" => "unpaved", "oneway" => "<null>", "_minzoom" => 14},
+            ],
+            &t.process(&line_feature(tags! {"surface" => surface, "highway" => "path"})),
+        );
+    }
+}
+
+#[test]
 fn test_private_path() {
     let t = LayerTest::new();
     assert_features(
