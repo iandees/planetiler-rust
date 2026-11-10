@@ -603,17 +603,30 @@ impl<R: Read> GeoJsonFeatureIterator<R> {
     }
 
     fn consume(&mut self, matches: impl Fn(&Token) -> bool, expected: &str) -> Result<bool> {
+        self.consume_allow_null(matches, expected, false)
+    }
+
+    fn consume_allow_null(
+        &mut self,
+        matches: impl Fn(&Token) -> bool,
+        expected: &str,
+        allow_null: bool,
+    ) -> Result<bool> {
         let token = self.parser.next_token()?;
-        if !token.as_ref().is_some_and(matches) {
-            self.warn(&format!("Unexpected token type: {expected}"));
-            self.parser.skip_children()?;
-            return Ok(false);
+        if token.as_ref().is_some_and(matches) {
+            return Ok(true);
         }
-        Ok(true)
+        // RFC 7946 allows null for "geometry" and "properties"
+        if !allow_null || token != Some(Token::Null) {
+            let found = token.as_ref().map_or("null", Token::describe);
+            self.warn(&format!("Expected {expected} but got {found}"));
+            self.parser.skip_children()?;
+        }
+        Ok(false)
     }
 
     fn consume_properties(&mut self) -> Result<()> {
-        if self.consume(|t| *t == Token::StartObject, "START_OBJECT")?
+        if self.consume_allow_null(|t| *t == Token::StartObject, "START_OBJECT", true)?
             && let Json::Object(entries) = self.parser.read_value()?
         {
             self.properties = Some(into_tags(entries));
@@ -622,7 +635,7 @@ impl<R: Read> GeoJsonFeatureIterator<R> {
     }
 
     fn consume_geometry(&mut self) -> Result<()> {
-        if self.consume(|t| *t == Token::StartObject, "START_OBJECT")? {
+        if self.consume_allow_null(|t| *t == Token::StartObject, "START_OBJECT", true)? {
             self.geometry_start = Some(self.parser.token_location());
             let mut kind = Json::Null;
             let mut coordinates = Json::Null;
