@@ -84,7 +84,6 @@ struct DbfField {
 
 #[derive(Clone, Debug, Default)]
 struct DbfHeader {
-    num_records: u64,
     header_length: usize,
     record_length: usize,
     fields: Vec<DbfField>,
@@ -236,7 +235,7 @@ impl ShapefileReader {
             let mut id = 0i64;
             let mut seq = 0usize;
             let mut batch = RawBatch::new(seq);
-            let mut dbf_done = dbf.is_none();
+            let mut record_count = 0usize;
             loop {
                 let mut record_header = [0u8; 8];
                 if !read_exact_or_eof(shp, &mut record_header)? {
@@ -250,12 +249,18 @@ impl ShapefileReader {
                 let shp_start = batch.shp.len();
                 batch.shp.resize(shp_start + content_length, 0);
                 shp.read_exact(&mut batch.shp[shp_start..]).context("reading shapefile record")?;
+                record_count += 1;
                 let dbf_start = batch.dbf.len();
-                if !dbf_done && let Some(dbf) = dbf.as_deref_mut() {
+                if let Some(dbf) = dbf.as_deref_mut() {
                     batch.dbf.resize(dbf_start + record_length, 0);
-                    if !read_exact_or_eof(dbf, &mut batch.dbf[dbf_start..])? {
-                        batch.dbf.truncate(dbf_start);
-                        dbf_done = true;
+                    // read the .shp and .dbf in lockstep so a record that can't be decoded later never shifts the
+                    // attributes of the records after it
+                    if !read_exact_or_eof(dbf, &mut batch.dbf[dbf_start..])? || batch.dbf[dbf_start] == 0x1A {
+                        bail!(
+                            ".dbf file for {} has fewer records than the .shp file (ended after {} records)",
+                            self.layer,
+                            record_count - 1
+                        );
                     }
                 }
                 let shp_range = shp_start..batch.shp.len();
@@ -279,7 +284,7 @@ impl ShapefileReader {
                     };
                 if include {
                     id += 1;
-                    batch.records.push(RawRecord { id, shp: shp_range, dbf: dbf_range });
+                    batch.records.push(RawRecord { id, number: record_count, shp: shp_range, dbf: dbf_range });
                 } else {
                     batch.shp.truncate(shp_start);
                     batch.dbf.truncate(dbf_start);
@@ -303,9 +308,18 @@ impl ShapefileReader {
         let mut result = Vec::with_capacity(batch.records.len());
         for record in &batch.records {
             let content = &batch.shp[record.shp.clone()];
-            let geometry = decode_shape(content, self.transform.as_ref())
-                .with_context(|| format!("Error decoding record {} of {}", record.id, self.layer))?;
-            let Some(geometry) = geometry else { continue };
+            let geometry = match decode_shape(content, self.transform.as_ref()) {
+                Ok(Some(geometry)) => geometry,
+                Ok(None) => continue,
+                Err(e) if e.is::<UnreadableGeometry>() => {
+                    warn!(
+                        "Skipping record {} of {} with a geometry that can't be read: {e}",
+                        record.number, self.layer
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e.context(format!("Error decoding record {} of {}", record.number, self.layer))),
+            };
             let tags = self.decode_attributes(&batch.dbf[record.dbf.clone()]);
             result.push(ReaderFeature { geometry, tags, source_layer: Some(self.layer.clone()), id: record.id });
         }
@@ -331,9 +345,7 @@ impl SimpleReader for ShapefileReader {
 
     fn feature_count(&self) -> Result<u64> {
         if self.source_filter.is_none() {
-            if !self.dbf.fields.is_empty() || self.dbf.num_records > 0 {
-                return Ok(self.dbf.num_records);
-            }
+            // the .shx only has record headers, the .dbf can have a different number of records
             if let Some(shx) = read_sibling(&self.input, "shx")? {
                 return Ok((shx.len().saturating_sub(100) / 8) as u64);
             }
@@ -445,7 +457,10 @@ pub(crate) fn emit_in_order(
 }
 
 struct RawRecord {
+    /// Feature id, counting only the records that were kept.
     id: i64,
+    /// 1-based record number in the `.shp` file.
+    number: usize,
     shp: Range<usize>,
     dbf: Range<usize>,
 }
@@ -548,7 +563,6 @@ fn read_dbf_header(input: &Input, charset: Charset) -> Result<DbfHeader> {
     fn parse(reader: &mut dyn Read, charset: Charset) -> Result<DbfHeader> {
         let mut header = [0u8; 32];
         reader.read_exact(&mut header).context("reading dbf header")?;
-        let num_records = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
         let header_length = u16::from_le_bytes(header[8..10].try_into().unwrap()) as usize;
         let record_length = u16::from_le_bytes(header[10..12].try_into().unwrap()) as usize;
         let mut rest = vec![0u8; header_length.saturating_sub(32)];
@@ -567,7 +581,7 @@ fn read_dbf_header(input: &Input, charset: Charset) -> Result<DbfHeader> {
             fields.push(DbfField { name, kind, offset, length, decimals });
             offset += length;
         }
-        Ok(DbfHeader { num_records, header_length, record_length, fields })
+        Ok(DbfHeader { header_length, record_length, fields })
     }
     match input {
         Input::Disk { dbf: Some(dbf), .. } => parse(&mut BufReader::new(std::fs::File::open(dbf)?), charset),
@@ -648,6 +662,23 @@ fn record_envelope(shape_type: i32, content: &[u8]) -> Option<Envelope> {
     }
 }
 
+/// A record whose geometry can't be decoded (GeoTools throws a `RuntimeException` for these): the record is skipped
+/// instead of failing the whole file.
+#[derive(Debug)]
+struct UnreadableGeometry(String);
+
+impl std::fmt::Display for UnreadableGeometry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnreadableGeometry {}
+
+fn unreadable(message: &str) -> anyhow::Error {
+    anyhow::Error::new(UnreadableGeometry(message.to_string()))
+}
+
 /// Little-endian cursor over a shapefile record.
 struct Cursor<'a> {
     data: &'a [u8],
@@ -656,7 +687,7 @@ struct Cursor<'a> {
 
 impl Cursor<'_> {
     fn i32(&mut self) -> Result<i32> {
-        let b = self.data.get(self.pos..self.pos + 4).ok_or_else(|| anyhow!("truncated shapefile record"))?;
+        let b = self.data.get(self.pos..self.pos + 4).ok_or_else(|| unreadable("truncated shapefile record"))?;
         self.pos += 4;
         Ok(i32::from_le_bytes(b.try_into().unwrap()))
     }
@@ -664,7 +695,7 @@ impl Cursor<'_> {
     fn count(&mut self) -> Result<usize> {
         let n = self.i32()?;
         if n < 0 {
-            bail!("negative count in shapefile record");
+            return Err(unreadable("negative count in shapefile record"));
         }
         Ok(n as usize)
     }
@@ -674,7 +705,8 @@ impl Cursor<'_> {
     }
 
     fn coords(&mut self, n: usize, transform: Option<&MathTransform>) -> Result<Vec<Coord<f64>>> {
-        let bytes = self.data.get(self.pos..self.pos + n * 16).ok_or_else(|| anyhow!("truncated shapefile record"))?;
+        let bytes =
+            self.data.get(self.pos..self.pos + n * 16).ok_or_else(|| unreadable("truncated shapefile record"))?;
         self.pos += n * 16;
         let mut result = Vec::with_capacity(n);
         for chunk in bytes.as_chunks::<16>().0 {
@@ -725,10 +757,15 @@ fn decode_shape(content: &[u8], transform: Option<&MathTransform>) -> Result<Opt
             if matches!(shape_type, 3 | 13 | 23) {
                 Geometry::MultiLineString(MultiLineString(rings.into_iter().map(LineString).collect()))
             } else {
-                Geometry::MultiPolygon(build_polygons(rings))
+                let polygons = build_polygons(rings);
+                if polygons.0.is_empty() {
+                    // e.g. the polygons with 1 ring and no points in Geofabrik extracts (planetiler #1568)
+                    return Err(unreadable("polygon without any usable rings"));
+                }
+                Geometry::MultiPolygon(polygons)
             }
         }
-        other => bail!("Unsupported shape type {other}"),
+        other => return Err(unreadable(&format!("Unsupported shape type {other}"))),
     }))
 }
 
@@ -1074,6 +1111,91 @@ mod tests {
         assert!(err.contains("unsupported projection \"Van_der_Grinten_I\""), "{err}");
         // an explicit projection is used instead
         assert!(ShapefileReader::new(Some("EPSG:4326"), "test", &shp_path).is_ok());
+    }
+
+    /// Writes polygons with `value` 1 to `count` in order, the i-th covering (i, i) to (i + 0.5, i + 0.5).
+    fn write_polygons(shp_path: &Path, count: usize) {
+        let table = shapefile::dbase::TableWriterBuilder::new().add_numeric_field(
+            shapefile::dbase::FieldName::try_from("value").unwrap(),
+            10,
+            0,
+        );
+        let mut writer = shapefile::Writer::from_path(shp_path, table).unwrap();
+        for i in 1..=count {
+            let (min, max) = (i as f64, i as f64 + 0.5);
+            let polygon = shapefile::Polygon::new(shapefile::PolygonRing::Outer(vec![
+                shapefile::Point::new(min, min),
+                shapefile::Point::new(min, max),
+                shapefile::Point::new(max, max),
+                shapefile::Point::new(max, min),
+                shapefile::Point::new(min, min),
+            ]));
+            let mut record = shapefile::dbase::Record::default();
+            record.insert("value".to_string(), shapefile::dbase::FieldValue::Numeric(Some(i as f64)));
+            writer.write_shape_and_record(&polygon, &record).unwrap();
+        }
+    }
+
+    fn assert_rectangle(feature: &ReaderFeature, value: i64) {
+        assert_eq!(Some(&Value::Int(value)), feature.get_tag("value"));
+        let v = value as f64;
+        let env = crate::geo::envelope::Envelope::of_geometry(&feature.geometry);
+        assert_eq!((v, v + 0.5, v, v + 0.5), (env.min_x, env.max_x, env.min_y, env.max_y));
+    }
+
+    #[test]
+    fn skips_record_with_geometry_that_cant_be_read() {
+        for with_bounds in [false, true] {
+            // write 3 polygons with value 1, 2 and 3, then set the second one's point count to 0 like the polygons
+            // with 1 ring and no points in Geofabrik extracts (planetiler #1568)
+            let dir = tempfile::tempdir().unwrap();
+            let shp_path = dir.path().join("test.shp");
+            write_polygons(&shp_path, 3);
+            let mut shp = std::fs::read(&shp_path).unwrap();
+            // records start after the 100-byte header with an 8-byte header holding their length in 16-bit words
+            let first_length = i32::from_be_bytes(shp[104..108].try_into().unwrap()) as usize * 2;
+            let second_record = 100 + 8 + first_length;
+            // the point count follows the shape type, bounding box and part count
+            let at = second_record + 8 + 40;
+            shp[at..at + 4].copy_from_slice(&0i32.to_le_bytes());
+            std::fs::write(&shp_path, shp).unwrap();
+
+            let bounds =
+                if with_bounds { Bounds::new(Some(Envelope::new(0.0, 10.0, 0.0, 10.0))) } else { Bounds::world() };
+            let reader = ShapefileReader::with_bounds(None, "test", &shp_path, &bounds).unwrap();
+            assert_eq!(3, reader.feature_count().unwrap());
+            let features = reader.read_all().unwrap();
+            assert_eq!(2, features.len());
+            assert_rectangle(&features[0], 1);
+            assert_rectangle(&features[1], 3);
+        }
+    }
+
+    #[test]
+    fn fails_when_dbf_has_fewer_records_than_shp() {
+        let dir = tempfile::tempdir().unwrap();
+        let shp_path = dir.path().join("test.shp");
+        write_polygons(&shp_path, 3);
+        write_polygons(&dir.path().join("other.shp"), 2);
+        std::fs::copy(dir.path().join("other.dbf"), dir.path().join("test.dbf")).unwrap();
+        let reader = ShapefileReader::new(None, "test", &shp_path).unwrap();
+        assert!(reader.read_all().is_err());
+    }
+
+    #[test]
+    fn ignores_extra_dbf_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let shp_path = dir.path().join("test.shp");
+        write_polygons(&shp_path, 3);
+        write_polygons(&dir.path().join("other.shp"), 4);
+        std::fs::copy(dir.path().join("other.dbf"), dir.path().join("test.dbf")).unwrap();
+        let reader = ShapefileReader::new(None, "test", &shp_path).unwrap();
+        assert_eq!(3, reader.feature_count().unwrap());
+        let features = reader.read_all().unwrap();
+        assert_eq!(3, features.len());
+        for (i, feature) in features.iter().enumerate() {
+            assert_rectangle(feature, i as i64 + 1);
+        }
     }
 
     #[test]
