@@ -33,7 +33,6 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use geo_types::{Coord, Geometry, LineString, Point, Polygon};
-use rayon::slice::ParallelSliceMut;
 use roaring::RoaringTreemap;
 
 use crate::collection::feature_group::{self, FeatureGroup, FeatureSink, RenderedFeatureEncoder};
@@ -166,10 +165,12 @@ struct RelationState {
 
 impl RelationState {
     fn freeze(&mut self) {
-        // stable sorts keep memberships for each key in insertion order
-        self.way_to_relations.par_sort_by_key(|p| p.0);
+        // Pass 1 can process relations from several threads, which append in a different order every run, so order
+        // memberships for each key by relation ID (not role, since role IDs are also assigned in a different order each
+        // time planetiler runs) to keep output deterministic between runs. Ties keep insertion order.
+        long_long_multimap::sort_pairs(&mut self.way_to_relations, NOT_ROLE_MASK);
         self.way_to_relations.shrink_to_fit();
-        self.relation_to_parent_relations.par_sort_by_key(|p| p.0);
+        long_long_multimap::sort_pairs(&mut self.relation_to_parent_relations, NOT_ROLE_MASK);
         self.relation_to_parent_relations.shrink_to_fit();
     }
 
@@ -1030,12 +1031,15 @@ impl OsmReader {
     ) -> ResourceUsage {
         let nodes = estimate_num_nodes(osm_file_size);
         let max_node_id = estimate_max_node_id(osm_file_size);
+        // sparsearray and sortedtable keep ~4 bytes per 256-ID chunk that has nodes, plus ~210 bytes per 131,072-ID
+        // page that has nodes: dense on the planet, but on an extract each node may be in its own chunk and page
+        let in_memory_index = nodes.min(max_node_id / 256) * 4 + nodes.min(max_node_id / 131_072) * 210;
         let check = ResourceUsage::new("nodemap");
         let kind = storage_kind(storage);
         match map_type {
             LongLongMapType::Noop => {}
             LongLongMapType::SparseArray => {
-                check.add_memory(300_000_000, "sparsearray node location in-memory index").add_storage(
+                check.add_memory(in_memory_index, "sparsearray node location in-memory index").add_storage(
                     path,
                     kind,
                     9 * nodes,
@@ -1043,7 +1047,7 @@ impl OsmReader {
                 );
             }
             LongLongMapType::SortedTable => {
-                check.add_memory(300_000_000, "sortedtable node location in-memory index").add_storage(
+                check.add_memory(in_memory_index, "sortedtable node location in-memory index").add_storage(
                     path,
                     kind,
                     12 * nodes,
@@ -1107,8 +1111,8 @@ fn estimate_num_nodes(osm_file_size: u64) -> u64 {
 
 fn estimate_max_node_id(osm_file_size: u64) -> u64 {
     // On 2/14/2022, planet.pbf was 66691979646 bytes and max node ID was ~9.5b, so scale from there but don't go
-    // less than 9.5b in case it's an extract
-    (9_500_000_000f64 * 1f64.max(osm_file_size as f64 / 66_691_979_646f64)).round() as u64
+    // less than 14b (it was ~14.3b on 10/29/2026) since extracts contain recent nodes too
+    14_000_000_000u64.max((9_500_000_000f64 * osm_file_size as f64 / 66_691_979_646f64).round() as u64)
 }
 
 fn get_split_way_multiplier(max_way_id: i64) -> i64 {

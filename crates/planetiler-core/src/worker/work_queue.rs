@@ -3,6 +3,8 @@
 //!
 //! Wraps a bounded `crossbeam_channel` with a few customizations:
 //! - items are buffered into configurable-sized batches before putting them on the channel to reduce contention
+//! - optionally, a batch is handed off early once the total weight of its items reaches a limit, so expensive items
+//!   get spread over more consumers
 //! - writers mark the queue "finished" with [`WorkQueue::close`] and readers get `None` when there are no more items
 //!
 //! Each thread should get its own [`WorkQueueWriter`] / [`WorkQueueReader`] through
@@ -30,11 +32,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Estimated cost for a consumer to process an item.
+pub type Weigher<T> = Arc<dyn Fn(&T) -> usize + Send + Sync>;
+
 struct Inner<T> {
     id: u64,
     sender: RwLock<Option<Sender<Vec<T>>>>,
     receiver: Receiver<Vec<T>>,
     batch_size: usize,
+    weigher: Option<Weigher<T>>,
+    max_batch_weight: usize,
     pending_batches_capacity: usize,
     writers: Mutex<Vec<Arc<Mutex<Vec<T>>>>>,
     num_readers: AtomicUsize,
@@ -119,6 +126,25 @@ impl<T: Send + 'static> WorkQueue<T> {
     /// - `capacity`: maximum number of pending items that can be held in the queue
     /// - `max_batch`: batch size to buffer elements into before handing off to the blocking queue
     pub fn new(name: &str, capacity: usize, max_batch: usize, stats: &StatsRef) -> WorkQueue<T> {
+        Self::new_weighted(name, capacity, max_batch, None, usize::MAX, stats)
+    }
+
+    /// Creates a queue that hands off a batch once it holds `max_batch` items or once their total weight reaches
+    /// `max_batch_weight`, whichever comes first, so that expensive items get spread over more consumers.
+    ///
+    /// - `name`: ID to prepend to stats generated about this queue
+    /// - `capacity`: maximum number of pending items that can be held in the queue
+    /// - `max_batch`: batch size to buffer elements into before handing off to the blocking queue
+    /// - `weigher`: estimated cost for a consumer to process each item, or `None` to batch by count only
+    /// - `max_batch_weight`: total weight that triggers handing off a batch before it is full
+    pub fn new_weighted(
+        name: &str,
+        capacity: usize,
+        max_batch: usize,
+        weigher: Option<Weigher<T>>,
+        max_batch_weight: usize,
+        stats: &StatsRef,
+    ) -> WorkQueue<T> {
         let max_batch = max_batch.max(1);
         let pending_batches_capacity = (capacity / max_batch).max(1);
         let (sender, receiver) = crossbeam_channel::bounded(pending_batches_capacity);
@@ -127,6 +153,8 @@ impl<T: Send + 'static> WorkQueue<T> {
             sender: RwLock::new(Some(sender)),
             receiver,
             batch_size: max_batch,
+            weigher,
+            max_batch_weight,
             pending_batches_capacity,
             writers: Mutex::new(Vec::new()),
             num_readers: AtomicUsize::new(0),
@@ -158,6 +186,7 @@ impl<T: Send + 'static> WorkQueue<T> {
             enqueue_block_time_nanos: self.inner.enqueue_block_time_nanos.counter_for_thread(),
             queue: self.inner.clone(),
             batch,
+            batch_weight: 0,
         }
     }
 
@@ -264,6 +293,8 @@ impl<T: Send> QueueHandle for WorkQueue<T> {
 pub struct WorkQueueWriter<T> {
     queue: Arc<Inner<T>>,
     batch: Arc<Mutex<Vec<T>>>,
+    /// Total weight of the items in `batch`.
+    batch_weight: usize,
     pending_count: ThreadCounter,
     enqueue_count: ThreadCounter,
     enqueue_block_time_nanos: ThreadCounter,
@@ -272,10 +303,14 @@ pub struct WorkQueueWriter<T> {
 impl<T> WorkQueueWriter<T> {
     /// Adds `item` to the queue, blocking if the queue is full.
     pub fn accept(&mut self, item: T) {
+        if let Some(weigher) = &self.queue.weigher {
+            self.batch_weight = self.batch_weight.saturating_add(weigher(&item));
+        }
         let full = {
             let mut batch = self.batch.lock();
             batch.push(item);
-            if batch.len() >= self.queue.batch_size {
+            if batch.len() >= self.queue.batch_size || self.batch_weight >= self.queue.max_batch_weight {
+                self.batch_weight = 0;
                 Some(std::mem::replace(&mut *batch, Vec::with_capacity(self.queue.batch_size)))
             } else {
                 None
@@ -290,6 +325,7 @@ impl<T> WorkQueueWriter<T> {
 
     /// Hands off any buffered items to readers.
     pub fn flush(&mut self) {
+        self.batch_weight = 0;
         let batch = std::mem::take(&mut *self.batch.lock());
         self.queue.flush(batch, &self.enqueue_block_time_nanos);
     }
@@ -361,6 +397,49 @@ mod tests {
 
     fn new_queue<T: Send + 'static>(max_batch: usize) -> WorkQueue<T> {
         WorkQueue::new("queue", 1000, max_batch, &InMemoryStats::arc())
+    }
+
+    fn new_weighted_queue(max_batch: usize, weigher: fn(&i32) -> usize, max_weight: usize) -> WorkQueue<i32> {
+        WorkQueue::new_weighted("queue", 1000, max_batch, Some(Arc::new(weigher)), max_weight, &InMemoryStats::arc())
+    }
+
+    /// `get` on an open queue only returns once the writer handed off a batch, so these tests would hang if the
+    /// weight limit did not trigger a hand-off.
+    #[test]
+    fn hands_off_batch_once_max_weight_reached() {
+        let q = new_weighted_queue(16, |i| *i as usize, 10);
+        q.accept(3);
+        q.accept(4);
+        q.accept(5);
+        assert_eq!(Some(3), q.get());
+        assert_eq!(Some(4), q.get());
+        assert_eq!(Some(5), q.get());
+        q.accept(1);
+        q.close();
+        assert_eq!(Some(1), q.get());
+        assert_eq!(None, q.get());
+    }
+
+    #[test]
+    fn item_heavier_than_max_weight_handed_off_alone() {
+        let q = new_weighted_queue(16, |i| *i as usize, 10);
+        q.accept(100);
+        assert_eq!(Some(100), q.get());
+        q.accept(200);
+        assert_eq!(Some(200), q.get());
+        q.close();
+        assert_eq!(None, q.get());
+    }
+
+    #[test]
+    fn weighted_queue_still_hands_off_full_batches() {
+        let q = new_weighted_queue(2, |_| 0, 10);
+        q.accept(1);
+        q.accept(2);
+        assert_eq!(Some(1), q.get());
+        assert_eq!(Some(2), q.get());
+        q.close();
+        assert_eq!(None, q.get());
     }
 
     #[test]

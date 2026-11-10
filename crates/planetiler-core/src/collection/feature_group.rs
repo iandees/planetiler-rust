@@ -425,6 +425,7 @@ fn encode_value(
         put_sint(buf, group.group);
         put_sint(buf, group.limit as i64);
     }
+    // everything written before the attributes must be compared in same_encoding_before_attributes
     put_sint(buf, feature.id);
     put_sint(buf, encode_geom_type_and_scale(&feature.geometry) as i8 as i64);
     let attrs = &feature.tags;
@@ -453,6 +454,22 @@ fn encode_value(
         put_sint(buf, command as i64);
     }
     Ok(())
+}
+
+/// Returns true if [`encode_value`] writes the same bytes for both features up to their attributes, so their relative
+/// order depends on attribute key IDs. Keep in sync with [`encode_value`].
+fn same_encoding_before_attributes(a: &vector_tile::Feature, b: &vector_tile::Feature) -> bool {
+    a.group == b.group
+        && a.id == b.id
+        && a.geometry.geom_type() == b.geometry.geom_type()
+        && a.geometry.scale() == b.geometry.scale()
+        && a.tags.len() == b.tags.len()
+}
+
+fn sorted_keys(feature: &vector_tile::Feature) -> Vec<&str> {
+    let mut keys: Vec<&str> = feature.tags.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys
 }
 
 /// Appends `val` to `buf` in the smallest msgpack integer encoding (byte-identical to `rmp::encode::write_sint`).
@@ -885,6 +902,32 @@ impl TileFeatures {
         result
     }
 
+    /// Features are sorted by their encoded bytes, so features that tie on everything before their attributes get
+    /// ordered by attribute key IDs, which writer threads assign first come, first served. Reorder runs of those by
+    /// attribute key names so the output does not depend on thread timing.
+    fn order_ties_by_attribute_keys(&self, features: &mut [vector_tile::Feature]) {
+        let mut start = 0;
+        let mut keys_differ = false;
+        for i in 1..=features.len() {
+            // the entry key holds the layer and sort key, which decoded features don't have
+            if i < features.len()
+                && self.entries[start].key == self.entries[i].key
+                && same_encoding_before_attributes(&features[start], &features[i])
+            {
+                // same number of tags, so the key sets are equal if every key of one is in the other
+                keys_differ |= !features[start].tags.keys().all(|k| features[i].tags.contains_key(k));
+            } else {
+                if keys_differ {
+                    // stable, and only for runs that need it, so order is unchanged for everything already
+                    // deterministic
+                    features[start..i].sort_by(|a, b| sorted_keys(a).cmp(&sorted_keys(b)));
+                }
+                start = i;
+                keys_differ = false;
+            }
+        }
+    }
+
     fn build_vector_tile(&self, layer_stats: Option<&layer_attr_stats::Updater>) -> VectorTile {
         let mut tile = VectorTile::new();
         if let Some(stats) = layer_stats {
@@ -892,11 +935,15 @@ impl TileFeatures {
         }
         let mut layer_features: LayerFeatures = LayerFeatures::new();
         let mut current: Option<(u8, Vec<vector_tile::Feature>)> = None;
+        let mut decoded: Vec<vector_tile::Feature> = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
-            let feature = match self.decode_vector_tile_feature(entry) {
-                Ok(f) => f,
+            match self.decode_vector_tile_feature(entry) {
+                Ok(f) => decoded.push(f),
                 Err(e) => panic!("Error decoding feature in {:?}: {e:#}", self.tile_coord),
-            };
+            }
+        }
+        self.order_ties_by_attribute_keys(&mut decoded);
+        for (entry, feature) in self.entries.iter().zip(decoded) {
             let layer_id = extract_layer_id_from_key(entry.key);
             match &mut current {
                 Some((id, items)) if *id == layer_id => items.push(feature),
@@ -1176,6 +1223,38 @@ mod tests {
             .into_iter()
             .map(|(tile, layers)| (tile, layers.into_iter().map(|(l, f)| (l.to_string(), f)).collect()))
             .collect()
+    }
+
+    /// Writing features from several threads assigns string IDs in a different order each run, so encode keys in a
+    /// specific order first, then return the order of tied features in another tile.
+    fn feature_order_after_encoding_keys_in_order(keys: &[&str]) -> Vec<Tags> {
+        let mut h = Harness::new();
+        let first = TileCoord::of_xyz(0, 0, 0);
+        let second = TileCoord::of_xyz(1, 1, 1);
+        for key in keys {
+            h.put_full(1, first, "layer", tags! {*key => 1i64}, pt(1.0, 2.0), 0, None);
+        }
+        // features that tie on everything before their attributes: same tile, layer, sort key, ID and geometry type
+        for key in ["a", "b"] {
+            h.put_full(2, second, "layer", tags! {key => 1i64}, pt(3.0, 4.0), 0, None);
+        }
+        let mut result = Vec::new();
+        for tile in h.features.iter().unwrap() {
+            if tile.tile_coord() == second {
+                for feature in vector_tile::decode(&tile.get_vector_tile().encode()).unwrap() {
+                    result.push(owned_tags(&feature.tags));
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn test_feature_order_does_not_depend_on_string_encoding_order() {
+        assert_eq!(
+            feature_order_after_encoding_keys_in_order(&["a", "b"]),
+            feature_order_after_encoding_keys_in_order(&["b", "a"])
+        );
     }
 
     #[test]

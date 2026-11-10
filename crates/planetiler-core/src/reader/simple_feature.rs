@@ -96,6 +96,11 @@ impl SimpleFeature {
         SimpleFeature { base, geometry_type, from_lat_lon, lat_lon_geometry: lat_lon, world_geometry: world, osm }
     }
 
+    /// Returns the number of points in this feature's geometry without converting between projections.
+    pub fn num_points(&self) -> usize {
+        self.lat_lon_geometry.get().or_else(|| self.world_geometry.get()).map_or(0, geo::CoordsIter::coords_count)
+    }
+
     /// Returns a new feature from its geometry in latitude/longitude coordinates (converted to world web mercator on
     /// read), tags, and source information.
     pub fn create(
@@ -333,6 +338,16 @@ mod tests {
 
     fn gc(geoms: Vec<Geometry<f64>>) -> Geometry<f64> {
         Geometry::GeometryCollection(GeometryCollection(geoms))
+    }
+
+    #[test]
+    fn test_num_points() {
+        assert_eq!(1, SimpleFeature::from_lat_lon_geometry(new_point(1.0, 2.0)).num_points());
+        assert_eq!(
+            3,
+            SimpleFeature::from_lat_lon_geometry(new_line_string(&[0.0, 0.0, 1.0, 1.0, 2.0, 2.0])).num_points()
+        );
+        assert_eq!(5, SimpleFeature::from_world_geometry(rectangle(0.1, 0.2)).num_points());
     }
 
     #[test]

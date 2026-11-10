@@ -34,7 +34,7 @@
 //!   disk estimate (resource amounts are unsigned).
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -62,6 +62,7 @@ use crate::reader::parquet::parquet_input_file::IdGenerator;
 use crate::reader::parquet::parquet_reader::{LayerGenerator, ParquetReader};
 use crate::reader::remote::cached_range_file::CachedRangeFile;
 use crate::reader::remote::download_mode::DownloadMode;
+use crate::reader::shapefile_options::ShapefileOptions;
 use crate::stats::process_info;
 use crate::stats::stats::StatsRef;
 use crate::stats::timers::Finishable;
@@ -415,29 +416,167 @@ impl Planetiler {
         })
     }
 
-    /// Adds a new ESRI shapefile source that will be processed using a projection inferred from the shapefile when
-    /// [`Planetiler::run`] is called.
+    /// Adds a new shapefile source that will be processed when [`Planetiler::run`] is called.
     ///
-    /// `default_path` can be a `.shp` file with the other shapefile components in the same directory, a directory, or
-    /// a `.zip` file containing the shapefile components. Override with the `name_path` argument.
-    pub fn add_shapefile_source(&mut self, name: &str, default_path: impl Into<PathBuf>) -> anyhow::Result<&mut Self> {
-        self.add_shapefile_source_with_projection(None, name, default_path, None)
+    /// `default_path` can be:
+    /// - a single `roads.shp`, with `roads.dbf`, `roads.prj`, ... next to it
+    /// - `water-polygons.zip`, containing one shapefile anywhere inside it
+    /// - a directory or `.zip` file with many shapefiles, to read the ones matching [`ShapefileOptions::glob_pattern`]
+    ///   like `"ne_10m_*.shp"` (in a directory, also inside each matching `.zip` file)
+    ///
+    /// Each feature's source layer is the name of its `.shp` file without the extension, like `roads`.
+    ///
+    /// If the file does not exist and the `download` argument is set, then it gets downloaded from `default_url`
+    /// first. To override them, set `name_path=newpath` and `name_url=http://url/of/shapefile.zip` in the arguments.
+    pub fn add_shapefile_source_with_options(
+        &mut self,
+        name: &str,
+        default_path: impl Into<PathBuf>,
+        default_url: Option<&str>,
+        options: ShapefileOptions,
+    ) -> anyhow::Result<&mut Self> {
+        let path = self.get_path(name, "shapefile", default_path.into(), default_url);
+        let description = format!("Process features in {}", path.display());
+        self.add_source_stage(name, &description, move |ctx| {
+            let source_paths = find_shapefiles(&path, &options.glob_pattern)?;
+            simple_sources::process_shapefiles(&options, &source_paths, ctx)
+        })
     }
 
-    /// Like [`Planetiler::add_shapefile_source`] but downloads from `default_url` (overridden by `name_url`) if the
-    /// file does not exist and `--download` is set.
+    /// Adds a new shapefile source downloaded from multiple URLs that will be processed when [`Planetiler::run`] is
+    /// called.
+    ///
+    /// `default_directory` can be a local directory on disk containing the file names specified in `default_urls`.
+    /// When you run with `--download`, it will download those files into that directory.
+    ///
+    /// `default_directory` can also be a zip file containing all of the necessary files (or set
+    /// `name_path=path/to/shapefiles.zip` in the arguments), and only the shapefiles named like the files in
+    /// `default_urls` get read from it.
+    ///
+    /// Each feature's source layer is the name of its `.shp` file without the extension. To override the URLs, set
+    /// `name_urls=http://url/one.zip,http://url/two.zip` in the arguments.
+    ///
+    /// For example, to read two Natural Earth tables, downloading only their zip files into
+    /// `data/sources/natural_earth` with `--download`:
+    ///
+    /// ```ignore
+    /// planetiler.add_shapefile_multi_url_source(
+    ///     "natural_earth",
+    ///     "data/sources/natural_earth",
+    ///     &[
+    ///         "https://naciscdn.org/naturalearth/10m/physical/ne_10m_ocean.zip",
+    ///         "https://naciscdn.org/naturalearth/10m/physical/ne_10m_lakes.zip",
+    ///     ],
+    ///     ShapefileOptions::default(),
+    /// )?;
+    /// ```
+    ///
+    /// Or to read the same tables from the full Natural Earth package downloaded manually from
+    /// [naciscdn.org](https://naciscdn.org/naturalearth/packages/natural_earth_vector.zip), pass
+    /// `data/sources/natural_earth_vector.zip` as `default_directory`.
+    pub fn add_shapefile_multi_url_source<S: AsRef<str>>(
+        &mut self,
+        name: &str,
+        default_directory: impl Into<PathBuf>,
+        default_urls: &[S],
+        options: ShapefileOptions,
+    ) -> anyhow::Result<&mut Self> {
+        let arg_prefix = format!("--{}", name.replace('_', "-"));
+        let path = self.arguments.file(
+            &format!("{name}_path"),
+            &format!("{name} shapefile directory, or a .zip file containing all the shapefiles"),
+            default_directory,
+        );
+        // the URLs name the local files, so they're needed even when not downloading
+        let urls = self.arguments.get_list(&format!("{name}_urls"), &format!("{name} shapefile urls"), default_urls);
+        if self
+            .arguments
+            .get_string_opt(&format!("{name}_url"), &format!("not supported for {name}, use {name}_urls"))
+            .is_some()
+        {
+            bail!(
+                "{arg_prefix}-url is not supported since {name} reads {} files, set {arg_prefix}-urls (comma \
+                 separated) or {arg_prefix}-path to a .zip file containing all the shapefiles instead",
+                urls.len()
+            );
+        }
+        let free_after_reading = self.arguments.get_boolean(
+            &format!("free_{name}_after_read"),
+            &format!("delete {name} input files after reading to make space for output (reduces peak disk usage)"),
+            false,
+        );
+        if path.is_file() {
+            // select the shapefiles now so a file without them fails before any download
+            let shapefiles = find_shapefiles_matching_urls(&path, &urls, &options.glob_pattern, &arg_prefix)?;
+            self.input_paths.push(InputPath {
+                id: name.to_string(),
+                path: path.clone(),
+                free_after_reading,
+                reads_partial: false,
+            });
+            let description = format!("Process features in {}", path.display());
+            return self.add_source_stage(name, &description, move |ctx| {
+                simple_sources::process_shapefiles(&options, &shapefiles, ctx)
+            });
+        }
+
+        let refresh = self.arguments.get_boolean(
+            &format!("refresh_{name}"),
+            &format!("Download new version of {name} if changed"),
+            self.refresh_sources,
+        );
+        let mut url_to_path: Vec<(String, PathBuf)> = Vec::with_capacity(urls.len());
+        for url in &urls {
+            let file = path.join(url.rsplit('/').next().unwrap_or(url));
+            self.input_paths.push(InputPath {
+                id: name.to_string(),
+                path: file.clone(),
+                free_after_reading,
+                reads_partial: false,
+            });
+            url_to_path.push((url.clone(), file));
+        }
+        if self.download_sources || refresh {
+            let missing: Vec<(String, PathBuf)> =
+                url_to_path.iter().filter(|(_, file)| !file.exists() || refresh).cloned().collect();
+            if !missing.is_empty() {
+                self.to_download.push(ToDownload {
+                    id: name.to_string(),
+                    urls: DownloadUrls::Ready(missing),
+                    needs_bounds: false,
+                });
+            }
+        }
+        let description = format!("Process features in {} files in {}", urls.len(), path.display());
+        self.add_source_stage(name, &description, move |ctx| {
+            let mut shapefiles = vec![];
+            for (_, file) in &url_to_path {
+                shapefiles.extend(find_shapefiles(file, &options.glob_pattern)?);
+            }
+            simple_sources::process_shapefiles(&options, &shapefiles, ctx)
+        })
+    }
+
+    /// Alias for [`Planetiler::add_shapefile_source_with_options`] for a local shapefile with the projection it
+    /// defines.
+    pub fn add_shapefile_source(&mut self, name: &str, default_path: impl Into<PathBuf>) -> anyhow::Result<&mut Self> {
+        self.add_shapefile_source_with_options(name, default_path, None, ShapefileOptions::default())
+    }
+
+    /// Alias for [`Planetiler::add_shapefile_source_with_options`] for a shapefile downloaded from `default_url`
+    /// (overridden by `name_url`) with the projection it defines.
     pub fn add_shapefile_source_with_url(
         &mut self,
         name: &str,
         default_path: impl Into<PathBuf>,
         default_url: Option<&str>,
     ) -> anyhow::Result<&mut Self> {
-        self.add_shapefile_source_with_projection(None, name, default_path, default_url)
+        self.add_shapefile_source_with_options(name, default_path, default_url, ShapefileOptions::default())
     }
 
-    /// Adds a new ESRI shapefile source with an explicit `projection` (`None` to infer it from the `.prj` file). The
-    /// projection can be any EPSG code (`EPSG:2056`, `urn:ogc:def:crs:EPSG::2056`, optionally with a `:lon_first` /
-    /// `:lat_first` suffix), a PROJ string or WKT, see [`crate::geo::crs`].
+    /// Alias for [`Planetiler::add_shapefile_source_with_options`] with an explicit `projection` (`None` to infer it
+    /// from the `.prj` file). The projection can be any EPSG code (`EPSG:2056`, `urn:ogc:def:crs:EPSG::2056`,
+    /// optionally with a `:lon_first` / `:lat_first` suffix), a PROJ string or WKT, see [`crate::geo::crs`].
     pub fn add_shapefile_source_with_projection(
         &mut self,
         projection: Option<&str>,
@@ -445,21 +584,17 @@ impl Planetiler {
         default_path: impl Into<PathBuf>,
         default_url: Option<&str>,
     ) -> anyhow::Result<&mut Self> {
-        let path = self.get_path(name, "shapefile", default_path.into(), default_url);
-        let projection = projection.map(str::to_string);
-        let description = format!("Process features in {}", path.display());
-        self.add_source_stage(name, &description, move |ctx| {
-            let source_paths = if file_utils::has_extension(&path, "zip") || path.is_dir() {
-                file_utils::walk_path_with_pattern(&path, "*.shp")?
-            } else {
-                vec![path.clone()]
-            };
-            simple_sources::process_shapefiles(projection.as_deref(), &source_paths, ctx)
-        })
+        self.add_shapefile_source_with_options(
+            name,
+            default_path,
+            default_url,
+            ShapefileOptions::default().with_projection(projection),
+        )
     }
 
-    /// Adds a new ESRI shapefile glob source that will process all files under `base_path` (a directory or zip
-    /// archive) matching `glob_pattern`. Zip files that match are searched for `*.shp` files.
+    /// Alias for [`Planetiler::add_shapefile_source_with_options`] for the files matching `glob_pattern` in a
+    /// directory or zip archive (downloaded from `default_url` if set) with an explicit `projection`. Zip files that
+    /// match are searched for `*.shp` files.
     pub fn add_shapefile_glob_source(
         &mut self,
         projection: Option<&str>,
@@ -468,18 +603,12 @@ impl Planetiler {
         glob_pattern: &str,
         default_url: Option<&str>,
     ) -> anyhow::Result<&mut Self> {
-        let base_path = base_path.into();
-        let dir_path = self.get_path(name, "shapefile glob", base_path.clone(), default_url);
-        let projection = projection.map(str::to_string);
-        let pattern = glob_pattern.to_string();
-        let description = format!("Process all files matching {}/{glob_pattern}", dir_path.display());
-        self.add_source_stage(name, &description, move |ctx| {
-            // like Java, walk the base path (not the `name_path` override)
-            let source_paths = file_utils::walk_path_with_pattern_and_zip(&base_path, &pattern, |zip| {
-                file_utils::walk_path_with_pattern(zip, "*.shp").unwrap_or_default()
-            })?;
-            simple_sources::process_shapefiles(projection.as_deref(), &source_paths, ctx)
-        })
+        self.add_shapefile_source_with_options(
+            name,
+            base_path,
+            default_url,
+            ShapefileOptions::default().with_projection(projection).with_glob_pattern(glob_pattern),
+        )
     }
 
     /// Adds a new OGC GeoPackage source that will be processed when [`Planetiler::run`] is called.
@@ -1586,6 +1715,56 @@ fn common_parent_prefix(paths: &[PathBuf]) -> String {
     prefix
 }
 
+/// Returns the shapefiles to read from `input`: the matches of `glob_pattern` in a directory or `.zip` file (a
+/// matching `.zip` file inside a directory is searched for `*.shp` files), or `input` itself.
+fn find_shapefiles(input: &Path, glob_pattern: &str) -> anyhow::Result<Vec<PathBuf>> {
+    if file_utils::has_extension(input, "zip") || input.is_dir() {
+        file_utils::walk_path_with_pattern_and_zip(input, glob_pattern, |zip| {
+            file_utils::walk_path_with_pattern(zip, "*.shp").unwrap_or_default()
+        })
+    } else {
+        Ok(vec![input.to_path_buf()])
+    }
+}
+
+/// Returns the shapefiles in `file` named like the files of `urls`, in the order of the URLs.
+fn find_shapefiles_matching_urls(
+    file: &Path,
+    urls: &[String],
+    glob_pattern: &str,
+    arg_prefix: &str,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut by_name: HashMap<String, PathBuf> = HashMap::new();
+    for shapefile in find_shapefiles(file, glob_pattern)? {
+        let file_name = shapefile.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if by_name.insert(file_name.clone(), shapefile).is_some() {
+            bail!("{} contains more than one {file_name}", file.display());
+        }
+    }
+    let mut result = vec![];
+    let mut missing = vec![];
+    for url in urls {
+        let last = url.rsplit('/').next().unwrap_or(url);
+        let file_name = last.strip_suffix(".zip").unwrap_or(last);
+        let file_name = if file_name.ends_with(".shp") { file_name.to_string() } else { format!("{file_name}.shp") };
+        match by_name.get(&file_name) {
+            Some(shapefile) => result.push(shapefile.clone()),
+            None => missing.push(file_name),
+        }
+    }
+    if !missing.is_empty() {
+        bail!(
+            "{} is missing {} of the {} shapefiles needed ({}), set {arg_prefix}-path to a directory to download \
+             them into, or a .zip file containing them",
+            file.display(),
+            missing.len(),
+            urls.len(),
+            missing.join(", ")
+        );
+    }
+    Ok(result)
+}
+
 /// `path.resolveSibling(path.getFileName() + "-unzipped")`.
 fn unzipped_sibling(path: &Path) -> PathBuf {
     let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
@@ -1601,17 +1780,18 @@ mod simple_sources {
     use crate::reader::geo_package_reader::GeoPackageReader;
     use crate::reader::geojson::geo_json_reader::GeoJsonReader;
     use crate::reader::natural_earth_reader::NaturalEarthReader;
+    use crate::reader::shapefile_options::ShapefileOptions;
     use crate::reader::shapefile_reader::ShapefileReader;
 
     pub fn process_shapefiles(
-        projection: Option<&str>,
+        options: &ShapefileOptions,
         paths: &[PathBuf],
         ctx: &mut StageContext<'_>,
     ) -> anyhow::Result<()> {
-        ShapefileReader::process_with_projection(
-            projection,
+        ShapefileReader::process_with_options(
             ctx.name,
             paths.to_vec(),
+            options,
             ctx.feature_group,
             ctx.config,
             ctx.profile,
