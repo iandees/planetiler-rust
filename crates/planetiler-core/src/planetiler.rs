@@ -175,7 +175,7 @@ fn shared_overture_stac(
     cell.lock()
         .get_or_insert_with(|| {
             let downloader = shared_downloader(downloader, config);
-            Arc::new(OvertureStac::with_fetcher(Arc::new(move |url| downloader.fetch_string(url))))
+            Arc::new(OvertureStac::new(downloader))
         })
         .clone()
 }
@@ -1379,7 +1379,7 @@ impl Planetiler {
         }
         let config = self.config.clone();
         if self.fetch_osm_tile_stats {
-            top_osm_tiles::download_precomputed(&config);
+            top_osm_tiles::download_precomputed(&shared_downloader(&self.downloader, &config));
         }
 
         if self.fetch_wikidata {
@@ -1388,7 +1388,7 @@ impl Planetiler {
             wikidata::fetch_with_max_age(
                 infile,
                 outfile,
-                &config,
+                &shared_downloader(&self.downloader, &config),
                 wikidata::profile_filter(profile.clone()),
                 self.stats.clone(),
                 self.wikidata_max_age,

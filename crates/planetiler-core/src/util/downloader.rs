@@ -424,19 +424,6 @@ pub fn parse_retry_after(value: &str, now_epoch_seconds: i64) -> Option<Duration
     Some(Duration::from_secs((date.timestamp() - now_epoch_seconds).max(0) as u64))
 }
 
-/// Returns the contents of `url` read with a short-lived downloader.
-///
-/// Use [`Downloader::open_stream`] on the shared downloader instead so requests share its limits; this only remains
-/// for code that doesn't have one yet.
-pub fn open_stream(url: &str, config: &PlanetilerConfig) -> anyhow::Result<Box<dyn Read + Send>> {
-    Downloader::create(config.clone()).open_stream(url)
-}
-
-/// Reads the full body of a remote URL as a string, with a short-lived downloader.
-pub fn fetch_string(url: &str, config: &PlanetilerConfig) -> anyhow::Result<String> {
-    Downloader::create(config.clone()).fetch_string(url)
-}
-
 /// A resource to download.
 pub struct ResourceToDownload {
     pub id: String,
@@ -604,11 +591,11 @@ impl Downloader {
     /// name. `output` is where to download the file to.
     pub fn add(&self, id: &str, url: &str, output: impl Into<PathBuf>) -> anyhow::Result<&Downloader> {
         let url = if let Some(query) = url.strip_prefix("geofabrik:") {
-            crate::util::geofabrik::get_download_url(query, &self.inner.config)?
+            crate::util::geofabrik::get_download_url(query, self)?
         } else if let Some(query) = url.strip_prefix("aws:") {
-            crate::util::aws_osm::AwsOsm::osm_pds().get_download_url(query, &self.inner.config)?
+            crate::util::aws_osm::AwsOsm::osm_pds().get_download_url(query, self)?
         } else if let Some(query) = url.strip_prefix("overture:") {
-            crate::util::aws_osm::AwsOsm::overture().get_download_url(query, &self.inner.config)?
+            crate::util::aws_osm::AwsOsm::overture().get_download_url(query, self)?
         } else {
             url.to_string()
         };

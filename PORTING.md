@@ -310,13 +310,12 @@ One row per area. The notes after the table describe each area's Rust API and it
 
 ### Wikidata notes
 
-- `Wikidata.fetch(infile, outfile, config, profile, stats[, maxAge, updateLimit])` -> `wikidata::fetch(&OsmInputFile,
-  &Path, &PlanetilerConfig, filter: Fn(&OsmElement) -> bool, StatsRef)` / `fetch_with_max_age(..)` /
-  `fetch_with_client(.., Box<dyn WikidataClient>)`. `Wikidata.load(path)` -> `wikidata::load(&Path)`,
+- `Wikidata.fetch(infile, outfile, downloader, profile, stats[, maxAge, updateLimit])` -> `wikidata::fetch(&OsmInputFile,
+  &Path, &Downloader, filter: Fn(&OsmElement) -> bool, StatsRef)` / `fetch_with_max_age(..)`. `Wikidata.load(path)` -> `wikidata::load(&Path)`,
   `load(reader, maxAge, updateLimit, clock)` -> `load_from_reader(BufRead, Duration, usize, now_millis)`.
-- `Wikidata.Client` -> `WikidataClient` trait (`send(&WikidataRequest) -> anyhow::Result<Vec<u8>>`), default
-  `UreqWikidataClient`. Any send/parse error is retried `http_retries` times (Java retries `IOException`s, which
-  includes JSON errors). Output lines are written sorted by QID.
+- `Wikidata.Client` is gone, as in Java: queries go through `Downloader::send_with_retries` (tests use
+  `StubDownloader`; its `sent_requests()` is Java's `StubDownloader.sent`). Any send/parse error is retried
+  `http_retries` times (Java retries `IOException`s, which includes JSON errors). Output lines are written sorted by QID.
 - `WikidataTranslations` implements `TranslationProvider`; update times are epoch millis (`i64`).
 ### Feature pipeline notes (profile / collector / renderer / feature group)
 
@@ -532,8 +531,8 @@ tiles.join()?;
   `download_max_bandwidth` limits, `Retry-After` handling (`http_retry_max_wait`) and `download_fail_if_changed`
   (`If-Match`/`If-Unmodified-Since` preconditions). Full downloads go through `CachedRangeFile`, so they resume and share
   bytes with `download=cached` runs; servers without range support fall back to one request that restarts.
-  `util::request_planner::RequestPlanner` decides the range requests. `fetch_string`/`open_stream(url, config)` remain as
-  shims that make a short-lived downloader for the code that has no shared one yet (aws/geofabrik/overture/top tiles).
+  `util::request_planner::RequestPlanner` decides the range requests. `AwsOsm`, `Geofabrik`, `OvertureStac`, `TopOsmTiles` and `Wikidata` take a
+  shared `Downloader` like Java (`Downloader::fetch_string`/`open_stream`); the old per-call shims are gone.
 - `reader::remote`: `RangeFile` (`Arc<dyn RangeFile>`), `LocalRangeFile`, `HttpRangeFile`, `CachedRangeFile`,
   `DownloadMode`. `Pending::{start, get, ready}` mirror Java; `ready()` is a `worker::Done`. The `.meta` / `.ranges`
   files have the same format as Java's (the version JSON uses `length`, `etag`, `lastModified`).

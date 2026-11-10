@@ -18,13 +18,13 @@ use parking_lot::Mutex;
 use regex::Regex;
 use serde_json::Value as Json;
 
-use crate::config::planetiler_config::PlanetilerConfig;
 use crate::reader::osm::osm_block_source::OsmBlockSource;
 use crate::reader::osm::osm_element::OsmElement;
 use crate::reader::osm::osm_input_file::OsmInputFile;
 use crate::reader::with_tags::WithTags;
 use crate::stats::progress_loggers::ProgressLoggers;
 use crate::stats::stats::StatsRef;
+use crate::util::downloader::{Downloader, Request};
 use crate::util::format;
 use crate::util::translations::TranslationProvider;
 use crate::value::{Tags, Value};
@@ -40,72 +40,6 @@ pub const SPARQL_URL: &str = "https://query.wikidata.org/bigdata/namespace/wdq/s
 
 /// Map from language to name for each wikidata QID.
 pub type TranslationMap = HashMap<i64, BTreeMap<String, String>>;
-
-/// An HTTP request to the wikidata SPARQL endpoint.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WikidataRequest {
-    pub url: String,
-    pub method: &'static str,
-    pub headers: Vec<(String, String)>,
-    pub body: String,
-}
-
-impl WikidataRequest {
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
-    }
-}
-
-/// Abstraction over HTTP client so tests can easily mock-out the client's response (Java's `Wikidata.Client`).
-pub trait WikidataClient: Send {
-    /// Sends `request` and returns the (decompressed) response body, or an error for failures and HTTP status >= 400.
-    fn send(&self, request: &WikidataRequest) -> anyhow::Result<Vec<u8>>;
-}
-
-impl<F: Fn(&WikidataRequest) -> anyhow::Result<Vec<u8>> + Send> WikidataClient for F {
-    fn send(&self, request: &WikidataRequest) -> anyhow::Result<Vec<u8>> {
-        self(request)
-    }
-}
-
-/// [`WikidataClient`] backed by `ureq` (handles gzip `Content-Encoding` transparently).
-pub struct UreqWikidataClient {
-    agent: ureq::Agent,
-}
-
-impl UreqWikidataClient {
-    pub fn new(config: &PlanetilerConfig) -> UreqWikidataClient {
-        let agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(config.http_timeout))
-            .timeout_global(Some(config.http_timeout))
-            .http_status_as_error(false)
-            .build()
-            .into();
-        UreqWikidataClient { agent }
-    }
-}
-
-impl WikidataClient for UreqWikidataClient {
-    fn send(&self, request: &WikidataRequest) -> anyhow::Result<Vec<u8>> {
-        let mut builder = self.agent.post(&request.url);
-        for (k, v) in &request.headers {
-            builder = builder.header(k, v);
-        }
-        let response = builder.send(request.body.as_bytes())?;
-        let status = response.status().as_u16();
-        let mut body = Vec::new();
-        let read = response.into_body().into_reader().read_to_end(&mut body);
-        if status >= 400 {
-            let body = match read {
-                Ok(_) => String::from_utf8_lossy(&body).to_string(),
-                Err(e) => format!("Error reading body: {e}"),
-            };
-            bail!(std::io::Error::other(format!("Error reading {status}: {body}")));
-        }
-        read?;
-        Ok(body)
-    }
-}
 
 /// Returns a numeric ID from a wikidata IRI like `http://www.wikidata.org/entity/Q9141`.
 fn extract_id_from_wikidata_iri(iri: &str) -> anyhow::Result<i64> {
@@ -163,27 +97,19 @@ pub struct Wikidata<W: Write> {
     visited: HashSet<i64>,
     qids_to_fetch: Vec<i64>,
     writer: W,
-    client: Box<dyn WikidataClient>,
+    downloader: Downloader,
     batch_size: usize,
-    http_user_agent: String,
-    http_retries: u32,
-    http_retry_wait: Duration,
-    sleep: fn(Duration),
 }
 
 impl<W: Write> Wikidata<W> {
-    pub fn new(writer: W, client: Box<dyn WikidataClient>, batch_size: usize, config: &PlanetilerConfig) -> Self {
+    pub fn new(writer: W, downloader: Downloader, batch_size: usize) -> Self {
         Wikidata {
             counters: Arc::default(),
             visited: HashSet::new(),
             qids_to_fetch: Vec::with_capacity(batch_size),
             writer,
-            client,
+            downloader,
             batch_size,
-            http_user_agent: config.http_user_agent.clone(),
-            http_retries: config.http_retries,
-            http_retry_wait: config.http_retry_wait,
-            sleep: std::thread::sleep,
         }
     }
 
@@ -226,33 +152,16 @@ impl<W: Write> Wikidata<W> {
             "SELECT ?id ?label where {{\n  VALUES ?id {{ {qid_list} }} ?id (owl:sameAs* / rdfs:label) ?label\n}}\n"
         );
         let query = WHITESPACE.replace_all(&query, " ").trim().to_string();
-        let request = WikidataRequest {
-            url: SPARQL_URL.to_string(),
-            method: "POST",
-            headers: vec![
-                ("User-Agent".to_string(), self.http_user_agent.clone()),
-                ("Accept".to_string(), "application/sparql-results+json".to_string()),
-                ("Content-Type".to_string(), "application/sparql-query".to_string()),
-            ],
-            body: query,
-        };
-
-        let mut i = 0;
-        loop {
-            match self.client.send(&request).and_then(|body| parse_results(&body)) {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    if i < self.http_retries {
-                        tracing::warn!("sparql query failed, retrying: {e:#}");
-                    } else {
-                        tracing::error!("sparql query failed, exhausted retries: {e:#}");
-                        return Err(e);
-                    }
-                    (self.sleep)(self.http_retry_wait);
-                }
-            }
-            i += 1;
-        }
+        let mut request = Request::post(SPARQL_URL, &query);
+        request.headers = vec![
+            ("Accept".to_string(), "application/sparql-results+json".to_string()),
+            ("Content-Type".to_string(), "application/sparql-query".to_string()),
+        ];
+        self.downloader.send_with_retries(&request, |body| {
+            let mut bytes = Vec::new();
+            BufReader::new(body).read_to_end(&mut bytes)?;
+            parse_results(&bytes).map_err(std::io::Error::other)
+        })
     }
 
     /// Writes translations we already have to the output and skips fetching them again.
@@ -294,11 +203,11 @@ pub fn profile_filter(
 pub fn fetch_for_profile(
     infile: &OsmInputFile,
     outfile: &Path,
-    config: &PlanetilerConfig,
+    downloader: &Downloader,
     profile: std::sync::Arc<dyn crate::profile::Profile>,
     stats: StatsRef,
 ) -> anyhow::Result<()> {
-    fetch(infile, outfile, config, profile_filter(profile), stats)
+    fetch(infile, outfile, downloader, profile_filter(profile), stats)
 }
 
 /// Loads any existing translations from `outfile`, then downloads translations for any wikidata element in `infile`
@@ -306,11 +215,11 @@ pub fn fetch_for_profile(
 pub fn fetch(
     infile: &OsmInputFile,
     outfile: &Path,
-    config: &PlanetilerConfig,
+    downloader: &Downloader,
     filter: impl Fn(&OsmElement) -> bool + Send + Sync + 'static,
     stats: StatsRef,
 ) -> anyhow::Result<()> {
-    fetch_with_max_age(infile, outfile, config, filter, stats, Duration::ZERO, 0)
+    fetch_with_max_age(infile, outfile, downloader, filter, stats, Duration::ZERO, 0)
 }
 
 /// Like [`fetch`], but re-fetches up to `update_limit` (0 = unlimited) translations older than `max_age`
@@ -318,28 +227,13 @@ pub fn fetch(
 pub fn fetch_with_max_age(
     infile: &OsmInputFile,
     outfile: &Path,
-    config: &PlanetilerConfig,
+    downloader: &Downloader,
     filter: impl Fn(&OsmElement) -> bool + Send + Sync + 'static,
     stats: StatsRef,
     max_age: Duration,
     update_limit: usize,
 ) -> anyhow::Result<()> {
-    let client = Box::new(UreqWikidataClient::new(config));
-    fetch_with_client(infile, outfile, config, filter, stats, max_age, update_limit, client)
-}
-
-/// Like [`fetch_with_max_age`] but with a custom HTTP `client`.
-#[allow(clippy::too_many_arguments)]
-pub fn fetch_with_client(
-    infile: &OsmInputFile,
-    outfile: &Path,
-    config: &PlanetilerConfig,
-    filter: impl Fn(&OsmElement) -> bool + Send + Sync + 'static,
-    stats: StatsRef,
-    max_age: Duration,
-    update_limit: usize,
-    client: Box<dyn WikidataClient>,
-) -> anyhow::Result<()> {
+    let config = downloader.config();
     let timer = stats.start_stage("wikidata");
     let process_threads = config.threads.saturating_sub(1).max(1);
     tracing::info!("Starting with {process_threads} process threads");
@@ -347,7 +241,7 @@ pub fn fetch_with_client(
     let old_mappings = load_with_max_age(outfile, max_age, update_limit);
     let writer = BufWriter::new(File::create(outfile).with_context(|| format!("{outfile:?}"))?);
     let source = Arc::new(infile.get()?);
-    let mut fetcher = Wikidata::new(writer, client, 5_000, config);
+    let mut fetcher = Wikidata::new(writer, downloader.clone(), 5_000);
     fetcher.load_existing(&old_mappings)?;
     drop(old_mappings);
     let counters = fetcher.counters.clone();
@@ -556,10 +450,11 @@ impl TranslationProvider for WikidataTranslations {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
 
     use super::*;
     use crate::config::arguments::Arguments;
+    use crate::config::planetiler_config::PlanetilerConfig;
+    use crate::testing::stub_downloader::StubDownloader;
 
     const RESPONSE: &str = r#"
     {
@@ -618,35 +513,13 @@ mod tests {
         PlanetilerConfig::from(&Arguments::from_args(&["--http-retries=1"])).unwrap()
     }
 
-    /// Mock client that records requests and pops responses from a queue (`None` = fail with an IO error).
-    #[derive(Clone, Default)]
-    struct MockClient {
-        requests: Arc<Mutex<Vec<WikidataRequest>>>,
-        responses: Arc<Mutex<VecDeque<Option<String>>>>,
+    fn create_fixture(downloader: &StubDownloader, batch_size: usize) -> Wikidata<Vec<u8>> {
+        Wikidata::new(Vec::new(), downloader.downloader(), batch_size)
     }
 
-    impl MockClient {
-        fn respond(&self, response: Option<&str>) {
-            self.responses.lock().push_back(response.map(String::from));
-        }
-    }
-
-    impl WikidataClient for MockClient {
-        fn send(&self, request: &WikidataRequest) -> anyhow::Result<Vec<u8>> {
-            self.requests.lock().push(request.clone());
-            match self.responses.lock().pop_front() {
-                Some(Some(body)) => Ok(body.into_bytes()),
-                Some(None) => Err(std::io::Error::other("failed").into()),
-                None => panic!("unexpected request"),
-            }
-        }
-    }
-
-    fn create_fixture(client: &MockClient, batch_size: usize) -> Wikidata<Vec<u8>> {
-        let mut result = Wikidata::new(Vec::new(), Box::new(client.clone()), batch_size, &config());
-        // don't sleep in tests
-        result.sleep = |_| {};
-        result
+    /// Returns the requests the stub received, with their headers and body.
+    fn sent(downloader: &StubDownloader) -> Vec<Request> {
+        downloader.sent_requests()
     }
 
     fn load_str(s: &str) -> WikidataTranslations {
@@ -675,25 +548,24 @@ mod tests {
 
     #[test]
     fn test_fetch_wikidata() {
-        let client = MockClient::default();
-        let mut fixture = create_fixture(&client, 2);
+        let downloader = StubDownloader::new(config());
+        let mut fixture = create_fixture(&downloader, 2);
         fixture.fetch(1).unwrap();
-        assert!(client.requests.lock().is_empty());
-        client.respond(Some(RESPONSE));
+        assert!(sent(&downloader).is_empty());
+        downloader.put(SPARQL_URL, RESPONSE.as_bytes());
         fixture.fetch(2).unwrap();
 
         // verify http response
         {
-            let requests = client.requests.lock();
+            let requests = sent(&downloader);
             assert_eq!(1, requests.len());
             let request = &requests[0];
             assert_eq!("https://query.wikidata.org/bigdata/namespace/wdq/sparql", request.url);
-            assert_eq!("POST", request.method);
             assert_eq!(Some("application/sparql-results+json"), request.header("Accept"));
             assert_eq!(Some("application/sparql-query"), request.header("Content-Type"));
             assert_eq!(
-                "SELECT ?id ?label where { VALUES ?id { wd:Q1 wd:Q2 } ?id (owl:sameAs* / rdfs:label) ?label }",
-                request.body
+                Some("SELECT ?id ?label where { VALUES ?id { wd:Q1 wd:Q2 } ?id (owl:sameAs* / rdfs:label) ?label }"),
+                request.body.as_deref()
             );
         }
 
@@ -704,34 +576,32 @@ mod tests {
         assert_eq!(Some(&map(&[("es", "es name2")])), translations.get(2));
 
         // do not re-request on subsequent loads
-        let client2 = MockClient::default();
-        let mut fixture2 = create_fixture(&client2, 2);
+        let downloader2 = StubDownloader::new(config());
+        let mut fixture2 = create_fixture(&downloader2, 2);
         fixture2.load_existing(&load_str(&written)).unwrap();
         fixture2.fetch(1).unwrap();
         fixture2.fetch(2).unwrap();
         fixture2.fetch(1).unwrap();
         fixture2.flush().unwrap();
-        assert!(client2.requests.lock().is_empty());
+        assert!(sent(&downloader2).is_empty());
     }
 
     #[test]
     fn test_retry_failed_request_once() {
-        let client = MockClient::default();
-        let mut fixture = create_fixture(&client, 1);
+        let downloader = StubDownloader::new(config());
+        downloader.put(SPARQL_URL, RESPONSE.as_bytes());
+        let mut fixture = create_fixture(&downloader, 1);
         // fail once then succeed
-        client.respond(None);
-        client.respond(Some(RESPONSE));
+        downloader.fail_next(1, 503);
         fixture.fetch(1).unwrap();
         let translations = load_str(&String::from_utf8(fixture.writer.clone()).unwrap());
         assert_eq!(Some(&map(&[("en", "en name"), ("es", "es name")])), translations.get(1));
         assert_eq!(Some(&map(&[("es", "es name2")])), translations.get(2));
 
         // fail all subsequent requests
-        client.respond(None);
-        client.respond(None);
+        downloader.fail_next(1000, 503);
         let err = fixture.fetch(2).unwrap_err();
-        assert!(err.chain().any(|e| e.is::<std::io::Error>()), "{err:?}");
-        assert_eq!(4, client.requests.lock().len());
+        assert!(crate::util::downloader::download_error(&err).is_some(), "{err:?}");
     }
 
     #[test]
@@ -772,14 +642,14 @@ mod tests {
         std::fs::write(&outfile, "[\"5\",{\"en\":\"five\"},1000]\n").unwrap();
 
         let input = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/resources/monaco-latest.osm.pbf");
-        let client = MockClient::default();
-        client.respond(Some(RESPONSE));
+        let downloader = StubDownloader::new(config());
+        downloader.put(SPARQL_URL, RESPONSE.as_bytes());
         let seen = Arc::new(AtomicI64::new(0));
         let seen2 = seen.clone();
-        fetch_with_client(
+        fetch_with_max_age(
             &OsmInputFile::new(input, false),
             &outfile,
-            &PlanetilerConfig::defaults(),
+            &downloader.downloader(),
             move |elem| {
                 seen2.fetch_add(1, Ordering::Relaxed);
                 elem.id() < 0
@@ -787,12 +657,11 @@ mod tests {
             crate::stats::stats::InMemoryStats::arc(),
             Duration::ZERO,
             0,
-            Box::new(client.clone()),
         )
         .unwrap();
         assert!(seen.load(Ordering::Relaxed) > 0);
         // filter rejected everything, so no requests were made but existing translations were kept
-        assert!(client.requests.lock().is_empty());
+        assert!(sent(&downloader).is_empty());
         let loaded = load(&outfile);
         assert_eq!(Some(&map(&[("en", "five")])), loaded.get(5));
         assert!(loaded.get_update_times().is_empty());

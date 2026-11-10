@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 use anyhow::bail;
 use parking_lot::Mutex;
 
-use crate::config::planetiler_config::PlanetilerConfig;
+use crate::util::downloader::Downloader;
 
 const MAX_PAGES: usize = 100;
 
@@ -46,9 +46,10 @@ impl AwsOsm {
         &OVERTURE
     }
 
-    /// Fetches the bucket index and returns the URL of a `.osm.pbf` file where the snapshot matches `search_query`, or
-    /// the latest snapshot if `search_query == "latest"`.
-    pub fn get_download_url(&self, search_query: &str, config: &PlanetilerConfig) -> anyhow::Result<String> {
+    /// Fetches the bucket index with `downloader` and returns the URL of a `.osm.pbf` file where the snapshot matches
+    /// `search_query`, or the latest snapshot if `search_query == "latest"`. The index is only fetched once and cached
+    /// after that.
+    pub fn get_download_url(&self, search_query: &str, downloader: &Downloader) -> anyhow::Result<String> {
         let mut entries = self.entries.lock();
         if entries.is_empty() {
             let mut result = vec![];
@@ -59,10 +60,7 @@ impl AwsOsm {
                 if page_num > MAX_PAGES {
                     bail!("Too many entries in {} to page through", self.bucket_index_url);
                 }
-                let xml = crate::util::downloader::fetch_string(
-                    &format!("{}?list-type=2{param}", self.bucket_index_url),
-                    config,
-                )?;
+                let xml = downloader.fetch_string(&format!("{}?list-type=2{param}", self.bucket_index_url))?;
                 let page = parse_index_xml(&xml);
                 result.extend(page.contents);
                 next_page_param = match (page.truncated, page.next_token) {
@@ -149,6 +147,8 @@ pub fn parse_index_xml(xml: &str) -> IndexXml {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::planetiler_config::PlanetilerConfig;
+    use crate::testing::stub_downloader::StubDownloader;
 
     fn contents(keys: &[&str]) -> String {
         keys.iter()
@@ -250,6 +250,24 @@ mod tests {
         let expected = "https://base.url/release/2023-04-02-alpha/planet-2023-04-02-alpha.osm.pbf";
         assert_eq!(expected, aws_osm.search_index_for_download_url("latest", &index.contents).unwrap());
         assert_eq!(expected, aws_osm.search_index_for_download_url("2023-04-02-alpha", &index.contents).unwrap());
+    }
+
+    #[test]
+    fn fetches_and_caches_all_pages_of_the_index() {
+        let stub = StubDownloader::new(PlanetilerConfig::defaults());
+        stub.put("https://base.url/?list-type=2", response().as_bytes());
+        stub.put("https://base.url/?list-type=2&continuation-token=nextpage", overture_response().as_bytes());
+        let aws_osm = AwsOsm::new("https://base.url/");
+        assert_eq!(
+            "https://base.url/release/2023-04-02-alpha/planet-2023-04-02-alpha.osm.pbf",
+            aws_osm.get_download_url("latest", &stub.downloader()).unwrap()
+        );
+        assert_eq!(2, stub.requests().len());
+        assert_eq!(
+            "https://base.url/2023/planet-230116.osm.pbf",
+            aws_osm.get_download_url("230116", &stub.downloader()).unwrap()
+        );
+        assert_eq!(2, stub.requests().len(), "index is cached");
     }
 
     #[test]

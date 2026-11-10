@@ -18,6 +18,7 @@ use crate::config::planetiler_config::PlanetilerConfig;
 use crate::geo::tile_coord::TileCoord;
 use crate::stats::progress_loggers::ProgressLoggers;
 use crate::stats::stats::StatsRef;
+use crate::util::downloader::Downloader;
 use crate::util::tile_weights::TileWeights;
 use crate::worker::worker_pipeline::WorkerPipeline;
 
@@ -46,19 +47,19 @@ fn tile_log_url_from(base_url: &str, date: NaiveDate) -> String {
 }
 
 /// Returns a fetcher that downloads `.xz` compressed tile logs from `base_url` (a 404 is reported as `NotFound`).
-pub fn http_fetcher(config: &PlanetilerConfig, base_url: &str) -> LogFetcher {
-    let (config, base_url) = (config.clone(), base_url.to_string());
+pub fn http_fetcher(downloader: &Downloader, base_url: &str) -> LogFetcher {
+    let (downloader, base_url) = (downloader.clone(), base_url.to_string());
     Arc::new(move |date| {
-        let input = crate::util::downloader::open_stream(&tile_log_url_from(&base_url, date), &config)?;
+        let input = downloader.open_stream(&tile_log_url_from(&base_url, date))?;
         Ok(Box::new(xz_reader(input)) as Box<dyn Read + Send>)
     })
 }
 
 impl TopOsmTiles {
-    /// Creates an instance that downloads `.xz` compressed logs from openstreetmap.org.
-    pub fn new(config: PlanetilerConfig, stats: StatsRef) -> TopOsmTiles {
-        let fetcher = http_fetcher(&config, TILE_LOGS_URL);
-        Self::with_fetcher(config, stats, fetcher)
+    /// Creates an instance that downloads `.xz` compressed logs from openstreetmap.org with `downloader`.
+    pub fn new(downloader: Downloader, stats: StatsRef) -> TopOsmTiles {
+        let fetcher = http_fetcher(&downloader, TILE_LOGS_URL);
+        Self::with_fetcher(downloader.config().clone(), stats, fetcher)
     }
 
     /// Creates an instance that reads logs using `fetcher` (for tests).
@@ -140,9 +141,10 @@ pub fn main<S: AsRef<str>>(args: &[S]) -> anyhow::Result<()> {
 fn run_main(
     arguments: &Arguments,
     today: NaiveDate,
-    create: impl FnOnce(PlanetilerConfig, StatsRef) -> TopOsmTiles,
+    create: impl FnOnce(Downloader, StatsRef) -> TopOsmTiles,
 ) -> anyhow::Result<()> {
     let config = PlanetilerConfig::from(arguments)?;
+    let downloader = Downloader::create(config);
     let stats = arguments.get_stats()?;
     let days = arguments.get_integer("days", "number of days into the past to look", 90)?;
     let max_zoom = arguments.get_integer("maxzoom", "max zoom", 16)?;
@@ -156,7 +158,7 @@ fn run_main(
     )?;
 
     let to_download = (0..days.max(0) as u64).map(|i| today - chrono::Days::new(i)).collect();
-    create(config, stats)
+    create(downloader, stats)
         .run(threads.max(1) as usize, top_n.max(0) as usize, max_zoom.max(0) as u32, to_download)?
         .write_to_file(&output)?;
     Ok(())
@@ -209,8 +211,8 @@ fn read_file(fetcher: &LogFetcher, retries: u32, max_zoom: u32, date: NaiveDate)
 
 /// Downloads precomputed top-1m tile stats from 90 days of openstreetmap.org tile logs to
 /// [`PlanetilerConfig::tile_weights`] if the file doesn't already exist. Failures are logged, not returned.
-pub fn download_precomputed(config: &PlanetilerConfig) {
-    let dest = &config.tile_weights;
+pub fn download_precomputed(downloader: &Downloader) {
+    let dest = &downloader.config().tile_weights;
     if dest.exists() {
         return;
     }
@@ -218,7 +220,7 @@ pub fn download_precomputed(config: &PlanetilerConfig) {
     tmp_name.push(".tmp");
     let tmp = dest.with_file_name(tmp_name);
     let result = (|| -> anyhow::Result<()> {
-        let mut input = crate::util::downloader::open_stream(DOWNLOAD_URL, config)?;
+        let mut input = downloader.open_stream(DOWNLOAD_URL)?;
         tracing::info!("Downloading pre-computed tile weights from {DOWNLOAD_URL} to {}", dest.display());
         if let Some(parent) = tmp.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
@@ -242,6 +244,7 @@ mod tests {
 
     use super::*;
     use crate::stats::stats::InMemoryStats;
+    use crate::testing::stub_downloader::StubDownloader;
 
     fn reader(s: &str) -> anyhow::Result<Box<dyn Read + Send>> {
         Ok(Box::new(std::io::Cursor::new(s.as_bytes().to_vec())))
@@ -333,56 +336,17 @@ mod tests {
         assert_eq!(format!("{DAY0}{DAY1}"), result);
     }
 
-    /// Serves `.xz` tile logs for day 0 and day 1 over HTTP (404 for anything else) for `requests` requests, and
-    /// returns the requested paths.
-    fn serve_tile_logs(requests: usize) -> (String, std::thread::JoinHandle<Vec<String>>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base_url = format!("http://127.0.0.1:{}/tile_logs", listener.local_addr().unwrap().port());
-        let server = std::thread::spawn(move || {
-            let mut paths = vec![];
-            for _ in 0..requests {
-                let (stream, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(stream);
-                let mut request_line = String::new();
-                reader.read_line(&mut request_line).unwrap();
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line.trim().is_empty() {
-                        break;
-                    }
-                }
-                let path = request_line.split(' ').nth(1).unwrap_or_default().to_string();
-                let body = match path.as_str() {
-                    "/tile_logs/tiles-1970-01-01.txt.xz" => Some(xz(DAY0)),
-                    "/tile_logs/tiles-1970-01-02.txt.xz" => Some(xz(DAY1)),
-                    _ => None,
-                };
-                let mut stream = reader.into_inner();
-                match body {
-                    Some(body) => {
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                            body.len()
-                        )
-                        .unwrap();
-                        stream.write_all(&body).unwrap();
-                    }
-                    None => stream
-                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                        .unwrap(),
-                }
-                paths.push(path);
-            }
-            paths
-        });
-        (base_url, server)
+    /// A stub server with `.xz` tile logs for day 0 and day 1 under [`TILE_LOGS_URL`] (404 for anything else).
+    fn stub_tile_logs(config: PlanetilerConfig) -> StubDownloader {
+        let stub = StubDownloader::new(config);
+        stub.put(&tile_log_url(day(0)), &xz(DAY0));
+        stub.put(&tile_log_url(day(1)), &xz(DAY1));
+        stub
     }
 
     #[test]
     fn main_downloads_and_writes_tile_weights() {
-        let (base_url, server) = serve_tile_logs(3);
+        let stub = stub_tile_logs(PlanetilerConfig::defaults());
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("top.tsv.gz");
         let arguments = Arguments::of_pairs([
@@ -392,21 +356,33 @@ mod tests {
             ("download-threads", "1"),
             ("output", output.to_str().unwrap()),
         ]);
-        run_main(&arguments, day(2), |config, stats| {
-            let fetcher = http_fetcher(&config, &base_url);
-            TopOsmTiles::with_fetcher(config, stats, fetcher)
-        })
-        .unwrap();
-        let mut paths = server.join().unwrap();
-        paths.sort();
+        run_main(&arguments, day(2), |_, stats| TopOsmTiles::new(stub.downloader(), stats)).unwrap();
+        let mut urls: Vec<String> = stub.requests().into_iter().map(|r| r.url).collect();
+        urls.sort();
         assert_eq!(
             vec![
-                "/tile_logs/tiles-1970-01-01.txt.xz",
-                "/tile_logs/tiles-1970-01-02.txt.xz",
-                "/tile_logs/tiles-1970-01-03.txt.xz"
+                "https://planet.openstreetmap.org/tile_logs/tiles-1970-01-01.txt.xz",
+                "https://planet.openstreetmap.org/tile_logs/tiles-1970-01-02.txt.xz",
+                "https://planet.openstreetmap.org/tile_logs/tiles-1970-01-03.txt.xz"
             ],
-            paths
+            urls
         );
         assert_eq!(weights(&[(0, 0, 0, 15), (0, 0, 1, 12)]), TileWeights::read_from_file(&output));
+    }
+
+    #[test]
+    fn download_precomputed_uses_downloader() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("weights.tsv.gz");
+        let mut config = PlanetilerConfig::defaults();
+        config.tile_weights = dest.clone();
+        let stub = StubDownloader::new(config);
+        stub.put(DOWNLOAD_URL, b"contents");
+        download_precomputed(&stub.downloader());
+        assert_eq!(b"contents".to_vec(), std::fs::read(&dest).unwrap());
+        // does not download again once the file exists
+        stub.clear_requests();
+        download_precomputed(&stub.downloader());
+        assert!(stub.requests().is_empty());
     }
 }

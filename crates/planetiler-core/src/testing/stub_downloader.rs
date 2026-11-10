@@ -39,6 +39,7 @@ pub struct StubTransport {
     files: Mutex<HashMap<String, StubFile>>,
     redirects: Mutex<HashMap<String, String>>,
     requests: Mutex<Vec<StubRequest>>,
+    sent: Mutex<Vec<Request>>,
     retry_waits: Mutex<Vec<Duration>>,
     failures_left: AtomicI64,
     failure_status: AtomicUsize,
@@ -75,6 +76,7 @@ impl Transport for StubTransport {
         let range = request.header("range").map(str::to_string);
         let if_match = request.header("if-match").map(str::to_string);
         let if_unmodified_since = request.header("if-unmodified-since").map(str::to_string);
+        self.sent.lock().push(request.clone());
         self.requests.lock().push(StubRequest {
             url: url.to_string(),
             range: range.clone(),
@@ -267,8 +269,15 @@ impl StubDownloader {
         self.stub.requests.lock().clone()
     }
 
+    /// Returns the requests received so far as they were sent, with their headers and body (Java's
+    /// `StubDownloader.sent`).
+    pub fn sent_requests(&self) -> Vec<Request> {
+        self.stub.sent.lock().clone()
+    }
+
     pub fn clear_requests(&self) {
         self.stub.requests.lock().clear();
+        self.stub.sent.lock().clear();
     }
 
     /// Returns how long the downloader waited before each retry (without waiting).
