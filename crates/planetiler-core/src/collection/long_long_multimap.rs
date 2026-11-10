@@ -129,6 +129,24 @@ pub fn new_appendable_multimap() -> SparseUnorderedBinarySearchMultimap {
     SparseUnorderedBinarySearchMultimap::new()
 }
 
+/// Returns a new multimap like [`new_appendable_multimap`] that returns each key's values sorted by
+/// `value & order_mask`, with values that tie on those bits in the order they were written.
+///
+/// Useful to keep reads deterministic when values get written from several threads.
+pub fn new_appendable_multimap_with_order_mask(order_mask: i64) -> SparseUnorderedBinarySearchMultimap {
+    SparseUnorderedBinarySearchMultimap::with_order_mask(order_mask)
+}
+
+/// Stably sorts `(key, value)` pairs by key, and values with the same key by `value & order_mask` (unless the mask is
+/// 0, which keeps their insertion order).
+pub fn sort_pairs(pairs: &mut [(i64, i64)], order_mask: i64) {
+    if order_mask == 0 {
+        pairs.par_sort_by_key(|p| p.0);
+    } else {
+        pairs.par_sort_by_key(|p| (p.0, p.1 & order_mask));
+    }
+}
+
 /// Dummy implementation that ignores writes and panics on [`LongLongMultimap::get`].
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Noop;
@@ -156,11 +174,17 @@ impl Appendable for Noop {
 /// insertion order).
 pub struct SparseUnorderedBinarySearchMultimap {
     state: SealOnRead<Vec<(i64, i64)>>,
+    order_mask: i64,
 }
 
 impl SparseUnorderedBinarySearchMultimap {
     pub fn new() -> SparseUnorderedBinarySearchMultimap {
-        SparseUnorderedBinarySearchMultimap { state: SealOnRead::new(Vec::new()) }
+        Self::with_order_mask(0)
+    }
+
+    /// See [`new_appendable_multimap_with_order_mask`].
+    pub fn with_order_mask(order_mask: i64) -> SparseUnorderedBinarySearchMultimap {
+        SparseUnorderedBinarySearchMultimap { state: SealOnRead::new(Vec::new()), order_mask }
     }
 
     fn sorted(&self) -> &[(i64, i64)] {
@@ -168,7 +192,7 @@ impl SparseUnorderedBinarySearchMultimap {
             let timer = Timer::start();
             tracing::debug!("Sorting long long multimap...");
             // stable parallel sort keeps values for each key in insertion order
-            pairs.par_sort_by_key(|p| p.0);
+            sort_pairs(pairs, self.order_mask);
             pairs.shrink_to_fit();
             tracing::debug!("Sorted long long multimap {}", timer.stop());
         })
@@ -460,6 +484,68 @@ mod tests {
             c.assert_result(vec![1, 2, 3], 1);
             c.assert_result(vec![], 2);
         }
+    }
+
+    const MASK: i64 = (1 << 48) - 1;
+
+    fn value(ordered: i64, other: i64) -> i64 {
+        ordered | (other << 48)
+    }
+
+    fn masked(values: Vec<i64>) -> Vec<i64> {
+        values.into_iter().map(|v| v & MASK).collect()
+    }
+
+    #[test]
+    fn order_mask_map_behaves_like_plain_appendable() {
+        let c = Case {
+            map: Map::Appendable(Box::new(new_appendable_multimap_with_order_mask(MASK))),
+            retain_input_order: false,
+            _dir: None,
+        };
+        c.put(1, 1);
+        c.put(3, 3);
+        c.assert_result(vec![], 0);
+        c.assert_result(vec![1], 1);
+        c.assert_result(vec![], 2);
+        c.assert_result(vec![3], 3);
+    }
+
+    #[test]
+    fn read_order_does_not_depend_on_write_order() {
+        let a = new_appendable_multimap_with_order_mask(MASK);
+        let b = new_appendable_multimap_with_order_mask(MASK);
+        // the high bits differ between runs, like IDs that get assigned first come, first served
+        a.put(1, value(3, 1)).unwrap();
+        a.put(2, value(1, 1)).unwrap();
+        a.put(1, value(1, 2)).unwrap();
+        a.put(1, value(2, 1)).unwrap();
+        a.put(1, value(2, 2)).unwrap();
+        a.put(2, value(4, 2)).unwrap();
+
+        b.put(1, value(1, 1)).unwrap();
+        b.put(1, value(2, 2)).unwrap();
+        b.put(1, value(2, 1)).unwrap();
+        b.put(2, value(4, 1)).unwrap();
+        b.put(2, value(1, 2)).unwrap();
+        b.put(1, value(3, 2)).unwrap();
+
+        for key in 0..=2 {
+            assert_eq!(masked(a.get(key)), masked(b.get(key)), "key {key}");
+        }
+    }
+
+    #[test]
+    fn equal_ordered_bits_keep_write_order() {
+        let a = new_appendable_multimap_with_order_mask(MASK);
+        let b = new_appendable_multimap_with_order_mask(MASK);
+        a.put(1, value(2, 1)).unwrap();
+        a.put(1, value(1, 1)).unwrap();
+        a.put(1, value(1, 2)).unwrap();
+        b.put(1, value(1, 1)).unwrap();
+        b.put(1, value(1, 2)).unwrap();
+        b.put(1, value(2, 1)).unwrap();
+        assert_eq!(a.get(1), b.get(1));
     }
 
     #[test]

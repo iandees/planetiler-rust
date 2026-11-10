@@ -33,7 +33,6 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use geo_types::{Coord, Geometry, LineString, Point, Polygon};
-use rayon::slice::ParallelSliceMut;
 use roaring::RoaringTreemap;
 
 use crate::collection::feature_group::{self, FeatureGroup, FeatureSink, RenderedFeatureEncoder};
@@ -166,10 +165,12 @@ struct RelationState {
 
 impl RelationState {
     fn freeze(&mut self) {
-        // stable sorts keep memberships for each key in insertion order
-        self.way_to_relations.par_sort_by_key(|p| p.0);
+        // Pass 1 can process relations from several threads, which append in a different order every run, so order
+        // memberships for each key by relation ID (not role, since role IDs are also assigned in a different order each
+        // time planetiler runs) to keep output deterministic between runs. Ties keep insertion order.
+        long_long_multimap::sort_pairs(&mut self.way_to_relations, NOT_ROLE_MASK);
         self.way_to_relations.shrink_to_fit();
-        self.relation_to_parent_relations.par_sort_by_key(|p| p.0);
+        long_long_multimap::sort_pairs(&mut self.relation_to_parent_relations, NOT_ROLE_MASK);
         self.relation_to_parent_relations.shrink_to_fit();
     }
 
