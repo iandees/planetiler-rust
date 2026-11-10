@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use anyhow::bail;
 use serde::Deserialize;
 
-use crate::config::planetiler_config::PlanetilerConfig;
+use crate::util::downloader::Downloader;
 
 const INDEX_URL: &str = "https://download.geofabrik.de/index-v1-nogeom.json";
 
@@ -56,16 +56,19 @@ pub struct IndexJson {
 ///
 /// Prefers exact ID matches, then exact name matches, then names that contain all the tokens. Fails if there are no
 /// matches or more than one match.
-pub fn get_download_url(search_query: &str, config: &PlanetilerConfig) -> anyhow::Result<String> {
+pub fn get_download_url(search_query: &str, downloader: &Downloader) -> anyhow::Result<String> {
     let index = match INDEX.get() {
         Some(index) => index,
         None => {
-            let json = crate::util::downloader::fetch_string(INDEX_URL, config)?;
-            let _ = INDEX.set(parse_index_json(&json)?);
+            let _ = INDEX.set(fetch_index(downloader)?);
             INDEX.get().expect("index set")
         }
     };
     search_index_for_download_url(search_query, index)
+}
+
+fn fetch_index(downloader: &Downloader) -> anyhow::Result<IndexJson> {
+    parse_index_json(&downloader.fetch_string(INDEX_URL)?)
 }
 
 /// Parses the Geofabrik JSON index.
@@ -199,6 +202,23 @@ mod tests {
         ] {
             assert_eq!(expected, search_index_for_download_url(search, &index).unwrap(), "{search}");
         }
+    }
+
+    #[test]
+    fn fetches_index_with_downloader() {
+        let stub = crate::testing::stub_downloader::StubDownloader::new(
+            crate::config::planetiler_config::PlanetilerConfig::defaults(),
+        );
+        let json = r#"{"features": [{"properties": {"id": "monaco", "name": "Monaco",
+            "urls": {"pbf": "https://download.geofabrik.de/europe/monaco-latest.osm.pbf"}}}]}"#;
+        stub.put(INDEX_URL, json.as_bytes());
+        let index = fetch_index(&stub.downloader()).unwrap();
+        assert_eq!(
+            "https://download.geofabrik.de/europe/monaco-latest.osm.pbf",
+            search_index_for_download_url("monaco", &index).unwrap()
+        );
+        stub.put(INDEX_URL, b"not json");
+        assert!(fetch_index(&stub.downloader()).is_err());
     }
 
     #[test]

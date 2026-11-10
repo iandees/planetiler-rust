@@ -53,7 +53,7 @@ pub fn main<S: AsRef<str>>(args: &[S]) -> anyhow::Result<()> {
     let stats = crate::stats::stats::in_memory();
     let download = arguments.get_boolean("download_osm_tile_weights|download", "download OSM tile weights file", false);
     if download && !config.tile_weights.exists() {
-        crate::util::top_osm_tiles::download_precomputed(&config);
+        crate::util::top_osm_tiles::download_precomputed(&crate::util::downloader::Downloader::create(config.clone()));
     }
     let tile_stats =
         TilesetSummaryStatistics::with_weights(std::sync::Arc::new(TileWeights::read_from_file(&config.tile_weights)));

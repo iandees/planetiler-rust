@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::config::bounds::Bounds;
-use crate::config::planetiler_config::PlanetilerConfig;
 use crate::geo::envelope::Envelope;
+use crate::util::downloader::Downloader;
 
 pub const DEFAULT_CATALOG_URL: &str = "https://stac.overturemaps.org/catalog.json";
 
@@ -71,37 +71,31 @@ pub struct StacItem {
     pub assets: BTreeMap<String, StacAsset>,
 }
 
-/// Fetches the body of a URL as a string.
-pub type Fetcher = Arc<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>;
-
 /// Lists the parquet files for a catalog URL, theme, type and bounds in place of walking the catalog.
 pub type Lookup = Arc<dyn Fn(&str, &str, &str, &Bounds) -> anyhow::Result<Vec<String>> + Send + Sync>;
 
 /// Client for the Overture STAC catalog.
 pub struct OvertureStac {
-    fetcher: Fetcher,
+    downloader: Option<Downloader>,
     lookup: Option<Lookup>,
 }
 
 impl OvertureStac {
-    /// Creates a client backed by real HTTP requests using timeouts and user agent from `config`.
-    pub fn create(config: &PlanetilerConfig) -> OvertureStac {
-        let config = config.clone();
-        OvertureStac::with_fetcher(Arc::new(move |url| crate::util::downloader::fetch_string(url, &config)))
-    }
-
-    /// Creates a client that fetches JSON with `fetcher` (for tests).
-    pub fn with_fetcher(fetcher: Fetcher) -> OvertureStac {
-        OvertureStac { fetcher, lookup: None }
+    /// Creates a client that fetches catalogs through `downloader`.
+    pub fn new(downloader: Downloader) -> OvertureStac {
+        OvertureStac { downloader: Some(downloader), lookup: None }
     }
 
     /// Creates a client that lists files with `lookup` instead of walking the catalog (for tests to simulate it).
     pub fn with_lookup(lookup: Lookup) -> OvertureStac {
-        OvertureStac { fetcher: Arc::new(|url| anyhow::bail!("no catalog to fetch {url} from")), lookup: Some(lookup) }
+        OvertureStac { downloader: None, lookup: Some(lookup) }
     }
 
     fn fetch<T: DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
-        let json = (self.fetcher)(url).with_context(|| format!("Failed to fetch STAC URL: {url}"))?;
+        let Some(downloader) = &self.downloader else {
+            bail!("no catalog to fetch {url} from");
+        };
+        let json = downloader.fetch_string(url).with_context(|| format!("Failed to fetch STAC URL: {url}"))?;
         serde_json::from_str(&json).with_context(|| format!("Failed to parse STAC URL: {url}"))
     }
 
@@ -282,15 +276,17 @@ pub fn resolve_url(base: &str, href: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
+    use crate::config::planetiler_config::PlanetilerConfig;
+    use crate::testing::stub_downloader::StubDownloader;
 
+    /// An `OvertureStac` that fetches the JSON in `stubs` from a stub server instead of making real HTTP requests.
     fn stub_stac(stubs: &[(&str, &str)]) -> OvertureStac {
-        let stubs: HashMap<String, String> = stubs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        OvertureStac::with_fetcher(Arc::new(move |url| {
-            stubs.get(url).cloned().ok_or_else(|| anyhow::anyhow!("No stub for URL: {url}"))
-        }))
+        let downloader = StubDownloader::new(PlanetilerConfig::defaults());
+        for (url, json) in stubs {
+            downloader.put(url, json.as_bytes());
+        }
+        OvertureStac::new(downloader.downloader())
     }
 
     fn parse<T: DeserializeOwned>(json: &str) -> T {
