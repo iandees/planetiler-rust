@@ -818,3 +818,50 @@ fn test_handle_profile_exception() {
     .unwrap();
     assert_submap(&tile_map([]), &results.tiles);
 }
+
+fn route_relation_with_members(id: i64, member_type: OsmElementType, ref_id: i64, role: &str) -> OsmElement {
+    relation(id, tags! {"type" => "route"}, vec![Member::new(member_type, ref_id, role)])
+}
+
+/// Returns the relation IDs and roles that way 5 sees (including super-relations), in the order they are returned.
+fn relation_info_order_for_way(relations: &[OsmElement]) -> String {
+    let mut elements = vec![node(1, 0.0, 0.0), node(2, get_world_lat(0.375), 0.0), way(5, tags! {}, &[1, 2])];
+    elements.extend(relations.iter().cloned());
+    let results = run_with_osm_elements(
+        &[("threads", "1")],
+        elements,
+        |rel| Some(vec![Arc::new(TestRelationInfo { id: rel.id, name: None }) as Arc<dyn OsmRelationInfo>]),
+        |source, features| {
+            let order = source
+                .relation_info_with_super::<TestRelationInfo>(true)
+                .iter()
+                .map(|member| format!("{}:{}", member.relation.id, member.role))
+                .collect::<Vec<_>>()
+                .join(",");
+            features.line("layer").set_zoom_range(0, 0).set_attr("relations", order);
+        },
+    )
+    .unwrap();
+    results.tiles[&TileCoord::of_xyz(0, 0, 0)][0].attrs.get("relations").and_then(|v| v.as_str()).unwrap().to_string()
+}
+
+#[test]
+fn test_osm_relation_info_order_does_not_depend_on_relation_processing_order() {
+    // Pass 1 processes relations from several threads when the node map supports parallel writes, so the order it sees
+    // them in changes from run to run. Processing them out of order from a single thread reproduces that reliably.
+    let relations = vec![
+        // way 5 is in relations 1-4, and relation 4 which is in relations 6-8
+        route_relation_with_members(1, OsmElementType::Way, 5, "a"),
+        route_relation_with_members(2, OsmElementType::Way, 5, "b"),
+        route_relation_with_members(3, OsmElementType::Way, 5, "c"),
+        route_relation_with_members(4, OsmElementType::Way, 5, "d"),
+        route_relation_with_members(6, OsmElementType::Relation, 4, "e"),
+        route_relation_with_members(7, OsmElementType::Relation, 4, "f"),
+        route_relation_with_members(8, OsmElementType::Relation, 4, "g"),
+    ];
+    let in_id_order = relation_info_order_for_way(&relations);
+    let reversed: Vec<_> = relations.iter().rev().cloned().collect();
+    assert_eq!(in_id_order, relation_info_order_for_way(&reversed));
+    let shuffled: Vec<_> = [2, 5, 0, 3, 6, 1, 4].iter().map(|&i| relations[i].clone()).collect();
+    assert_eq!(in_id_order, relation_info_order_for_way(&shuffled));
+}
