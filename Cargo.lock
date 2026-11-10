@@ -2130,6 +2130,7 @@ dependencies = [
  "approx",
  "arrow",
  "brotli",
+ "bytes",
  "chrono",
  "crc32fast",
  "crossbeam-channel",

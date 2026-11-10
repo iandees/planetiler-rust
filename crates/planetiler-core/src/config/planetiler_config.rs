@@ -42,9 +42,15 @@ pub struct PlanetilerConfig {
     pub http_timeout: Duration,
     pub http_retries: u32,
     pub http_retry_wait: Duration,
+    /// Longest a server may make us wait (`Retry-After`) before retrying an HTTP request, longer waits get capped.
+    pub http_retry_max_wait: Duration,
     pub download_chunk_size_mb: u64,
     pub download_threads: usize,
     pub download_max_bandwidth: f64,
+    /// Maximum number of HTTP requests in flight at once across all downloads.
+    pub download_max_requests: usize,
+    /// Fail when the `ETag` or `Last-Modified` header of a remote file changes mid-download.
+    pub download_fail_if_changed: bool,
     pub min_feature_size_at_max_zoom: f64,
     pub min_feature_size_below_max_zoom: f64,
     pub simplify_tolerance_at_max_zoom: f64,
@@ -251,24 +257,51 @@ impl PlanetilerConfig {
         }
         let http_retry_wait =
             arguments.get_duration("http_retry_wait", "How long to wait before retrying HTTP request", "5s")?;
+        let http_retry_max_wait = arguments.get_duration(
+            "http_retry_max_wait",
+            "Longest a server may make us wait (Retry-After) before retrying an HTTP request, longer waits get capped",
+            "5m",
+        )?;
         let download_chunk_size_mb = arguments.get_long(
             "download_chunk_size_mb",
-            "Size of file chunks to download in parallel in megabytes",
+            "Largest HTTP request to make when downloading in megabytes",
             100,
         )?;
+        if download_chunk_size_mb <= 0 {
+            anyhow::bail!("--download-chunk-size-mb must be > 0, was {download_chunk_size_mb}");
+        }
         let download_threads = to_usize(
             arguments.get_integer(
                 "download_threads",
-                "Number of parallel threads to use when downloading each file",
-                1,
+                "Number of parallel requests to make to each remote file (up to 4x as many when reading part of a file)",
+                4,
             )?,
             "download_threads",
         )?;
+        if download_threads == 0 {
+            anyhow::bail!("--download-threads must be > 0, was {download_threads}");
+        }
         let download_max_bandwidth = crate::util::parse::bandwidth_str(&arguments.get_string(
             "download_max_bandwidth",
             "Maximum bandwidth to consume when downloading files in units mb/s, mbps, kbps, etc.",
             "",
         ))?;
+        let download_max_requests = to_usize(
+            arguments.get_integer(
+                "download_max_requests",
+                "Maximum number of HTTP requests in flight at once across all downloads (at least download_threads)",
+                64,
+            )?,
+            "download_max_requests",
+        )?;
+        if download_max_requests == 0 {
+            anyhow::bail!("--download-max-requests must be > 0, was {download_max_requests}");
+        }
+        let download_fail_if_changed = arguments.get_boolean(
+            "download_fail_if_changed",
+            "Fail when the ETag or Last-Modified header of a remote file changes mid-download",
+            true,
+        );
         let min_feature_size_at_max_zoom = arguments.get_double(
             "min_feature_size_at_max_zoom",
             "Default value for the minimum size in tile pixels of features to emit at the maximum zoom level to allow for overzooming",
@@ -430,9 +463,12 @@ impl PlanetilerConfig {
             http_timeout,
             http_retries: http_retries as u32,
             http_retry_wait,
-            download_chunk_size_mb: download_chunk_size_mb.max(0) as u64,
+            http_retry_max_wait,
+            download_chunk_size_mb: download_chunk_size_mb as u64,
             download_threads,
             download_max_bandwidth,
+            download_max_requests,
+            download_fail_if_changed,
             min_feature_size_at_max_zoom,
             min_feature_size_below_max_zoom,
             simplify_tolerance_at_max_zoom,
@@ -484,7 +520,9 @@ impl PlanetilerConfig {
 
     /// Maximum time an HTTP request can take including retries.
     pub fn max_http_request_duration(&self) -> Duration {
-        self.http_timeout * (self.http_retries + 1) + self.http_retry_wait * self.http_retries
+        // a server may ask to wait up to http_retry_max_wait before each retry
+        let retry_wait = self.http_retry_wait.max(self.http_retry_max_wait);
+        self.http_timeout * (self.http_retries + 1) + retry_wait * self.http_retries
     }
 }
 
@@ -516,7 +554,11 @@ mod tests {
         assert_eq!(None, config.color);
         assert_eq!(0.0, config.download_max_bandwidth);
         assert_eq!(Duration::from_secs(10), config.log_interval);
-        assert_eq!(Duration::from_secs(30 * 6 + 5 * 5), config.max_http_request_duration());
+        // a server may ask to wait up to 5 minutes before each retry
+        assert_eq!(Duration::from_secs(30 * 6 + 300 * 5), config.max_http_request_duration());
+        assert_eq!(4, config.download_threads);
+        assert_eq!(64, config.download_max_requests);
+        assert!(config.download_fail_if_changed);
         assert!(config.bounds.is_world());
     }
 
@@ -564,6 +606,9 @@ mod tests {
         assert!(PlanetilerConfig::from(&Arguments::of_pairs([("maxzoom", "17")])).is_err());
         assert!(PlanetilerConfig::from(&Arguments::of_pairs([("minzoom", "-1")])).is_err());
         assert!(PlanetilerConfig::from(&Arguments::of_pairs([("http_retries", "-1")])).is_err());
+        for key in ["download_chunk_size_mb", "download_threads", "download_max_requests"] {
+            assert!(PlanetilerConfig::from(&Arguments::of_pairs([(key, "0")])).is_err(), "{key}");
+        }
         assert!(PlanetilerConfig::from(&Arguments::of_pairs([("tile_format", "bogus")])).is_err());
         assert!(PlanetilerConfig::from(&Arguments::of_pairs([("download_max_bandwidth", "1 parsecs")])).is_err());
     }

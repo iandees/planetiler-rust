@@ -165,6 +165,7 @@ impl Root {
         values.insert("http_retries".into(), Value::Int(config.http_retries as i64));
         values.insert("download_chunk_size_mb".into(), Value::Int(config.download_chunk_size_mb as i64));
         values.insert("download_threads".into(), usize_value(config.download_threads));
+        values.insert("download_max_requests".into(), usize_value(config.download_max_requests));
         values.insert("download_max_bandwidth".into(), Value::Double(config.download_max_bandwidth));
         values.insert("min_feature_size_at_max_zoom".into(), Value::Double(config.min_feature_size_at_max_zoom));
         values.insert("min_feature_size".into(), Value::Double(config.min_feature_size_below_max_zoom));

@@ -3,23 +3,33 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use planetiler_core::archive::readable_tile_archive::ReadableTileArchive;
 
 use planetiler_core::archive::tile_compression::TileCompression;
 use planetiler_core::archive::tile_format::TileFormat;
 use planetiler_core::config::arguments::Arguments;
+use planetiler_core::config::bounds::BoundsProvider;
+use planetiler_core::config::planetiler_config::PlanetilerConfig;
 use planetiler_core::feature_collector::FeatureCollector;
 use planetiler_core::files::readable_files_archive::ReadableFilesArchive;
+use planetiler_core::geo::envelope::Envelope;
 use planetiler_core::geo::tile_coord::TileCoord;
 use planetiler_core::mbtiles::mbtiles::Mbtiles;
 use planetiler_core::planetiler::Planetiler;
 use planetiler_core::pmtiles::readable_pmtiles::ReadablePmtiles;
 use planetiler_core::profile::Profile;
+use planetiler_core::reader::osm::osm_input_file::OsmInputFile;
+use planetiler_core::reader::remote::cached_range_file::CachedRangeFile;
 use planetiler_core::reader::source_feature::SourceFeature;
 use planetiler_core::testing::in_memory_stream_archive::InMemoryStreamArchive;
+use planetiler_core::testing::stub_downloader::StubDownloader;
 use planetiler_core::testing::{ComparableFeature, get_tile_map_with_compression, get_tile_map_with_format};
 use planetiler_core::util::gzip::gunzip;
+use planetiler_core::util::overture_stac::OvertureStac;
 use planetiler_core::value::Value;
 
 fn resource(name: &str) -> PathBuf {
@@ -615,6 +625,284 @@ fn test_reuse_feature_db() {
     assert!(!tiles1.is_empty());
     assert_eq!(tiles1, mbtiles_tiles(&mbtiles2));
     assert_eq!(std::fs::read(&mbtiles).unwrap(), std::fs::read(&mbtiles2).unwrap());
+}
+
+/// Reusing the feature DB takes the map bounds and OSM header metadata of the run that wrote it, without reading the
+/// `.osm.pbf` again.
+#[test]
+fn test_reuse_feature_db_with_osm_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let tmp_data = temp.path().join("data");
+    let tmpdir = format!("--tmpdir={}", tmp_data.display());
+    let run = |osm: PathBuf, output: &Path| {
+        let mut planetiler = Planetiler::create(Arguments::from_args(&[
+            tmpdir.clone(),
+            "--reuse_featuredb=true".into(),
+            "--force=true".into(),
+        ]))
+        .unwrap();
+        planetiler
+            .set_profile(FnProfile(|source, features| {
+                if source.is_point() && source.has_tag("name") {
+                    features.point("points").set_zoom_range(0, 14).set_attr("name", source.get_tag("name").unwrap());
+                }
+            }))
+            .add_osm_source("osm", osm)
+            .unwrap()
+            .set_output(output)
+            .unwrap();
+        planetiler.run().unwrap();
+    };
+    let first = temp.path().join("output.mbtiles");
+    let second = temp.path().join("output2.mbtiles");
+    run(resource("monaco-latest.osm.pbf"), &first);
+    run(tmp_data.join("missing.osm.pbf"), &second);
+
+    assert!(!mbtiles_tiles(&first).is_empty());
+    let db = Mbtiles::new_read_only_database(&second).unwrap();
+    let metadata = db.metadata_table().get_all();
+    assert!(metadata.contains_key("planetiler:osm:osmosisreplicationseq"), "{metadata:?}");
+    assert!(metadata.contains_key("bounds"), "{metadata:?}");
+    assert_eq!(std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap());
+}
+
+fn recording_overture_stac(lookups: Arc<Mutex<Vec<Envelope>>>) -> OvertureStac {
+    OvertureStac::with_lookup(Arc::new(move |_catalog, _theme, _type, bounds| {
+        lookups.lock().push(bounds.lat_lon());
+        Ok(vec![])
+    }))
+}
+
+fn stub_downloader() -> StubDownloader {
+    StubDownloader::new(PlanetilerConfig::defaults())
+}
+
+fn buildings_with_id_profile() -> impl Profile {
+    FnProfile(|source, features| {
+        features
+            .polygon("buildings")
+            .set_zoom_range(0, 14)
+            .set_min_pixel_size(0.0)
+            .set_attr("id", source.get_string("id").unwrap_or_default());
+    })
+}
+
+#[test]
+fn test_planetiler_runner_remote_parquet() {
+    for mode in ["streaming", "cached"] {
+        let temp = tempfile::tempdir().unwrap();
+        let boston = resource("parquet/boston.parquet");
+        let url = "http://host/boston.parquet";
+        let downloader = stub_downloader();
+        downloader.put(url, &std::fs::read(&boston).unwrap());
+        // feature ids come from the file's path, so the local run reads the same path the remote one would cache to
+        let path = temp.path().join("sources").join("boston.parquet");
+        let remote_output = temp.path().join("remote.mbtiles");
+        let local_output = temp.path().join("local.mbtiles");
+        let tmpdir = format!("--tmpdir={}", temp.path().join("data").display());
+
+        let mut planetiler =
+            Planetiler::create(Arguments::from_args(&[tmpdir.clone(), format!("--download={mode}")])).unwrap();
+        planetiler
+            .set_downloader(downloader.downloader())
+            .set_profile(buildings_with_id_profile())
+            .add_parquet_source_from_url("parquet", &path, url)
+            .unwrap()
+            .set_output(&remote_output)
+            .unwrap();
+        planetiler.run().unwrap();
+        assert!(!downloader.requests().is_empty());
+        assert_eq!(mode == "cached", path.exists(), "cached keeps a local copy, streaming doesn't");
+
+        if !path.exists() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::copy(&boston, &path).unwrap();
+        }
+        let mut planetiler = Planetiler::create(Arguments::from_args(&[tmpdir])).unwrap();
+        planetiler
+            .set_profile(buildings_with_id_profile())
+            .add_parquet_source("parquet", vec![path.clone()], false, None, None)
+            .unwrap()
+            .set_output(&local_output)
+            .unwrap();
+        planetiler.run().unwrap();
+
+        let tiles = mbtiles_tiles(&local_output);
+        assert!(!tiles.is_empty());
+        assert_eq!(tiles, mbtiles_tiles(&remote_output), "{mode}");
+    }
+}
+
+#[test]
+fn test_overture_files_listed_for_bounds_from_osm_file() {
+    for (mode, download_osm) in [
+        ("full", false),
+        ("cached", false),
+        ("streaming", false),
+        ("full", true),
+        ("cached", true),
+        ("streaming", true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let local_osm = resource("monaco-latest.osm.pbf");
+        let osm_path =
+            if download_osm { temp.path().join("sources").join("monaco.osm.pbf") } else { local_osm.clone() };
+        let osm_url = "http://host/monaco.osm.pbf";
+        let lookups = Arc::new(Mutex::new(vec![]));
+        let downloader = stub_downloader();
+        downloader.put(osm_url, &std::fs::read(&local_osm).unwrap());
+
+        let mut planetiler = Planetiler::create(Arguments::from_args(&[
+            format!("--tmpdir={}", temp.path().join("data").display()),
+            format!("--download={mode}"),
+        ]))
+        .unwrap();
+        planetiler
+            .set_downloader(downloader.downloader())
+            .set_overture_stac(recording_overture_stac(lookups.clone()))
+            .set_profile(planetiler_core::profile::NullProfile)
+            .add_osm_source_with_url("osm", &osm_path, Some(osm_url))
+            .unwrap()
+            .add_overture_source("overture-buildings", "buildings", "building", temp.path().join("overture"))
+            .unwrap()
+            .set_output(temp.path().join("output.mbtiles"))
+            .unwrap();
+        planetiler.run().unwrap();
+
+        let lookups = lookups.lock();
+        assert_eq!(1, lookups.len(), "{mode} {download_osm}");
+        let osm_bounds = OsmInputFile::new(&local_osm, false).get_lat_lon_bounds().unwrap();
+        assert_eq!(osm_bounds, lookups[0], "{mode} {download_osm}");
+    }
+}
+
+/// Copies `source` to `dest` with the files a partial `CachedRangeFile` leaves next to it.
+fn mark_as_partial_download(source: &Path, dest: &Path) {
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::copy(source, dest).unwrap();
+    let length = std::fs::metadata(dest).unwrap().len();
+    std::fs::write(CachedRangeFile::meta_path(dest), format!("{{\"length\":{length}}}")).unwrap();
+    std::fs::write(CachedRangeFile::ranges_path(dest), format!("0 {length}\n")).unwrap();
+}
+
+#[test]
+fn test_partially_downloaded_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet = temp.path().join("sources").join("boston.parquet");
+    mark_as_partial_download(&resource("parquet/boston.parquet"), &parquet);
+    let osm = temp.path().join("sources").join("monaco.osm.pbf");
+    mark_as_partial_download(&resource("monaco-latest.osm.pbf"), &osm);
+    let tmpdir = format!("--tmpdir={}", temp.path().join("data").display());
+
+    // parquet sources read the ranges a cached run fetched without --download
+    let mut planetiler = Planetiler::create(Arguments::from_args(std::slice::from_ref(&tmpdir))).unwrap();
+    planetiler
+        .set_profile(FnProfile(|_source, features| {
+            features.polygon("buildings");
+        }))
+        .add_parquet_source_from_url("parquet", &parquet, "http://host/boston.parquet")
+        .unwrap()
+        .set_output(temp.path().join("parquet.mbtiles"))
+        .unwrap();
+    planetiler.run().unwrap();
+
+    // other sources can only be read complete
+    let mut planetiler = Planetiler::create(Arguments::from_args(&[tmpdir])).unwrap();
+    planetiler
+        .set_profile(planetiler_core::profile::NullProfile)
+        .add_osm_source_with_url("osm", &osm, Some("http://host/monaco.osm.pbf"))
+        .unwrap()
+        .set_output(temp.path().join("osm.mbtiles"))
+        .unwrap();
+    let error = planetiler.run().unwrap_err();
+    assert!(error.to_string().contains("only partially downloaded"), "{error:#}");
+}
+
+#[test]
+fn test_reuse_feature_db_with_osm_and_overture_sources() {
+    for mode in ["full", "streaming"] {
+        let temp = tempfile::tempdir().unwrap();
+        let tmp_data = temp.path().join("data");
+        let lookups = Arc::new(Mutex::new(vec![]));
+        let osm_path = resource("monaco-latest.osm.pbf");
+        let run = |osm: PathBuf, output: &str| {
+            let path = temp.path().join(output);
+            let mut planetiler = Planetiler::create(Arguments::from_args(&[
+                format!("--tmpdir={}", tmp_data.display()),
+                "--reuse_featuredb=true".into(),
+                "--force=true".into(),
+                format!("--download={mode}"),
+            ]))
+            .unwrap();
+            planetiler
+                .set_overture_stac(recording_overture_stac(lookups.clone()))
+                .set_profile(FnProfile(|source, features| {
+                    if source.is_point() && source.has_tag("name") {
+                        features
+                            .point("points")
+                            .set_zoom_range(0, 14)
+                            .set_attr("name", source.get_tag("name").unwrap());
+                    }
+                }))
+                .add_osm_source("osm", osm)
+                .unwrap()
+                .add_overture_source("overture-buildings", "buildings", "building", temp.path().join("overture"))
+                .unwrap()
+                .set_output(&path)
+                .unwrap();
+            planetiler.run().unwrap();
+            path
+        };
+
+        let first = run(osm_path.clone(), "output.mbtiles");
+        // the reuse run gets the bounds and OSM header metadata of the first run without the .osm.pbf
+        let second = run(tmp_data.join("missing.osm.pbf"), "output2.mbtiles");
+
+        // only full downloads list files when reusing the feature DB, since the range mode stages don't run
+        let lookups = lookups.lock();
+        assert_eq!(if mode == "full" { 2 } else { 1 }, lookups.len(), "{mode}");
+        let osm_bounds = OsmInputFile::new(&osm_path, false).get_lat_lon_bounds().unwrap();
+        assert!(lookups.iter().all(|bounds| *bounds == osm_bounds), "{lookups:?}");
+        assert!(!mbtiles_tiles(&first).is_empty());
+        let db = Mbtiles::new_read_only_database(&first).unwrap();
+        assert!(db.metadata_table().get_all().contains_key("planetiler:osm:osmosisreplicationseq"));
+        assert_eq!(std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap(), "{mode}");
+    }
+}
+
+/// A source that is not parquet gets an error that says where to download the parquet file from.
+#[test]
+fn test_parquet_source_overridden_with_other_file() {
+    for override_url in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let zip = resource("water-polygons-split-3857.zip");
+        let override_arg = if override_url {
+            "--water-url=http://host/water.zip".to_string()
+        } else {
+            format!("--water-path={}", zip.display())
+        };
+        let downloader = stub_downloader();
+        downloader.put("http://host/water.zip", &std::fs::read(&zip).unwrap());
+        let mut planetiler = Planetiler::create(Arguments::from_args(&[
+            format!("--tmpdir={}", temp.path().join("data").display()),
+            "--download".into(),
+            override_arg,
+        ]))
+        .unwrap();
+        planetiler
+            .set_downloader(downloader.downloader())
+            .set_profile(planetiler_core::profile::NullProfile)
+            .add_parquet_source_from_url("water", temp.path().join("water.parquet"), "http://host/water.parquet")
+            .unwrap()
+            .set_output(temp.path().join("output.mbtiles"))
+            .unwrap();
+        let error = planetiler.run().unwrap_err();
+        let expected = if override_url { "http://host/water.zip".to_string() } else { zip.display().to_string() };
+        assert_eq!(
+            format!("{expected} is not a valid parquet file, download it from http://host/water.parquet"),
+            error.root_cause().to_string()
+        );
+    }
 }
 
 /// Runs a profile that collects the IDs of all features from a `shapes` multi-URL shapefile source.

@@ -37,8 +37,9 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::thread::JoinHandle;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use anyhow::{Context, anyhow, bail};
 
@@ -49,13 +50,18 @@ use crate::archive::tile_archives;
 use crate::collection::feature_group::FeatureGroup;
 use crate::collection::{long_long_map, long_long_multimap};
 use crate::config::arguments::Arguments;
+use crate::config::bounds::BoundsProvider;
 use crate::config::planetiler_config::PlanetilerConfig;
+use crate::geo::envelope::Envelope;
+use crate::pmtiles::pmtiles::FileFormatException;
 use crate::profile::Profile;
 use crate::reader::osm::osm_input_file::OsmInputFile;
 use crate::reader::osm::osm_node_bounds_provider::OsmNodeBoundsProvider;
 use crate::reader::osm::osm_reader::OsmReader;
 use crate::reader::parquet::parquet_input_file::IdGenerator;
 use crate::reader::parquet::parquet_reader::{LayerGenerator, ParquetReader};
+use crate::reader::remote::cached_range_file::CachedRangeFile;
+use crate::reader::remote::download_mode::DownloadMode;
 use crate::reader::shapefile_options::ShapefileOptions;
 use crate::stats::process_info;
 use crate::stats::stats::StatsRef;
@@ -101,20 +107,93 @@ struct Stage {
     task: StageTask,
 }
 
+/// Looks up the files of a source to download once the map bounds are known.
+type UrlLookup = Box<dyn FnOnce(&PlanetilerConfig) -> anyhow::Result<Vec<(String, PathBuf)>> + Send>;
+
 enum DownloadUrls {
     Ready(Vec<(String, PathBuf)>),
-    Pending(JoinHandle<anyhow::Result<Vec<(String, PathBuf)>>>),
+    Lazy(UrlLookup),
 }
 
 struct ToDownload {
     id: String,
+    /// True if listing the files depends on the map bounds, which may come from a `.osm.pbf` that is downloaded first.
+    needs_bounds: bool,
     urls: DownloadUrls,
+}
+
+/// What reading the sources determined besides features, saved next to the feature DB so a run with
+/// `reuse_feature_db` can restore it without reading the sources again.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct SourceInfo {
+    /// `[min_x, min_y, max_x, max_y]`, or `None` for the whole world.
+    bounds: Option<[f64; 4]>,
+    metadata: BTreeMap<String, String>,
+}
+
+/// Map bounds restored from [`SourceInfo`].
+struct SavedBounds(Envelope);
+
+impl BoundsProvider for SavedBounds {
+    fn get_lat_lon_bounds(&self) -> Option<Envelope> {
+        Some(self.0)
+    }
 }
 
 struct InputPath {
     id: String,
     path: PathBuf,
     free_after_reading: bool,
+    /// True if the source can read a partially downloaded file (a sparse file from a previous `download=cached` run).
+    reads_partial: bool,
+}
+
+/// The arguments of a source with a local path and a download URL.
+struct SourceArgs {
+    name: String,
+    path: PathBuf,
+    url: Option<String>,
+    mode: DownloadMode,
+    refresh: bool,
+}
+
+/// The downloader that whole file downloads and range requests share (so they share the bandwidth limit), created
+/// the first time it is needed.
+type SharedDownloader = Arc<Mutex<Option<Downloader>>>;
+
+type SharedOvertureStac = Arc<Mutex<Option<Arc<OvertureStac>>>>;
+
+fn shared_downloader(cell: &SharedDownloader, config: &PlanetilerConfig) -> Downloader {
+    cell.lock().get_or_insert_with(|| Downloader::create(config.clone())).clone()
+}
+
+fn shared_overture_stac(
+    cell: &SharedOvertureStac,
+    downloader: &SharedDownloader,
+    config: &PlanetilerConfig,
+) -> Arc<OvertureStac> {
+    cell.lock()
+        .get_or_insert_with(|| {
+            let downloader = shared_downloader(downloader, config);
+            Arc::new(OvertureStac::with_fetcher(Arc::new(move |url| downloader.fetch_string(url))))
+        })
+        .clone()
+}
+
+/// Returns true if the source at `path` has to be downloaded before it can be read: it is missing, only partially
+/// downloaded or should be refreshed.
+fn needs_download(path: &Path, refresh: bool) -> bool {
+    refresh || !path.exists() || CachedRangeFile::is_partial(path)
+}
+
+/// Adds where to download a parquet file from to the error for a file that is not parquet.
+fn with_download_hint(url: Option<&str>, result: anyhow::Result<()>) -> anyhow::Result<()> {
+    match (url, result) {
+        (Some(url), Err(e)) if url.ends_with(".parquet") && e.chain().any(|c| c.is::<FileFormatException>()) => {
+            Err(FileFormatException(format!("{}, download it from {url}", e.root_cause())).into())
+        }
+        (_, result) => result,
+    }
 }
 
 /// A translation provider that can be filled in after [`Translations`] is shared (used for wikidata translations
@@ -137,6 +216,8 @@ fn stage_error(id: &str, e: anyhow::Error) -> anyhow::Error {
 pub struct Planetiler {
     stages: Vec<Stage>,
     to_download: Vec<ToDownload>,
+    /// Metadata read from sources, saved and restored with the feature DB when `reuse_feature_db` is set.
+    source_metadata: Arc<Mutex<BTreeMap<String, String>>>,
     input_paths: Vec<InputPath>,
     overall_timer: Option<Finishable>,
     arguments: Arguments,
@@ -147,6 +228,11 @@ pub struct Planetiler {
     feature_db_path: PathBuf,
     only_run_tests: Option<PathBuf>,
     download_sources: bool,
+    download_mode: DownloadMode,
+    downloader: SharedDownloader,
+    overture_stac: SharedOvertureStac,
+    /// Errors in arguments that are reported when running since the methods that read them don't return errors.
+    argument_errors: Vec<anyhow::Error>,
     refresh_sources: bool,
     only_download_sources: bool,
     parse_node_bounds: bool,
@@ -181,7 +267,12 @@ impl Planetiler {
         let tmp_dir = config.tmp_dir.clone();
         let only_download_sources = arguments.get_boolean("only_download", "download source data then exit", false);
         let only_run_tests = arguments.file_opt("tests", "run test cases in a yaml then quit");
-        let download_sources = only_download_sources || arguments.get_boolean("download", "download sources", false);
+        let download_mode = DownloadMode::parse(&arguments.get_string(
+            "download",
+            "download missing sources: false, cached (same as true), streaming or full",
+            "false",
+        ))?;
+        let download_sources = only_download_sources || download_mode.enabled();
         let refresh_sources = arguments.get_boolean(
             "refresh_sources",
             "download new version of source files if they have changed",
@@ -198,6 +289,7 @@ impl Planetiler {
         Ok(Planetiler {
             stages: vec![],
             to_download: vec![],
+            source_metadata: Arc::default(),
             input_paths: vec![],
             overall_timer: Some(overall_timer),
             arguments,
@@ -208,6 +300,10 @@ impl Planetiler {
             feature_db_path,
             only_run_tests,
             download_sources,
+            download_mode,
+            downloader: Arc::default(),
+            overture_stac: Arc::default(),
+            argument_errors: vec![],
             refresh_sources,
             only_download_sources,
             parse_node_bounds,
@@ -260,23 +356,26 @@ impl Planetiler {
         let node_db_path = self.node_db_path.clone();
         let multipolygon_path = self.multipolygon_path.clone();
         let source_name = name.to_string();
+        let source_metadata = self.source_metadata.clone();
         let task = self.if_source_used(
             name,
             Box::new(move |ctx: &mut StageContext<'_>| {
                 let header = input_file.get_header()?;
-                ctx.metadata
-                    .set_extra_metadata(
+                {
+                    let mut metadata = source_metadata.lock();
+                    metadata.insert(
                         format!("planetiler:{source_name}:osmosisreplicationtime"),
                         header.instant.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-                    )
-                    .set_extra_metadata(
+                    );
+                    metadata.insert(
                         format!("planetiler:{source_name}:osmosisreplicationseq"),
-                        header.osmosis_replication_sequence_number,
-                    )
-                    .set_extra_metadata(
+                        header.osmosis_replication_sequence_number.to_string(),
+                    );
+                    metadata.insert(
                         format!("planetiler:{source_name}:osmosisreplicationurl"),
                         header.osmosis_replication_base_url,
                     );
+                }
                 let config = ctx.config;
                 let result = (|| -> anyhow::Result<()> {
                     let node_locations = long_long_map::from_config(
@@ -409,7 +508,12 @@ impl Planetiler {
         if path.is_file() {
             // select the shapefiles now so a file without them fails before any download
             let shapefiles = find_shapefiles_matching_urls(&path, &urls, &options.glob_pattern, &arg_prefix)?;
-            self.input_paths.push(InputPath { id: name.to_string(), path: path.clone(), free_after_reading });
+            self.input_paths.push(InputPath {
+                id: name.to_string(),
+                path: path.clone(),
+                free_after_reading,
+                reads_partial: false,
+            });
             let description = format!("Process features in {}", path.display());
             return self.add_source_stage(name, &description, move |ctx| {
                 simple_sources::process_shapefiles(&options, &shapefiles, ctx)
@@ -424,14 +528,23 @@ impl Planetiler {
         let mut url_to_path: Vec<(String, PathBuf)> = Vec::with_capacity(urls.len());
         for url in &urls {
             let file = path.join(url.rsplit('/').next().unwrap_or(url));
-            self.input_paths.push(InputPath { id: name.to_string(), path: file.clone(), free_after_reading });
+            self.input_paths.push(InputPath {
+                id: name.to_string(),
+                path: file.clone(),
+                free_after_reading,
+                reads_partial: false,
+            });
             url_to_path.push((url.clone(), file));
         }
         if self.download_sources || refresh {
             let missing: Vec<(String, PathBuf)> =
                 url_to_path.iter().filter(|(_, file)| !file.exists() || refresh).cloned().collect();
             if !missing.is_empty() {
-                self.to_download.push(ToDownload { id: name.to_string(), urls: DownloadUrls::Ready(missing) });
+                self.to_download.push(ToDownload {
+                    id: name.to_string(),
+                    urls: DownloadUrls::Ready(missing),
+                    needs_bounds: false,
+                });
             }
         }
         let description = format!("Process features in {} files in {}", urls.len(), path.display());
@@ -576,9 +689,64 @@ impl Planetiler {
         get_layer: Option<LayerGenerator>,
     ) -> anyhow::Result<&mut Self> {
         let resolved = paths.clone();
-        self.add_parquet_source_lazy(name, paths, move || Ok(resolved), hive_partitioning, get_id, get_layer)
+        self.add_parquet_source_lazy(name, paths, move || Ok(resolved), hive_partitioning, get_id, get_layer, None)
     }
 
+    /// Adds a new [geoparquet](https://github.com/opengeospatial/geoparquet) source that will be processed when
+    /// [`Planetiler::run`] is called.
+    ///
+    /// If the file does not exist and the `download` argument is set, then with `download=cached` (or `true`) or
+    /// `download=streaming` only the parts of `default_url` the map bounds need get read with range requests (keeping
+    /// them in a sparse file at the source's path with `cached`), and with `download=full` the whole file gets
+    /// downloaded first. `download_<name>` overrides that for this source.
+    ///
+    /// To override the location of the file, set `name_path=newpath.parquet` in the arguments and to override the
+    /// download URL set `name_url=http://url/of/file.parquet`.
+    pub fn add_parquet_source_from_url(
+        &mut self,
+        name: &str,
+        default_path: impl Into<PathBuf>,
+        default_url: &str,
+    ) -> anyhow::Result<&mut Self> {
+        let source = self.source_args(name, "parquet", default_path.into(), Some(default_url));
+        if source.mode.fetch_while_processing()
+            && let Some(url) = source.url.clone()
+        {
+            let (source_name, hint, downloader) = (name.to_string(), default_url.to_string(), self.downloader.clone());
+            let description =
+                format!("Process features in {} using {} range requests to {url}", source.path.display(), source.mode);
+            let (mode, refresh) = (source.mode, source.refresh);
+            let path_to_url = BTreeMap::from([(source.path, url)]);
+            return self.add_source_stage(name, &description, move |ctx| {
+                let downloader = shared_downloader(&downloader, ctx.config);
+                with_download_hint(
+                    Some(&hint),
+                    ParquetReader::new(&source_name, ctx.stats.clone()).process_remote(
+                        &path_to_url,
+                        mode,
+                        refresh,
+                        &downloader,
+                        ctx.feature_group,
+                        ctx.config,
+                        ctx.profile,
+                    ),
+                )
+            });
+        }
+        self.add_download(&source);
+        let path = source.path;
+        self.add_parquet_source_lazy(
+            name,
+            vec![path.clone()],
+            move || Ok(vec![path]),
+            false,
+            None,
+            None,
+            Some(default_url.to_string()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn add_parquet_source_lazy(
         &mut self,
         name: &str,
@@ -587,6 +755,7 @@ impl Planetiler {
         hive_partitioning: bool,
         get_id: Option<IdGenerator>,
         get_layer: Option<LayerGenerator>,
+        default_url: Option<String>,
     ) -> anyhow::Result<&mut Self> {
         let free_after_reading = self.arguments.get_boolean(
             &format!("free_{name}_after_read"),
@@ -595,16 +764,15 @@ impl Planetiler {
         );
         let prefix = common_parent_prefix(&base);
         for path in base {
-            self.input_paths.push(InputPath { id: name.to_string(), path, free_after_reading });
+            self.input_paths.push(InputPath { id: name.to_string(), path, free_after_reading, reads_partial: true });
         }
         let source_name = name.to_string();
         self.add_source_stage(name, &format!("Process features in {prefix}"), move |ctx| {
             let paths = paths()?;
-            ParquetReader::with_options(&source_name, ctx.stats.clone(), get_id, get_layer, hive_partitioning).process(
-                &paths,
-                ctx.feature_group,
-                ctx.config,
-                ctx.profile,
+            with_download_hint(
+                default_url.as_deref(),
+                ParquetReader::with_options(&source_name, ctx.stats.clone(), get_id, get_layer, hive_partitioning)
+                    .process(&paths, ctx.feature_group, ctx.config, ctx.profile),
             )
         })
     }
@@ -612,6 +780,11 @@ impl Planetiler {
     /// Adds a new [Overture Maps](https://overturemaps.org/) source that reads from a mirror of overture data on disk
     /// under `root_path/theme=<theme>/type=<type>/*.parquet` (override with `<name>_path`), downloading the files
     /// from the STAC catalog first when `--download` or `--refresh_<name>` is set.
+    ///
+    /// With `download=cached` (or `true`) or `download=streaming`, only the parts of the files in the catalog that the
+    /// map bounds need get read with range requests (keeping them in sparse files under `root_path` with `cached`),
+    /// and with `download=full` the whole files in the map bounds get downloaded first. `download_<name>` overrides
+    /// that for this source.
     pub fn add_overture_source(
         &mut self,
         name: &str,
@@ -621,33 +794,71 @@ impl Planetiler {
     ) -> anyhow::Result<&mut Self> {
         let download_dir =
             self.arguments.file(&format!("{name}_path"), &format!("{name} overture download directory"), root_path);
-        let refresh = self.arguments.get_boolean(
-            &format!("refresh_{name}"),
-            &format!("Download new version of {name} if changed"),
-            self.refresh_sources,
+        let refresh = self.refresh_source(name);
+        let catalog_url = self.arguments.get_string(
+            "overture_catalog_url",
+            "Overture STAC catalog to find files in",
+            crate::util::overture_stac::DEFAULT_CATALOG_URL,
         );
+        let mode = self.download_mode_for(name);
         let type_dir = download_dir.join(format!("theme={theme}")).join(format!("type={type_}"));
-        if self.download_sources || refresh {
-            // Kick off catalog traversal in the background; download() will wait for the result before running.
+        let local_path = {
+            let type_dir = type_dir.clone();
+            move |url: &str| type_dir.join(url.rsplit('/').next().unwrap_or(url))
+        };
+        let id: IdGenerator = Arc::new(|tags: &Tags| tags.get("id").cloned().unwrap_or(Value::Null));
+        let layer: LayerGenerator = Arc::new(|tags: &Tags| tags.get("type").cloned().unwrap_or(Value::Null));
+
+        if mode.fetch_while_processing() {
+            let (source_name, theme, type_) = (name.to_string(), theme.to_string(), type_.to_string());
+            let (downloader, stac) = (self.downloader.clone(), self.overture_stac.clone());
+            let description = format!("Process features in {} using {mode} range requests", type_dir.display());
+            return self.add_source_stage(name, &description, move |ctx| {
+                let urls = shared_overture_stac(&stac, &downloader, ctx.config).get_parquet_urls_from(
+                    &catalog_url,
+                    &theme,
+                    &type_,
+                    &ctx.config.bounds,
+                )?;
+                let path_to_url: BTreeMap<PathBuf, String> =
+                    urls.into_iter().map(|url| (local_path(&url), url)).collect();
+                ParquetReader::with_options(&source_name, ctx.stats.clone(), Some(id), Some(layer), true)
+                    .process_remote(
+                        &path_to_url,
+                        mode,
+                        refresh,
+                        &shared_downloader(&downloader, ctx.config),
+                        ctx.feature_group,
+                        ctx.config,
+                        ctx.profile,
+                    )
+            });
+        }
+
+        if mode.enabled() || refresh {
+            // ensure parent directory exists
             file_utils::create_directory(&type_dir)?;
-            let stac = OvertureStac::create(&self.config);
-            let (theme, type_, dir, bounds) =
-                (theme.to_string(), type_.to_string(), type_dir.clone(), self.config.bounds.clone());
-            self.add_lazy_download(name, move || {
-                let urls = stac.get_parquet_urls(&theme, &type_, &bounds)?;
+            let (theme, type_) = (theme.to_string(), type_.to_string());
+            let (downloader, stac) = (self.downloader.clone(), self.overture_stac.clone());
+            // the catalog lookup needs the final map bounds, so download() calls this once they are resolved
+            self.add_lazy_download(name, true, move |config| {
+                let urls = shared_overture_stac(&stac, &downloader, config).get_parquet_urls_from(
+                    &catalog_url,
+                    &theme,
+                    &type_,
+                    &config.bounds,
+                )?;
                 Ok(urls
                     .into_iter()
                     .map(|url| {
-                        let file = url.rsplit('/').next().unwrap_or(&url).to_string();
-                        (url, dir.join(file))
+                        let path = local_path(&url);
+                        (url, path)
                     })
-                    .filter(|(_, path)| refresh || !path.exists())
+                    .filter(|(_, path)| needs_download(path, refresh))
                     .collect())
             })?;
         }
         let find_dir = type_dir.clone();
-        let id: IdGenerator = Arc::new(|tags: &Tags| tags.get("id").cloned().unwrap_or(Value::Null));
-        let layer: LayerGenerator = Arc::new(|tags: &Tags| tags.get("type").cloned().unwrap_or(Value::Null));
         self.add_parquet_source_lazy(
             name,
             vec![type_dir],
@@ -660,7 +871,74 @@ impl Planetiler {
             true,
             Some(id),
             Some(layer),
+            None,
         )
+    }
+
+    /// Makes downloads use `downloader`, for tests to simulate a server.
+    pub fn set_downloader(&mut self, downloader: Downloader) -> &mut Self {
+        *self.downloader.lock() = Some(downloader);
+        self
+    }
+
+    /// Makes Overture sources list their files with `overture_stac`, for tests to simulate the STAC catalog.
+    pub fn set_overture_stac(&mut self, overture_stac: OvertureStac) -> &mut Self {
+        *self.overture_stac.lock() = Some(Arc::new(overture_stac));
+        self
+    }
+
+    fn refresh_source(&self, name: &str) -> bool {
+        self.arguments.get_boolean(
+            &format!("refresh_{name}"),
+            &format!("Download new version of {name} if changed"),
+            self.refresh_sources,
+        )
+    }
+
+    fn download_mode_for(&mut self, name: &str) -> DownloadMode {
+        let mode = self.arguments.get_string(
+            &format!("download_{name}"),
+            &format!("how to download {name}: false, cached (same as true), streaming or full"),
+            self.download_mode.name(),
+        );
+        // only_download is for running offline later, which needs whole files
+        if self.only_download_sources {
+            return DownloadMode::Full;
+        }
+        DownloadMode::parse(&mode).unwrap_or_else(|e| {
+            self.argument_errors.push(e.context(format!("Invalid download_{name}")));
+            self.download_mode
+        })
+    }
+
+    /// Reads the arguments of a source with a local path and a download URL, each once so each gets logged once.
+    fn source_args(&mut self, name: &str, type_: &str, default_path: PathBuf, default_url: Option<&str>) -> SourceArgs {
+        let path = self.arguments.file(&format!("{name}_path"), &format!("{name} {type_} path"), default_path);
+        let refresh = self.refresh_source(name);
+        let mode = self.download_mode_for(name);
+        let url = if mode.enabled() || refresh {
+            let (key, description) = (format!("{name}_url"), format!("{name} {type_} url"));
+            match default_url {
+                Some(default) => Some(self.arguments.get_string(&key, &description, default)),
+                None => self.arguments.get_string_opt(&key, &description),
+            }
+        } else {
+            None
+        };
+        SourceArgs { name: name.to_string(), path, url, mode, refresh }
+    }
+
+    /// Queues `source` for a full download before the stages run if it is incomplete or needs a refresh.
+    fn add_download(&mut self, source: &SourceArgs) {
+        if let Some(url) = &source.url
+            && needs_download(&source.path, source.refresh)
+        {
+            self.to_download.push(ToDownload {
+                id: source.name.clone(),
+                needs_bounds: false,
+                urls: DownloadUrls::Ready(vec![(url.clone(), source.path.clone())]),
+            });
+        }
     }
 
     /// Adds a new stage that will be invoked when [`Planetiler::run`] is called.
@@ -894,51 +1172,42 @@ impl Planetiler {
     /// `default_url`) if `--download` or `--refresh_<name>` is set and the file is missing (or refreshing), and
     /// registers it as an input that must exist (Java `getPath`).
     pub fn get_path(&mut self, name: &str, type_: &str, default_path: PathBuf, default_url: Option<&str>) -> PathBuf {
-        let args = &self.arguments;
-        let path = args.file(&format!("{name}_path"), &format!("{name} {type_} path"), default_path);
-        let refresh = args.get_boolean(
-            &format!("refresh_{name}"),
-            &format!("Download new version of {name} if changed"),
-            self.refresh_sources,
-        );
-        let free_after_reading = args.get_boolean(
+        let source = self.source_args(name, type_, default_path, default_url);
+        let free_after_reading = self.arguments.get_boolean(
             &format!("free_{name}_after_read"),
             &format!("delete {name} input file after reading to make space for output (reduces peak disk usage)"),
             false,
         );
-        if self.download_sources || refresh {
-            let url_key = format!("{name}_url");
-            let url_description = format!("{name} {type_} url");
-            let url = match default_url {
-                Some(default) => Some(args.get_string(&url_key, &url_description, default)),
-                None => args.get_string_opt(&url_key, &url_description),
-            };
-            if let Some(url) = url
-                && (!path.exists() || refresh)
-            {
-                self.to_download
-                    .push(ToDownload { id: name.to_string(), urls: DownloadUrls::Ready(vec![(url, path.clone())]) });
-            }
-        }
-        self.input_paths.push(InputPath { id: name.to_string(), path: path.clone(), free_after_reading });
-        path
+        self.add_download(&source);
+        self.input_paths.push(InputPath {
+            id: name.to_string(),
+            path: source.path.clone(),
+            free_after_reading,
+            reads_partial: false,
+        });
+        source.path
     }
 
     /// Registers an input path without download handling (used by sources like parquet that take explicit paths).
     pub fn add_input_path(&mut self, name: &str, path: PathBuf, free_after_reading: bool) -> &mut Self {
-        self.input_paths.push(InputPath { id: name.to_string(), path, free_after_reading });
+        self.input_paths.push(InputPath { id: name.to_string(), path, free_after_reading, reads_partial: false });
         self
     }
 
-    /// Queues downloads that are resolved lazily on a background thread (e.g. an Overture STAC catalog traversal);
-    /// [`Planetiler::run`] waits for the result before downloading.
+    /// Queues downloads that are listed lazily (e.g. an Overture STAC catalog traversal): [`Planetiler::run`] calls
+    /// `resolve` with the final config on a background thread right before downloading. With `needs_bounds`, that
+    /// happens after the `.osm.pbf` the map bounds come from is downloaded.
     pub fn add_lazy_download(
         &mut self,
         name: &str,
-        resolve: impl FnOnce() -> anyhow::Result<Vec<(String, PathBuf)>> + Send + 'static,
+        needs_bounds: bool,
+        resolve: impl FnOnce(&PlanetilerConfig) -> anyhow::Result<Vec<(String, PathBuf)>> + Send + 'static,
     ) -> anyhow::Result<&mut Self> {
-        let handle = std::thread::Builder::new().name(format!("resolve-{name}")).spawn(resolve)?;
-        self.to_download.push(ToDownload { id: name.to_string(), urls: DownloadUrls::Pending(handle) });
+        self.to_download.push(ToDownload {
+            id: name.to_string(),
+            needs_bounds,
+            urls: DownloadUrls::Lazy(Box::new(resolve)),
+        });
         Ok(self)
     }
 
@@ -962,6 +1231,9 @@ impl Planetiler {
         tracing::info!("Planetiler build timestamp: {}", build_info.build_time_string().as_deref().unwrap_or("null"));
         if show_version {
             return Ok(());
+        }
+        if !self.argument_errors.is_empty() {
+            return Err(self.argument_errors.remove(0));
         }
         let Some(profile) = self.profile()? else { bail!("No profile specified") };
         let Some(output) = self.output.clone() else { bail!("No output specified") };
@@ -1031,8 +1303,11 @@ impl Planetiler {
             self.feature_db_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let string_encoder_path = self.feature_db_path.join(format!("{feature_db_name}.strings"));
         let chunk_manifest_path = self.feature_db_path.join(format!("{feature_db_name}.manifest"));
-        let has_reusable_feature_db =
-            self.feature_db_path.exists() && string_encoder_path.exists() && chunk_manifest_path.exists();
+        let source_info_path = self.feature_db_path.join(format!("{feature_db_name}.sources"));
+        let has_reusable_feature_db = self.feature_db_path.exists()
+            && string_encoder_path.exists()
+            && chunk_manifest_path.exists()
+            && source_info_path.exists();
         let reuse_existing_feature_db = config.reuse_feature_db && has_reusable_feature_db;
 
         tracing::info!("Building {} profile into {} in these phases:", profile.name(), output.uri);
@@ -1080,14 +1355,31 @@ impl Planetiler {
         parents.extend(output.get_local_base_path());
         file_utils::create_parent_directories(&parents)?;
 
-        if !self.to_download.is_empty() {
-            self.download(&profile)?;
+        let download_timer = (!self.to_download.is_empty()).then(|| self.stats.start_stage("download"));
+        if reuse_existing_feature_db {
+            // no source gets read, and the bounds come from the run that wrote the feature DB
+            self.restore_source_info(&source_info_path)?;
+            // the stages don't need them, but --only-download and --fetch-wikidata (reads the .osm.pbf) still do
+            self.download(&profile, |_| true)?;
+        } else if self.bounds_need_osm_download() {
+            // sources that list their files for the map bounds wait for the .osm.pbf the bounds come from
+            self.download(&profile, |download| !download.needs_bounds)?;
+            // fail fast with "Run with --download" error since osm.pbf is needed for osm fallback
+            self.ensure_input_files_exist(&profile)?;
+            self.add_osm_bounds_fallback();
+            self.download(&profile, |download| download.needs_bounds)?;
+        } else {
+            // the bounds don't wait for a download: given explicitly, no .osm.pbf, or it is already on disk
+            self.add_osm_bounds_fallback();
+            self.download(&profile, |_| true)?;
+            self.ensure_input_files_exist(&profile)?;
         }
+        if let Some(timer) = download_timer {
+            timer.stop();
+        }
+        let config = self.config.clone();
         if self.fetch_osm_tile_stats {
             top_osm_tiles::download_precomputed(&config);
-        }
-        if !reuse_existing_feature_db {
-            self.ensure_input_files_exist(&profile)?;
         }
 
         if self.fetch_wikidata {
@@ -1119,16 +1411,6 @@ impl Planetiler {
         {
             self.check_disk_space(&profile, &osm_input_file, &output)?;
             self.check_memory(&profile, &osm_input_file)?;
-            if config.bounds.lat_lon_opt().is_none() {
-                let mut new_config = (*self.config).clone();
-                if !self.parse_node_bounds {
-                    new_config.bounds.add_fallback_provider(&osm_input_file);
-                }
-                let node_bounds =
-                    OsmNodeBoundsProvider::new(osm_input_file.clone(), new_config.clone(), self.stats.clone());
-                new_config.bounds.add_fallback_provider(&node_bounds);
-                self.config = Arc::new(new_config);
-            }
         }
         let config = self.config.clone();
         // must construct this after bounds providers are added in order to infer bounds from the input source if not
@@ -1188,7 +1470,11 @@ impl Planetiler {
             if config.reuse_feature_db {
                 feature_group.save_string_encoders(&string_encoder_path)?;
                 feature_group.save_chunk_manifest(&chunk_manifest_path)?;
+                self.save_source_info(&source_info_path, &config)?;
             }
+        }
+        for (key, value) in self.source_metadata.lock().iter() {
+            metadata.set_extra_metadata(key.clone(), value);
         }
 
         let output_size = Arc::new(FileSize(archive_path));
@@ -1308,31 +1594,105 @@ impl Planetiler {
         Ok(())
     }
 
-    fn download(&mut self, profile: &Arc<dyn Profile>) -> anyhow::Result<()> {
-        let timer = self.stats.start_stage("download");
-        let mut downloader = Downloader::create((*self.config).clone());
-        for to_download in std::mem::take(&mut self.to_download) {
-            let urls = match to_download.urls {
-                DownloadUrls::Ready(urls) => urls,
-                DownloadUrls::Pending(handle) => {
-                    handle.join().map_err(|_| anyhow!("resolving downloads for {} panicked", to_download.id))??
-                }
-            };
-            if profile.cares_about_source(&to_download.id) {
-                for (url, path) in urls {
-                    downloader = downloader.add(&to_download.id, &url, path)?;
+    /// Downloads the queued sources that match `filter`, leaving the others queued.
+    fn download(&mut self, profile: &Arc<dyn Profile>, filter: impl Fn(&ToDownload) -> bool) -> anyhow::Result<()> {
+        let (selected, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.to_download).into_iter().partition(filter);
+        self.to_download = rest;
+        let downloader = shared_downloader(&self.downloader, &self.config);
+        // start listing the files of all sources before waiting on any, since a catalog lookup can take a few seconds
+        let mut lookups = vec![];
+        for to_download in selected {
+            if !profile.cares_about_source(&to_download.id) {
+                continue;
+            }
+            let id = to_download.id;
+            match to_download.urls {
+                DownloadUrls::Ready(urls) => lookups.push((id, Ok(urls))),
+                DownloadUrls::Lazy(lookup) => {
+                    let config = self.config.clone();
+                    let handle =
+                        std::thread::Builder::new().name(format!("resolve-{id}")).spawn(move || lookup(&config))?;
+                    lookups.push((id, Err(handle)));
                 }
             }
         }
-        downloader.run()?;
-        timer.stop();
+        for (id, lookup) in lookups {
+            let urls = match lookup {
+                Ok(urls) => urls,
+                Err(handle) => handle.join().map_err(|_| anyhow!("resolving downloads for {id} panicked"))??,
+            };
+            for (url, path) in urls {
+                downloader.add(&id, &url, path)?;
+            }
+        }
+        downloader.run()
+    }
+
+    /// Returns true if the map bounds come from a `.osm.pbf` that isn't on disk yet (missing or downloading).
+    fn bounds_need_osm_download(&self) -> bool {
+        let Some(osm_input_file) = &self.osm_input_file else { return false };
+        if !self.config.bounds.is_world() {
+            return false;
+        }
+        let osm_path = osm_input_file.path();
+        !osm_path.exists() || self.to_download.iter().any(|download| {
+            !download.needs_bounds
+                && matches!(&download.urls, DownloadUrls::Ready(urls) if urls.iter().any(|(_, path)| path == osm_path))
+        })
+    }
+
+    /// Makes the map bounds fall back to those of the `.osm.pbf` when none were given.
+    fn add_osm_bounds_fallback(&mut self) {
+        let Some(osm_input_file) = self.osm_input_file.clone() else { return };
+        if self.config.bounds.lat_lon_opt().is_some() {
+            return;
+        }
+        let mut new_config = (*self.config).clone();
+        if !self.parse_node_bounds {
+            new_config.bounds.add_fallback_provider(&osm_input_file);
+        }
+        let node_bounds = OsmNodeBoundsProvider::new(osm_input_file, new_config.clone(), self.stats.clone());
+        new_config.bounds.add_fallback_provider(&node_bounds);
+        self.config = Arc::new(new_config);
+    }
+
+    // a reused feature DB skips reading the sources, so save what else reading them determined next to it
+    fn save_source_info(&self, path: &Path, config: &PlanetilerConfig) -> anyhow::Result<()> {
+        let bounds = (!config.bounds.is_world()).then(|| {
+            let lat_lon = config.bounds.lat_lon();
+            [lat_lon.min_x, lat_lon.min_y, lat_lon.max_x, lat_lon.max_y]
+        });
+        let info = SourceInfo { bounds, metadata: self.source_metadata.lock().clone() };
+        std::fs::write(path, serde_json::to_vec(&info)?)
+            .with_context(|| format!("Unable to save source info to {}", path.display()))
+    }
+
+    fn restore_source_info(&mut self, path: &Path) -> anyhow::Result<()> {
+        let info: SourceInfo = serde_json::from_slice(
+            &std::fs::read(path).with_context(|| format!("Unable to load source info from {}", path.display()))?,
+        )
+        .with_context(|| format!("Unable to load source info from {}", path.display()))?;
+        self.source_metadata.lock().extend(info.metadata);
+        if let Some([min_x, min_y, max_x, max_y]) = info.bounds {
+            let mut new_config = (*self.config).clone();
+            new_config.bounds.add_fallback_provider(&SavedBounds(Envelope::new(min_x, max_x, min_y, max_y)));
+            self.config = Arc::new(new_config);
+        }
         Ok(())
     }
 
     fn ensure_input_files_exist(&self, profile: &Arc<dyn Profile>) -> anyhow::Result<()> {
         for input_path in &self.input_paths {
-            if profile.cares_about_source(&input_path.id) && !input_path.path.exists() {
+            if !profile.cares_about_source(&input_path.id) {
+                continue;
+            }
+            if !input_path.path.exists() {
                 bail!("{} does not exist. Run with --download to fetch it", input_path.path.display());
+            } else if !input_path.reads_partial && CachedRangeFile::is_partial(&input_path.path) {
+                bail!(
+                    "{} is only partially downloaded. Run with --download to finish downloading it",
+                    input_path.path.display()
+                );
             }
         }
         Ok(())

@@ -24,6 +24,7 @@
 //! ```
 
 pub mod in_memory_stream_archive;
+pub mod stub_downloader;
 
 use std::collections::BTreeMap;
 use std::fmt;

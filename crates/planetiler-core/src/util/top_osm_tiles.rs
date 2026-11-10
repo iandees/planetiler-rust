@@ -188,7 +188,13 @@ fn read_file(fetcher: &LogFetcher, retries: u32, max_zoom: u32, date: NaiveDate)
         match attempt {
             Ok(result) => return result,
             Err(e) => {
-                if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+                let not_found =
+                    e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                        || matches!(
+                            crate::util::downloader::download_error(&e),
+                            Some(crate::util::downloader::DownloadError::BadResponse { status: 404, .. })
+                        );
+                if not_found {
                     tracing::info!("No data for {date}");
                     break;
                 }

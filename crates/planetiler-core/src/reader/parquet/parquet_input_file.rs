@@ -4,14 +4,21 @@
 //! A file is split into [`Block`]s (one per row group) that can be read independently from different threads. When
 //! bounds are provided, row groups are pruned using the statistics of the covering bbox columns and rows are
 //! filtered by those columns; if there is no covering bbox the decoded geometries are post-filtered instead.
+//!
+//! Files are read through a [`RangeFile`], so they can be local or remote (fetched with HTTP range requests). Each
+//! row group is fetched with one request that [`Block::start_fetch_if_necessary`] starts ahead of when the block is
+//! read. Differences from Java: Rust has no ParquetFileReader to reuse the footer for each row group, but the footer
+//! is parsed once in the constructor here too, and `ParquetInputFile` closes its file on [`ParquetInputFile::close`]
+//! instead of implementing `Closeable`.
 
-use std::collections::HashSet;
-use std::fs::File;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
+use parking_lot::Mutex;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::basic::{ConvertedType, Type as PhysicalType};
 use parquet::column::reader::ColumnReader;
@@ -24,21 +31,32 @@ use crate::config::bounds::Bounds;
 use crate::expression::expression::PartialInput;
 use crate::geo::envelope::Envelope;
 use crate::geo::geometry_type::GeometryType;
+use crate::pmtiles::pmtiles::FileFormatException;
 use crate::reader::parquet::geo_arrow::GeoArrowColumn;
 use crate::reader::parquet::geo_parquet_metadata::{FilterPredicate, GeoParquetMetadata};
 use crate::reader::parquet::geometry_reader::{GeometryEncoding, GeometryReader};
 use crate::reader::parquet::interval::Interval;
 use crate::reader::parquet::parquet_feature::ParquetFeature;
 use crate::reader::parquet::parquet_record_converter::ParquetRecordConverter;
+use crate::reader::parquet::range_input_file::RangeInputFile;
+use crate::reader::remote::range_file::{self, Pending, RangeFile};
+use crate::util::downloader::ByteRange;
 use crate::util::hashing;
+use crate::util::request_planner::Plan;
 use crate::value::{Tags, Value};
+use crate::worker::Done;
 
 /// Computes a feature ID from its tags.
 pub type IdGenerator = Arc<dyn Fn(&Tags) -> Value + Send + Sync>;
 
 const BATCH_SIZE: usize = 4096;
 
+/// The largest byte array that can be fetched ahead; row groups larger than this get read by parquet in pieces.
+const MAX_FETCH_BYTES: u64 = i32::MAX as u64 - 8;
+
 struct Inner {
+    file: Arc<dyn RangeFile>,
+    length: u64,
     path: Arc<PathBuf>,
     source: Arc<str>,
     layer: Arc<str>,
@@ -52,8 +70,10 @@ struct Inner {
     post_filter_bounds: Option<Envelope>,
     out_of_bounds: bool,
     count: u64,
-    /// indexes of the row groups that may contain features in bounds / matching the filter
+    /// indexes of the row groups that may contain features in bounds / matching the filter, in file order
     row_groups: Vec<usize>,
+    /// where each of `row_groups` is in the file
+    row_group_spans: Vec<ByteRange>,
     converter: ParquetRecordConverter,
     /// arrow column index of the primary geometry, when it is geoarrow-encoded and decoded straight from arrow
     geoarrow_column: Option<(usize, crate::reader::parquet::geo_arrow::GeoArrowEncoding)>,
@@ -81,17 +101,18 @@ pub fn hash_to_long(value: &Value) -> i64 {
 }
 
 /// True if the file is long enough and ends with the parquet `PAR1` magic number.
-fn is_valid_parquet_file(mut file: &File) -> Result<bool> {
-    use std::io::{Read, Seek, SeekFrom};
-    let length = file.metadata()?.len();
-    if length < 8 {
-        return Ok(false);
-    }
-    let mut tail = [0u8; 4];
-    file.seek(SeekFrom::Start(length - 4))?;
-    file.read_exact(&mut tail)?;
-    file.seek(SeekFrom::Start(0))?;
-    Ok(&tail == b"PAR1")
+fn is_valid_parquet_file(file: &dyn RangeFile) -> Result<bool> {
+    // The tail is already prefetched so this won't trigger any extra requests
+    let length = file.length()?;
+    Ok(length >= 8 && file.read(length - 4, 4)? == b"PAR1")
+}
+
+/// The column chunks of a row group are next to each other, so one read gets all of them.
+fn row_group_span(row_group: &parquet::file::metadata::RowGroupMetaData) -> ByteRange {
+    let ranges = row_group.columns().iter().map(|c| c.byte_range());
+    let start = ranges.clone().map(|(start, _)| start).min().unwrap_or(0);
+    let end = ranges.map(|(start, length)| start + length).max().unwrap_or(0);
+    ByteRange::new(start, end - start)
 }
 
 impl ParquetInputFile {
@@ -111,12 +132,33 @@ impl ParquetInputFile {
         extra_fields: Option<Tags>,
         id_generator: Option<IdGenerator>,
     ) -> Result<ParquetInputFile> {
-        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        if !is_valid_parquet_file(&file)? {
-            anyhow::bail!("{} is not a valid parquet file", path.display());
+        let file = range_file::open_local(path).with_context(|| format!("opening {}", path.display()))?;
+        Self::with_range_file(source, layer, path, file, filter, bounds, extra_fields, id_generator)
+    }
+
+    /// Like [`ParquetInputFile::with_options`] but reads from `file`, which may be remote.
+    ///
+    /// `path` is where the file would be on local disk: it identifies the file in features and logs, and feature IDs
+    /// are derived from it when there is no `id_generator`, so pass the same path whether `file` is local or remote
+    /// to get the same output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_range_file(
+        source: &str,
+        layer: &str,
+        path: &Path,
+        file: Arc<dyn RangeFile>,
+        filter: Option<FilterPredicate>,
+        bounds: &Bounds,
+        extra_fields: Option<Tags>,
+        id_generator: Option<IdGenerator>,
+    ) -> Result<ParquetInputFile> {
+        if !is_valid_parquet_file(file.as_ref())? {
+            return Err(FileFormatException(format!("{} is not a valid parquet file", file.describe())).into());
         }
-        let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())
-            .with_context(|| format!("reading parquet metadata from {}", path.display()))?;
+        let length = file.length()?;
+        let metadata =
+            ArrowReaderMetadata::load(&RangeInputFile::new(file.clone(), length, None), ArrowReaderOptions::new())
+                .with_context(|| format!("reading parquet metadata from {}", file.describe()))?;
         let parquet_metadata = metadata.metadata().clone();
         let file_metadata = parquet_metadata.file_metadata();
         let schema = file_metadata.schema_descr_ptr();
@@ -143,13 +185,15 @@ impl ParquetInputFile {
                 post_filter_bounds = Some(bounds.lat_lon());
             }
         }
-        let row_groups: Vec<usize> = if out_of_bounds {
+        let mut row_groups: Vec<usize> = if out_of_bounds {
             vec![]
         } else {
             (0..parquet_metadata.num_row_groups())
                 .filter(|&i| !filter.as_ref().is_some_and(|f| f.can_drop(parquet_metadata.row_group(i))))
                 .collect()
         };
+        row_groups.sort_by_key(|&i| row_group_span(parquet_metadata.row_group(i)).offset);
+        let row_group_spans = row_groups.iter().map(|&i| row_group_span(parquet_metadata.row_group(i))).collect();
         let count = row_groups.iter().map(|&i| parquet_metadata.row_group(i).num_rows().max(0) as u64).sum();
         let geoarrow_column = match geometry_reader.primary_encoding() {
             Some(GeometryEncoding::GeoArrow(e)) => {
@@ -173,6 +217,8 @@ impl ParquetInputFile {
             .collect();
         Ok(ParquetInputFile {
             inner: Arc::new(Inner {
+                file,
+                length,
                 path: Arc::new(path.to_path_buf()),
                 source: source.into(),
                 layer: layer.into(),
@@ -187,6 +233,7 @@ impl ParquetInputFile {
                 out_of_bounds,
                 count,
                 row_groups,
+                row_group_spans,
                 converter,
                 geoarrow_column,
                 interval_columns,
@@ -237,9 +284,65 @@ impl ParquetInputFile {
         self.inner.row_groups.len()
     }
 
-    /// The blocks of this file, which can be read independently.
+    /// The blocks of this file, which can be read independently, in file order.
+    ///
+    /// For remote files this plans the requests that fetch the row groups, which get sent once each block's
+    /// [`Block::start_fetch_if_necessary`] is called (or the block is read).
     pub fn get(&self) -> Vec<Block> {
-        self.inner.row_groups.iter().map(|&index| Block { file: self.inner.clone(), index }).collect()
+        let to_fetch = self.row_group_ranges_to_fetch();
+        let pending: Vec<Arc<dyn Pending>> = if to_fetch.is_empty() {
+            vec![]
+        } else {
+            self.inner
+                .file
+                .read_later(&to_fetch)
+                .expect("row groups are within the file")
+                .into_iter()
+                .map(Arc::from)
+                .collect()
+        };
+        let pending_by_span: HashMap<ByteRange, Arc<dyn Pending>> = to_fetch.into_iter().zip(pending).collect();
+        self.inner
+            .row_groups
+            .iter()
+            .zip(&self.inner.row_group_spans)
+            .map(|(&index, &span)| Block {
+                file: self.inner.clone(),
+                index,
+                span,
+                pending: Arc::new(Mutex::new(pending_by_span.get(&span).cloned())),
+            })
+            .collect()
+    }
+
+    /// Returns the number of bytes in the row groups that will be read.
+    pub fn bytes_to_read(&self) -> u64 {
+        self.inner.row_group_spans.iter().map(|span| span.length).sum()
+    }
+
+    /// Returns the HTTP requests required to read the row groups from the remote server.
+    pub fn plan_fetch(&self) -> Plan {
+        self.inner.file.plan_fetch(&self.row_group_ranges_to_fetch())
+    }
+
+    // row groups too large for one array get read by parquet in pieces instead, which the plan doesn't cover
+    fn row_group_ranges_to_fetch(&self) -> Vec<ByteRange> {
+        self.inner
+            .row_group_spans
+            .iter()
+            .copied()
+            .filter(|span| span.length <= MAX_FETCH_BYTES && self.inner.file.needs_fetch(span.offset, span.length))
+            .collect()
+    }
+
+    /// Returns the file this reads from, to report how much of it got fetched from a remote server.
+    pub fn file(&self) -> &Arc<dyn RangeFile> {
+        &self.inner.file
+    }
+
+    /// Releases the file this reads from.
+    pub fn close(&self) -> Result<()> {
+        self.inner.file.close()
     }
 }
 
@@ -248,6 +351,9 @@ impl ParquetInputFile {
 pub struct Block {
     file: Arc<Inner>,
     index: usize,
+    span: ByteRange,
+    /// the bytes of this row group, if they come from a remote server: taken by the first read
+    pending: Arc<Mutex<Option<Arc<dyn Pending>>>>,
 }
 
 fn read_interval_column(reader: &dyn RowGroupReader, leaf: usize, num_rows: usize) -> Result<Vec<Option<Interval>>> {
@@ -284,6 +390,19 @@ impl Block {
         self.index
     }
 
+    /// Starts fetching this block's bytes in the background if they have to come from a remote server, so that reading
+    /// it later blocks less. Returns right away, and does nothing when the bytes are already local.
+    pub fn start_fetch_if_necessary(&self) {
+        if let Some(pending) = &*self.pending.lock() {
+            pending.start();
+        }
+    }
+
+    /// Returns a handle that completes when all bytes are available for this block.
+    pub fn when_fetched(&self) -> Done {
+        self.pending.lock().as_ref().map_or_else(Done::completed, |pending| pending.ready())
+    }
+
     /// Reads all features in this block into a vector.
     pub fn features(&self) -> Result<Vec<ParquetFeature>> {
         let mut result = vec![];
@@ -310,20 +429,25 @@ impl Block {
             return Ok(());
         }
         let num_rows = row_group.num_rows().max(0) as usize;
+        let fetched = self.pending.lock().take();
+        let prefetched = match fetched {
+            Some(pending) => Some((self.span.offset, Bytes::from(pending.get()?))),
+            None => None,
+        };
+        let input = RangeInputFile::new(file.file.clone(), file.length, prefetched);
         let mut intervals = vec![];
         if !file.interval_columns.is_empty() {
-            let reader = SerializedFileReader::new(File::open(file.path.as_ref())?)?;
+            let reader = SerializedFileReader::new(input.clone())?;
             let rg = reader.get_row_group(self.index)?;
             for (_, leaf) in &file.interval_columns {
                 intervals.push(read_interval_column(rg.as_ref(), *leaf, num_rows)?);
             }
         }
         let intervals = Arc::new(intervals);
-        let reader =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(File::open(file.path.as_ref())?, file.metadata.clone())
-                .with_row_groups(vec![self.index])
-                .with_batch_size(BATCH_SIZE)
-                .build()?;
+        let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(input, file.metadata.clone())
+            .with_row_groups(vec![self.index])
+            .with_batch_size(BATCH_SIZE)
+            .build()?;
         let file_hash = hashing::fnv1a64(file.path.to_string_lossy().as_bytes());
         let block_hash = hashing::fnv1a64_with_init(file_hash, &(self.index as i32).to_be_bytes());
         let chunk_rows = chunk_rows.max(1);
@@ -437,6 +561,7 @@ impl RowChunk {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::fs::File;
 
     use super::*;
     use crate::expression::expression::Expression;
@@ -692,6 +817,159 @@ mod tests {
         assert_eq!(0, hash_to_long(&Value::Null));
         assert_eq!(hashing::fnv1a64(b"abc") as i64, hash_to_long(&Value::str("abc")));
         assert_eq!(1.5f64.to_bits() as i64, hash_to_long(&Value::Double(1.5)));
+    }
+
+    /// Records reads from a local file, acting like a remote one (every byte needs fetching) if `remote`.
+    struct RecordingRangeFile {
+        delegate: crate::reader::remote::local_range_file::LocalRangeFile,
+        remote: bool,
+        reads: Mutex<Vec<String>>,
+    }
+
+    impl RecordingRangeFile {
+        fn new(path: &Path, remote: bool) -> Arc<RecordingRangeFile> {
+            Arc::new(RecordingRangeFile {
+                delegate: crate::reader::remote::local_range_file::LocalRangeFile::new(path),
+                remote,
+                reads: Mutex::new(vec![]),
+            })
+        }
+
+        fn reads(&self) -> Vec<String> {
+            self.reads.lock().clone()
+        }
+
+        fn clear(&self) {
+            self.reads.lock().clear();
+        }
+    }
+
+    impl RangeFile for RecordingRangeFile {
+        fn needs_fetch(&self, _offset: u64, _length: u64) -> bool {
+            self.remote
+        }
+
+        fn length(&self) -> Result<u64> {
+            self.delegate.length()
+        }
+
+        fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
+            self.reads.lock().push(format!("read {offset}+{length}"));
+            self.delegate.read(offset, length)
+        }
+
+        fn read_later(&self, ranges: &[ByteRange]) -> Result<Vec<Box<dyn Pending>>> {
+            if !ranges.is_empty() {
+                let ranges: Vec<String> = ranges.iter().map(|r| format!("{}+{}", r.offset, r.length)).collect();
+                self.reads.lock().push(format!("readLater [{}]", ranges.join(", ")));
+            }
+            self.delegate.read_later(ranges)
+        }
+
+        fn close(&self) -> Result<()> {
+            self.delegate.close()
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn describe(&self) -> String {
+            self.delegate.describe()
+        }
+    }
+
+    #[test]
+    fn fetches_only_row_groups_in_bounds() {
+        let path = parquet_resource("boston.parquet");
+        let file = RecordingRangeFile::new(&path, true);
+        let outside = ParquetInputFile::with_range_file(
+            "parquet",
+            "layer",
+            &path,
+            file.clone(),
+            None,
+            &bounds(-71.08, -71.075, 42.356, 42.357),
+            None,
+            None,
+        )
+        .unwrap();
+        file.clear();
+        for block in outside.get() {
+            block.start_fetch_if_necessary();
+            block.features().unwrap();
+        }
+        assert!(file.reads().is_empty(), "{:?}", file.reads());
+        assert_eq!(0, outside.bytes_to_read());
+
+        let inside = ParquetInputFile::with_range_file(
+            "parquet",
+            "layer",
+            &path,
+            file.clone(),
+            None,
+            &bounds(-71.075, -71.074, 42.356, 42.357),
+            None,
+            None,
+        )
+        .unwrap();
+        file.clear();
+        let mut features = 0;
+        for block in inside.get() {
+            block.start_fetch_if_necessary();
+            features += block.features().unwrap().len();
+        }
+        // the whole row group in one read, nothing else
+        assert_eq!(vec![format!("readLater [4+{}]", inside.bytes_to_read())], file.reads());
+        assert_eq!(3, features);
+    }
+
+    #[test]
+    fn local_blocks_are_read_without_copying_up_front() {
+        let path = parquet_resource("boston.parquet");
+        let file = RecordingRangeFile::new(&path, false);
+        let input = ParquetInputFile::with_range_file(
+            "parquet",
+            "layer",
+            &path,
+            file.clone(),
+            None,
+            &Bounds::world(),
+            None,
+            None,
+        )
+        .unwrap();
+        file.clear();
+        let mut features = 0;
+        for block in input.get() {
+            block.start_fetch_if_necessary();
+            assert!(file.reads().is_empty(), "nothing read before reading the block");
+            features += block.features().unwrap().len();
+        }
+        assert!(file.reads().iter().all(|read| read.starts_with("read ")), "{:?}", file.reads());
+        assert_eq!(3, features);
+    }
+
+    #[test]
+    fn invalid_remote_file_error_names_the_remote_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("water.parquet");
+        std::fs::write(&path, b"this is definitely not a parquet file").unwrap();
+        let file = RecordingRangeFile::new(&path, false);
+        let error = ParquetInputFile::with_range_file(
+            "parquet",
+            "layer",
+            Path::new("water.parquet"),
+            file,
+            None,
+            &Bounds::world(),
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
+        assert!(error.downcast_ref::<FileFormatException>().is_some());
+        assert_eq!(format!("{} is not a valid parquet file", path.display()), error.to_string());
     }
 
     mod geoarrow {

@@ -61,12 +61,14 @@ pub trait Stats: Send + Sync {
     }
 
     /// Start timing a named stage. If `log` is true, logs that it started and sets the `[stage]` prefix on subsequent
-    /// log lines from this thread (see [`log_util`](crate::util::log_util)).
+    /// log lines from this thread (see [`log_util`](crate::util::log_util)), until the stage finishes.
     fn start_stage_with_log(&self, name: &str, log: bool) -> Finishable {
-        if log {
-            crate::util::log_util::set_stage(name);
+        if !log {
+            return self.timers().start_timer(name, log);
         }
-        self.timers().start_timer(name, log)
+        let previous_stage = crate::util::log_util::get_stage();
+        crate::util::log_util::set_stage(name);
+        self.timers().start_timer(name, log).restore_log_stage_on_stop(previous_stage)
     }
 
     /// Record that a tile was written.
@@ -252,5 +254,19 @@ mod tests {
         a.data_error("b");
         assert_eq!(BTreeMap::from([("a".to_string(), 2), ("b".to_string(), 1)]), a.data_errors());
         a.print_summary();
+    }
+
+    #[test]
+    fn stage_log_prefix_ends_with_stage() {
+        let stats = InMemoryStats::arc();
+        // the log prefix is per thread, and other tests on this thread may have left one behind
+        let before = crate::util::log_util::get_stage();
+        let outer = stats.start_stage("outer");
+        let inner = stats.start_stage("inner");
+        assert_eq!(Some("inner".to_string()), crate::util::log_util::get_stage());
+        inner.stop();
+        assert_eq!(Some("outer".to_string()), crate::util::log_util::get_stage());
+        outer.stop();
+        assert_eq!(before, crate::util::log_util::get_stage());
     }
 }

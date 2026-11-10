@@ -74,9 +74,13 @@ pub struct StacItem {
 /// Fetches the body of a URL as a string.
 pub type Fetcher = Arc<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>;
 
+/// Lists the parquet files for a catalog URL, theme, type and bounds in place of walking the catalog.
+pub type Lookup = Arc<dyn Fn(&str, &str, &str, &Bounds) -> anyhow::Result<Vec<String>> + Send + Sync>;
+
 /// Client for the Overture STAC catalog.
 pub struct OvertureStac {
     fetcher: Fetcher,
+    lookup: Option<Lookup>,
 }
 
 impl OvertureStac {
@@ -88,7 +92,12 @@ impl OvertureStac {
 
     /// Creates a client that fetches JSON with `fetcher` (for tests).
     pub fn with_fetcher(fetcher: Fetcher) -> OvertureStac {
-        OvertureStac { fetcher }
+        OvertureStac { fetcher, lookup: None }
+    }
+
+    /// Creates a client that lists files with `lookup` instead of walking the catalog (for tests to simulate it).
+    pub fn with_lookup(lookup: Lookup) -> OvertureStac {
+        OvertureStac { fetcher: Arc::new(|url| anyhow::bail!("no catalog to fetch {url} from")), lookup: Some(lookup) }
     }
 
     fn fetch<T: DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
@@ -110,6 +119,9 @@ impl OvertureStac {
         type_: &str,
         bounds: &Bounds,
     ) -> anyhow::Result<Vec<String>> {
+        if let Some(lookup) = &self.lookup {
+            return lookup(catalog_url, theme, type_, bounds);
+        }
         tracing::info!("Fetching Overture STAC catalog from {catalog_url}");
         let catalog: StacCatalog = self.fetch(catalog_url)?;
         let latest_catalog_url = resolve_latest_catalog_url(&catalog, catalog_url)?;
