@@ -36,7 +36,7 @@ use parking_lot::Mutex;
 use crate::stats::progress_loggers::ProgressLoggers;
 use crate::stats::stats::StatsRef;
 use crate::worker::Done;
-use crate::worker::work_queue::{QueueHandle, WorkQueue, WorkQueueReader, WorkQueueWriter};
+use crate::worker::work_queue::{QueueHandle, Weigher, WorkQueue, WorkQueueReader, WorkQueueWriter};
 use crate::worker::worker::Worker;
 
 /// One step of a running pipeline, used for logging.
@@ -102,14 +102,27 @@ pub struct Empty {
 /// Intermediate step while building a pipeline that requires a queue to buffer items before adding the next step.
 pub struct Bufferable<T> {
     #[allow(clippy::type_complexity)]
-    build: Box<dyn FnOnce(&str, usize, usize) -> Builder<T>>,
+    build: Box<dyn FnOnce(&str, usize, usize, Option<Weigher<T>>, usize) -> Builder<T>>,
 }
 
 impl<T> Bufferable<T> {
     /// Adds a [`WorkQueue`] that groups items into batches of `batch_size` before enqueueing them to reduce contention
     /// when many threads are reading or writing to the queue simultaneously.
     pub fn add_buffer_batched(self, name: &str, size: usize, batch_size: usize) -> Builder<T> {
-        (self.build)(name, size, batch_size)
+        (self.build)(name, size, batch_size, None, usize::MAX)
+    }
+
+    /// Adds a [`WorkQueue`] that groups items into batches of up to `batch_size` items, or fewer once their total
+    /// `weigher` weight reaches `max_batch_weight`, so that expensive items get spread over more consumer threads.
+    pub fn add_buffer_weighted(
+        self,
+        name: &str,
+        size: usize,
+        batch_size: usize,
+        weigher: impl Fn(&T) -> usize + Send + Sync + 'static,
+        max_batch_weight: usize,
+    ) -> Builder<T> {
+        (self.build)(name, size, batch_size, Some(Arc::new(weigher)), max_batch_weight)
     }
 
     /// Adds a [`WorkQueue`] with batching disabled.
@@ -136,8 +149,15 @@ impl Empty {
         let Empty { prefix, stats } = self;
         let name = name.to_string();
         Bufferable {
-            build: Box::new(move |queue_name, size, batch_size| {
-                let next_queue = WorkQueue::new(&format!("{prefix}_{queue_name}"), size, batch_size, &stats);
+            build: Box::new(move |queue_name, size, batch_size, weigher, max_batch_weight| {
+                let next_queue = WorkQueue::new_weighted(
+                    &format!("{prefix}_{queue_name}"),
+                    size,
+                    batch_size,
+                    weigher,
+                    max_batch_weight,
+                    &stats,
+                );
                 let q = next_queue.clone();
                 let worker = Worker::new(&format!("{prefix}_{name}"), stats.clone(), threads, move |_| {
                     let mut writer = q.thread_local_writer();
@@ -241,9 +261,16 @@ impl<O: Send + 'static> Builder<O> {
     {
         let name = name.to_string();
         Bufferable {
-            build: Box::new(move |queue_name, size, batch_size| {
+            build: Box::new(move |queue_name, size, batch_size, weigher, max_batch_weight| {
                 let Builder { prefix, stats, mut graph, output_queue } = self;
-                let next_queue = WorkQueue::new(&format!("{prefix}_{queue_name}"), size, batch_size, &stats);
+                let next_queue = WorkQueue::new_weighted(
+                    &format!("{prefix}_{queue_name}"),
+                    size,
+                    batch_size,
+                    weigher,
+                    max_batch_weight,
+                    &stats,
+                );
                 let (input, output) = (output_queue.clone(), next_queue.clone());
                 let worker = Worker::new(&format!("{prefix}_{name}"), stats.clone(), threads, move |_| {
                     let mut reader = input.thread_local_reader();
@@ -434,6 +461,25 @@ mod tests {
                 });
             assert!(pipeline.await_done().is_err(), "stage {failure_stage}");
         }
+    }
+
+    #[test]
+    fn weighted_buffer() {
+        let result = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+        let r = result.clone();
+        let pipeline = WorkerPipeline::start("test", InMemoryStats::arc())
+            .from_generator("reader", |next| {
+                for i in 0..100usize {
+                    next.accept(i);
+                }
+                Ok(())
+            })
+            .add_buffer_weighted("reader_queue", 10, 4, |i| *i, 50)
+            .sink_to_consumer("process", 2, move |i| {
+                r.lock().insert(i);
+            });
+        pipeline.await_done().unwrap();
+        assert_eq!(100, result.lock().len());
     }
 
     #[test]

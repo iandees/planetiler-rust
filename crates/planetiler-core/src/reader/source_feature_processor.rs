@@ -35,6 +35,11 @@ use crate::util::file_utils::DiskBacked;
 use crate::worker::work_queue::WorkQueueReader;
 use crate::worker::worker_pipeline::{Builder, WorkerPipeline};
 
+// Hand features off from reader to workers in batches of up to 16 features to improve throughput for many small
+// features, but pass big features off in their own batch, capping total points across all features in a batch to ~1k
+const PROCESS_BATCH_SIZE: usize = 16;
+const PROCESS_BATCH_MAX_POINTS: usize = 1_000;
+
 /// Process one feature (called from a processing thread).
 pub type ProcessFn = Box<dyn FnMut(ReaderFeature) -> anyhow::Result<()> + Send>;
 
@@ -234,7 +239,13 @@ where
                 }
                 Ok(())
             })
-            .add_buffer("process_queue", 1000)
+            .add_buffer_weighted(
+                "process_queue",
+                1000,
+                PROCESS_BATCH_SIZE,
+                ReaderFeature::num_points,
+                PROCESS_BATCH_MAX_POINTS,
+            )
     }
 
     /// Renders map features for all elements in `source_paths` based on the mapping logic defined in `profile`,

@@ -40,6 +40,11 @@ impl ReaderFeature {
         ReaderFeature { geometry, tags, source_layer, id }
     }
 
+    /// Returns the number of points in this feature's geometry (Java `SimpleFeature.numPoints()`).
+    pub fn num_points(&self) -> usize {
+        geo::CoordsIter::coords_count(&self.geometry)
+    }
+
     /// Converts this record into a [`SimpleFeature`] from source `source` (Java
     /// `SimpleFeature.create(latLonGeometry, tags, source, sourceLayer, id)`). Geometry, tags and layer name are moved,
     /// not copied; `source` is a shared `Arc` so this only bumps a reference count.
