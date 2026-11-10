@@ -379,6 +379,30 @@ impl PlanetilerConfig {
             false,
         );
 
+        if tile_format != TileFormat::Mlt
+            && (mlt_fsst
+                || mlt_fast_pfor
+                || mlt_tessellate_polygons
+                || mlt_polygon_outline
+                || mlt_reorder_feature
+                || mlt_shared_dictionaries)
+        {
+            anyhow::bail!("mlt_* options require tile_format=mlt, was {}", tile_format.id());
+        }
+        // FSST and FastPFOR shrink the uncompressed tile but leave output that gzip cannot compress further
+        if tile_format == TileFormat::Mlt && tile_compression == TileCompression::Gzip {
+            if mlt_fsst {
+                tracing::warn!(
+                    "mlt_fsst usually makes gzip-compressed tiles larger, use tile_compression=none or disable it"
+                );
+            }
+            if mlt_fast_pfor {
+                tracing::warn!(
+                    "mlt_fastpfor makes gzip-compressed tiles larger, use tile_compression=none or disable it"
+                );
+            }
+        }
+
         Ok(PlanetilerConfig {
             arguments: arguments.clone(),
             bounds,
@@ -506,6 +530,7 @@ mod tests {
             ("threads", "16"),
             ("bounds", "1,2,3,4"),
             ("download_max_bandwidth", "1mb/s"),
+            ("tile_format", "mlt"),
             ("mlt_advanced", "true"),
             ("color", "false"),
             ("extra_name_tags", "a, b"),
@@ -541,5 +566,55 @@ mod tests {
         assert!(PlanetilerConfig::from(&Arguments::of_pairs([("http_retries", "-1")])).is_err());
         assert!(PlanetilerConfig::from(&Arguments::of_pairs([("tile_format", "bogus")])).is_err());
         assert!(PlanetilerConfig::from(&Arguments::of_pairs([("download_max_bandwidth", "1 parsecs")])).is_err());
+    }
+
+    fn config(args: &[&str]) -> anyhow::Result<PlanetilerConfig> {
+        PlanetilerConfig::from(&Arguments::from_args(args))
+    }
+
+    #[test]
+    fn accepts_mlt_options() {
+        for args in [
+            "--tile-format=mvt",
+            "--tile-format=mvt --mlt-fsst=false",
+            "--tile-format=mlt",
+            "--tile-format=mlt --mlt-advanced",
+            "--tile-format=mlt --mlt-tessellate-polygons",
+            "--tile-format=mlt --mlt-fastpfor --mlt-fsst --mlt-reorder-features --mlt-shared-dict --exclude-ids \
+             --mlt-tessellate-polygons --mlt-polygon-outline",
+        ] {
+            let args: Vec<&str> = args.split_whitespace().filter(|a| *a != "\\").collect();
+            assert!(config(&args).is_ok(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_mlt_option_with_mvt() {
+        for option in [
+            "--mlt-fsst",
+            "--mlt-fastpfor",
+            "--mlt-tessellate-polygons",
+            "--mlt-polygon-outline",
+            "--mlt-reorder-features",
+            "--mlt-shared-dict",
+            "--mlt-advanced",
+        ] {
+            let error = config(&["--tile-format=mvt", option]).unwrap_err();
+            assert_eq!("mlt_* options require tile_format=mlt, was mvt", error.to_string(), "{option}");
+        }
+    }
+
+    #[test]
+    fn mlt_advanced_encodings() {
+        for (args, fsst, fast_pfor) in [
+            ("--tile-format=mlt --mlt-fsst", true, false),
+            ("--tile-format=mlt --mlt-fastpfor", false, true),
+            ("--tile-format=mlt --mlt-advanced", true, true),
+        ] {
+            let args: Vec<&str> = args.split_whitespace().collect();
+            let config = config(&args).unwrap();
+            assert_eq!(fsst, config.mlt_fsst, "{args:?}");
+            assert_eq!(fast_pfor, config.mlt_fast_pfor, "{args:?}");
+        }
     }
 }

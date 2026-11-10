@@ -324,6 +324,19 @@ mod tests {
     }
 
     #[test]
+    fn null_geometry_and_properties() {
+        let mut name = Tags::default();
+        name.insert("name".to_string(), Value::from("unlocated"));
+        test_parse(
+            r#"{"type": "FeatureCollection", "features": [
+  {"type": "Feature", "properties": {"name": "unlocated"}, "geometry": null},
+  {"type": "Feature", "properties": null, "geometry": {"type": "Point", "coordinates": [1, 2]}}
+]}"#,
+            vec![feature(geo_utils::empty_geometry(), name), feature(new_point(1.0, 2.0), Tags::default())],
+        );
+    }
+
+    #[test]
     fn bad_geometries() {
         for (json, expected) in [
             (r#"{"type": "Feature", "geometry": {"type": "Point", "coordinates": [[1, 2]]}}"#, "POINT EMPTY"),
