@@ -35,6 +35,11 @@ use crate::util::file_utils::DiskBacked;
 use crate::worker::work_queue::WorkQueueReader;
 use crate::worker::worker_pipeline::{Builder, WorkerPipeline};
 
+// Hand features off from reader to workers in batches of up to 16 features to improve throughput for many small
+// features, but pass big features off in their own batch, capping total points across all features in a batch to ~1k
+const PROCESS_BATCH_SIZE: usize = 16;
+const PROCESS_BATCH_MAX_POINTS: usize = 1_000;
+
 /// Process one feature (called from a processing thread).
 pub type ProcessFn = Box<dyn FnMut(ReaderFeature) -> anyhow::Result<()> + Send>;
 
@@ -203,7 +208,9 @@ where
         let mut count = 0;
         let mut readers = Vec::with_capacity(source_paths.len());
         for path in source_paths {
-            let reader = (self.reader_factory)(path)?;
+            let mut reader = (self.reader_factory)(path)?;
+            // start each file's IDs where the previous one left off so they don't collide
+            reader.set_feature_id_offset(count as i64);
             count += reader.feature_count()?;
             readers.push(reader);
         }
@@ -234,7 +241,13 @@ where
                 }
                 Ok(())
             })
-            .add_buffer("process_queue", 1000)
+            .add_buffer_weighted(
+                "process_queue",
+                1000,
+                PROCESS_BATCH_SIZE,
+                ReaderFeature::num_points,
+                PROCESS_BATCH_MAX_POINTS,
+            )
     }
 
     /// Renders map features for all elements in `source_paths` based on the mapping logic defined in `profile`,
@@ -595,6 +608,43 @@ mod tests {
             InMemoryStats::arc(),
         );
         assert_eq!(6, processor.get_feature_count(&[PathBuf::from("1"), PathBuf::from("22"), "333".into()]).unwrap());
+    }
+
+    /// Records the feature ID offset that it was given.
+    struct OffsetReader {
+        count: u64,
+        offsets: Arc<Mutex<Vec<i64>>>,
+    }
+
+    impl SimpleReader for OffsetReader {
+        fn source_name(&self) -> &str {
+            "sourceName"
+        }
+
+        fn set_feature_id_offset(&mut self, id_offset: i64) {
+            self.offsets.lock().push(id_offset);
+        }
+
+        fn feature_count(&self) -> anyhow::Result<u64> {
+            Ok(self.count)
+        }
+
+        fn read_features(&self, _next: &mut crate::reader::simple_reader::FeatureSink<'_>) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_assigns_feature_id_offsets_after_previous_files() {
+        let offsets = Arc::new(Mutex::new(vec![]));
+        let o = offsets.clone();
+        let processor = SourceFeatureProcessor::new(
+            "sourceName",
+            move |path: &Path| Ok(OffsetReader { count: path.to_string_lossy().len() as u64, offsets: o.clone() }),
+            InMemoryStats::arc(),
+        );
+        assert_eq!(6, processor.get_feature_count(&[PathBuf::from("1"), PathBuf::from("22"), "333".into()]).unwrap());
+        assert_eq!(vec![0, 1, 3], *offsets.lock());
     }
 
     #[test]

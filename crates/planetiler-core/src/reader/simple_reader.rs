@@ -40,6 +40,11 @@ impl ReaderFeature {
         ReaderFeature { geometry, tags, source_layer, id }
     }
 
+    /// Returns the number of points in this feature's geometry (Java `SimpleFeature.numPoints()`).
+    pub fn num_points(&self) -> usize {
+        geo::CoordsIter::coords_count(&self.geometry)
+    }
+
     /// Converts this record into a [`SimpleFeature`] from source `source` (Java
     /// `SimpleFeature.create(latLonGeometry, tags, source, sourceLayer, id)`). Geometry, tags and layer name are moved,
     /// not copied; `source` is a shared `Arc` so this only bumps a reference count.
@@ -68,6 +73,12 @@ pub type FeatureSink<'a> = dyn FnMut(ReaderFeature) -> anyhow::Result<()> + 'a;
 pub trait SimpleReader: Send + Sync {
     /// Name of the source, used in logs and stats.
     fn source_name(&self) -> &str;
+
+    /// Assigns feature IDs in the order they are read starting from `id_offset`, so readers of several files that are
+    /// processed as one source don't produce colliding IDs. Readers that don't assign their own IDs ignore this.
+    fn set_feature_id_offset(&mut self, id_offset: i64) {
+        let _ = id_offset;
+    }
 
     /// Returns the number of features to be read from this reader to use for displaying progress.
     fn feature_count(&self) -> anyhow::Result<u64>;
