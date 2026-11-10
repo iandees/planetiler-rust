@@ -15,13 +15,16 @@
 //! `FeatureGroup` encoder/sink, so the only shared state in the hot path is the distributor's `done` counter (and
 //! its bounded queue once some threads are idle). Difference from Java: the unit of work handed off is a chunk of up
 //! to 256 decoded arrow rows ([`RowChunk`]), not a built feature; see `Progress::process_blocks`.
+//!
+//! [`ParquetReader::process_remote`] reads files that aren't on local disk with HTTP range requests, fetching each row
+//! group with one request that starts shortly before a worker needs it.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
 use tracing::{error, info};
 
@@ -32,17 +35,30 @@ use crate::expression::expression::PartialInput;
 use crate::profile::Profile;
 use crate::reader::parquet::parquet_feature::ParquetFeature;
 use crate::reader::parquet::parquet_input_file::{Block, IdGenerator, ParquetInputFile, RowChunk};
+use crate::reader::remote::download_mode::DownloadMode;
+use crate::reader::remote::range_file::{self, RangeFile};
 use crate::reader::source_feature_processor::{finish_source, process_and_write_with_profile};
 use crate::stats::counter::{Counter, ThreadCounter};
+use crate::stats::process_info;
 use crate::stats::progress_loggers::ProgressLoggers;
 use crate::stats::stats::StatsRef;
+use crate::util::completable_futures::{in_completion_order, join_all_or_close};
+use crate::util::downloader::Downloader;
 use crate::util::file_utils::DiskBacked;
 use crate::util::format;
+use crate::util::request_planner::Plan;
 use crate::value::{Tags, Value};
 use crate::worker::distributor::Distributor;
 use crate::worker::worker_pipeline::{Builder, WorkerPipeline};
 
 pub const DEFAULT_LAYER: &str = "features";
+
+/// Parquet files keep their metadata in a footer, so fetching a generous chunk of the end of a remote file with the
+/// request that opens it avoids a round trip per metadata read.
+const FOOTER_PREFETCH_BYTES: usize = 1 << 20;
+
+/// Opens the file at a path.
+type OpenFile<'a> = &'a (dyn Fn(&Path) -> Result<Arc<dyn RangeFile>> + Sync);
 
 /// Maximum number of rows in one unit of work handed to another thread: big enough that the handoff (a queue
 /// operation and often a thread wake-up) is negligible next to processing the rows, small enough to balance the end of
@@ -240,23 +256,66 @@ impl ParquetReader {
         bounds: &Bounds,
         cares_about: &dyn Fn(&PartialInput) -> bool,
     ) -> Result<Vec<ParquetInputFile>> {
-        let mut result = vec![];
-        for path in source_paths {
-            if path.file_name().is_some_and(|n| n == "_SUCCESS") {
-                continue;
-            }
+        self.open_files_with(source_paths, bounds, cares_about, &|path| range_file::open_local(path), false)
+    }
+
+    /// Like [`ParquetReader::open_files`] but opens the file at each path with `open`, on a thread per file if
+    /// `parallel` (opening a remote file and reading its footer take a round trip or two each).
+    fn open_files_with(
+        &self,
+        source_paths: &[PathBuf],
+        bounds: &Bounds,
+        cares_about: &dyn Fn(&PartialInput) -> bool,
+        open: OpenFile<'_>,
+        parallel: bool,
+    ) -> Result<Vec<ParquetInputFile>> {
+        let paths: Vec<&PathBuf> =
+            source_paths.iter().filter(|path| !path.file_name().is_some_and(|n| n == "_SUCCESS")).collect();
+        let open_one = |path: &PathBuf| -> Result<ParquetInputFile> {
             let hive_partition_fields = if self.hive_partitioning { get_hive_partition_fields(path) } else { None };
             let layer = self.get_layer_name(path);
-            let file = ParquetInputFile::with_options(
+            let file = open(path)?;
+            ParquetInputFile::with_range_file(
                 &self.source_name,
                 &layer,
                 path,
+                file.clone(),
                 None,
                 bounds,
                 hive_partition_fields,
                 self.id_generator.clone(),
-            )?;
-            if !file.should_skip(cares_about) {
+            )
+            .inspect_err(|_| {
+                // not closed by a ParquetInputFile that failed to open
+                let _ = file.close();
+            })
+        };
+        let results: Vec<Result<ParquetInputFile>> = if parallel {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = paths.iter().map(|path| scope.spawn(|| open_one(path))).collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap_or_else(|_| Err(anyhow!("opening a parquet file panicked"))))
+                    .collect()
+            })
+        } else {
+            let mut results = vec![];
+            for path in paths {
+                let result = open_one(path);
+                let failed = result.is_err();
+                results.push(result);
+                if failed {
+                    break;
+                }
+            }
+            results
+        };
+        let opened = join_all_or_close(results, |file| file.close())?;
+        let mut result = vec![];
+        for file in opened {
+            if file.should_skip(cares_about) {
+                file.close()?;
+            } else {
                 result.push(file);
             }
         }
@@ -278,6 +337,40 @@ impl ParquetReader {
         config: &Arc<PlanetilerConfig>,
         profile: &Arc<dyn Profile>,
     ) -> Result<()> {
+        self.process_files(source_paths, &|path| range_file::open_local(path), false, writer, config, profile)
+    }
+
+    /// Like [`ParquetReader::process`] but reads files that aren't on local disk from their URL.
+    ///
+    /// `path_to_url` maps where each file is (or would be) on local disk to its URL. Files that are complete on local
+    /// disk get read from there, the others from their URL according to `mode` (see [`range_file::open`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_remote(
+        &self,
+        path_to_url: &BTreeMap<PathBuf, String>,
+        mode: DownloadMode,
+        refresh: bool,
+        downloader: &Downloader,
+        writer: &Arc<FeatureGroup>,
+        config: &Arc<PlanetilerConfig>,
+        profile: &Arc<dyn Profile>,
+    ) -> Result<()> {
+        let paths: Vec<PathBuf> = path_to_url.keys().cloned().collect();
+        // opening a remote file and reading its footer take a round trip or two each, so open them all at once
+        let open =
+            |path: &Path| range_file::open(path, &path_to_url[path], FOOTER_PREFETCH_BYTES, mode, refresh, downloader);
+        self.process_files(&paths, &open, true, writer, config, profile)
+    }
+
+    fn process_files(
+        &self,
+        source_paths: &[PathBuf],
+        open: OpenFile<'_>,
+        parallel_open: bool,
+        writer: &Arc<FeatureGroup>,
+        config: &Arc<PlanetilerConfig>,
+        profile: &Arc<dyn Profile>,
+    ) -> Result<()> {
         if !profile.cares_about_source(&self.source_name) {
             info!("Skipping {} because the profile does not use it", self.source_name);
             return Ok(());
@@ -285,7 +378,7 @@ impl ParquetReader {
         let cares_about = |input: &PartialInput| profile.cares_about(input);
         let stats = self.stats.clone();
         let distributor = self.new_distributor();
-        self.run(source_paths, config, &cares_about, Some(writer), |builder, progress| {
+        self.run(source_paths, config, &cares_about, open, parallel_open, Some(writer), |builder, progress| {
             process_and_write_with_profile(builder, writer, config, profile, &stats, move |prev, process| {
                 progress.process_blocks(prev, distributor.as_ref(), &mut |feature| process(&feature))
             })
@@ -309,33 +402,59 @@ impl ParquetReader {
     {
         let process_threads = config.feature_process_threads.max(1);
         let distributor = self.new_distributor();
-        self.run(source_paths, config, cares_about, None, |builder, progress| {
-            builder.sink_to("process", process_threads, move |prev| {
-                let mut process = processor_factory();
-                progress.process_blocks(prev, distributor.as_ref(), &mut |feature| {
-                    let id = feature.id();
-                    if let Err(e) = process(feature) {
-                        error!("Error processing parquet feature {id}: {e:#}");
-                    }
-                    Ok(())
+        self.run(
+            source_paths,
+            config,
+            cares_about,
+            &|path| range_file::open_local(path),
+            false,
+            None,
+            |builder, progress| {
+                builder.sink_to("process", process_threads, move |prev| {
+                    let mut process = processor_factory();
+                    progress.process_blocks(prev, distributor.as_ref(), &mut |feature| {
+                        let id = feature.id();
+                        if let Err(e) = process(feature) {
+                            error!("Error processing parquet feature {id}: {e:#}");
+                        }
+                        Ok(())
+                    })
                 })
-            })
-        })
+            },
+        )
     }
 
     /// Opens the input files, starts the pipeline that `build` creates from the blocks of every file, and logs
     /// progress until it completes.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         source_paths: &[PathBuf],
         config: &PlanetilerConfig,
         cares_about: &dyn Fn(&PartialInput) -> bool,
+        open: OpenFile<'_>,
+        parallel_open: bool,
         writer: Option<&Arc<FeatureGroup>>,
         build: impl FnOnce(Builder<Block>, Progress) -> WorkerPipeline,
     ) -> Result<()> {
         let timer = self.stats.start_stage(&self.source_name);
+        let input_files = self.open_files_with(source_paths, &config.bounds, cares_about, open, parallel_open)?;
+        let result = self.run_files(&input_files, config, writer, build);
+        let closed: Result<()> = input_files.iter().try_for_each(|file| file.close());
+        result?;
+        closed?;
+        timer.stop();
+        Ok(())
+    }
+
+    fn run_files(
+        &self,
+        input_files: &[ParquetInputFile],
+        config: &PlanetilerConfig,
+        writer: Option<&Arc<FeatureGroup>>,
+        build: impl FnOnce(Builder<Block>, Progress) -> WorkerPipeline,
+    ) -> Result<()> {
         let start = std::time::Instant::now();
-        let input_files = self.open_files(source_paths, &config.bounds, cares_about)?;
         // don't show % complete on features when a filter is present because to determine total # elements would
         // take an expensive initial query, and % complete on blocks gives a good enough proxy
         let feature_count: u64 = if input_files.iter().any(ParquetInputFile::has_filter) {
@@ -349,10 +468,49 @@ impl ParquetReader {
             features: Counter::new_multi_thread_counter(),
             working_on: Arc::new(Mutex::new(BTreeMap::new())),
         };
+        let range_files: Vec<Arc<dyn RangeFile>> = input_files.iter().map(|f| f.file().clone()).collect();
+        // files complete on local disk fetch nothing, and opening a remote one always makes a request
+        let remote = range_files.iter().any(|file| file.requests_made() > 0);
+        // before the pipeline starts fetching: progress counts the row group bytes only, not the footers fetched
+        // already
+        let plans: Vec<Plan> = input_files.iter().map(ParquetInputFile::plan_fetch).collect();
+        let bytes_to_fetch: u64 = plans.iter().map(Plan::bytes).sum();
+        let requests_to_fetch: u64 = plans.iter().map(|plan| plan.http_requests.len() as u64).sum();
+        // files get read one after another, so the look-ahead only needs to cover one file's requests in flight
+        let bytes_in_flight = plans.iter().map(Plan::bytes_in_flight).max().unwrap_or(0);
+        let process_threads = config.feature_process_threads.max(1);
+        let look_ahead = look_ahead_blocks(
+            block_count as u64,
+            input_files.iter().map(ParquetInputFile::bytes_to_read).sum(),
+            bytes_in_flight,
+            process_threads,
+        );
+        let bytes_fetched_before: u64 = range_files.iter().map(|f| f.bytes_fetched()).sum();
+        let requests_made_before: u64 = range_files.iter().map(|f| f.requests_made()).sum();
         let input_blocks: Vec<Block> = input_files.iter().flat_map(ParquetInputFile::get).collect();
 
-        let builder =
-            WorkerPipeline::start(&self.source_name, self.stats.clone()).read_from_tiny("blocks", input_blocks);
+        let start_pipeline = WorkerPipeline::start(&self.source_name, self.stats.clone());
+        let builder = if remote {
+            let blocks = Mutex::new(Some(input_blocks));
+            start_pipeline
+                .from_generator("fetch", move |next| {
+                    // Start processing a block as soon as it's ready, which may not be in file-order. Reading in
+                    // file-order would block streaming/cached downloads on a previous slow request
+                    in_completion_order(
+                        blocks.lock().take().unwrap_or_default(),
+                        look_ahead,
+                        |block| {
+                            block.start_fetch_if_necessary();
+                            block.when_fetched()
+                        },
+                        |block| next.accept(block),
+                    );
+                    Ok(())
+                })
+                .add_buffer("blocks", process_threads)
+        } else {
+            start_pipeline.read_from_tiny("blocks", input_blocks)
+        };
         let pipeline = build(builder, progress.clone());
 
         let (features, blocks, working) =
@@ -360,6 +518,26 @@ impl ParquetReader {
         let mut loggers = ProgressLoggers::create()
             .add_rate_percent_counter("read", feature_count as i64, move || features.get(), true)
             .add_rate_percent_counter("blocks", block_count as i64, move || blocks.get(), false);
+        if remote {
+            let (fetched, made) = (range_files.clone(), range_files.clone());
+            loggers = loggers
+                .add_storage_rate_percent_counter(
+                    "download",
+                    bytes_to_fetch as i64,
+                    move || fetched.iter().map(|f| f.bytes_fetched()).sum::<u64>() as i64 - bytes_fetched_before as i64,
+                    false,
+                )
+                .add(move || {
+                    format!(
+                        " ({}/{})",
+                        format::numeric(
+                            made.iter().map(|f| f.requests_made()).sum::<u64>() as i64 - requests_made_before as i64,
+                            false
+                        ),
+                        format::numeric(requests_to_fetch as i64, false)
+                    )
+                });
+        }
         if let Some(writer) = writer {
             let (written, file) = (writer.clone(), writer.clone());
             loggers = loggers
@@ -384,15 +562,23 @@ impl ParquetReader {
 
         let count = progress.features.get();
         let elapsed = start.elapsed().as_secs_f64().max(1e-9);
+        let downloaded = if remote {
+            format!(
+                ", downloaded {}B in {} requests",
+                format::storage(range_files.iter().map(|f| f.bytes_fetched()).sum::<u64>() as i64, false),
+                format::integer(range_files.iter().map(|f| f.requests_made()).sum::<u64>() as i64)
+            )
+        } else {
+            String::new()
+        };
         info!(
-            "Processed {} parquet features ({}/s, {} blocks, {} files) in {:.1}s",
+            "Processed {} parquet features ({}/s, {} blocks, {} files{downloaded}) in {:.1}s",
             format::integer(count),
             format::numeric(count as f64 / elapsed, false),
             format::integer(progress.blocks.get()),
             format::integer(input_files.len() as i64),
             elapsed
         );
-        timer.stop();
         Ok(())
     }
 
@@ -408,7 +594,7 @@ impl ParquetReader {
         let files = self.open_files(source_paths, bounds, &|_| true)?;
         let blocks: Vec<Block> = files.iter().flat_map(ParquetInputFile::get).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
+        let result: Result<()> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..threads.max(1).min(blocks.len().max(1)))
                 .map(|_| {
                     scope.spawn(|| -> Result<()> {
@@ -424,8 +610,21 @@ impl ParquetReader {
                 handle.join().map_err(|_| anyhow::anyhow!("parquet reader thread panicked"))??;
             }
             Ok(())
-        })
+        });
+        let closed: Result<()> = files.iter().try_for_each(|file| file.close());
+        result?;
+        closed
     }
+}
+
+/// Returns how many blocks to fetch ahead of the workers: enough to keep the `bytes_in_flight` of requests made at
+/// once busy twice over (so the next requests start as soon as some finish) and at least one per worker, but no more
+/// than 1/8 of the memory.
+fn look_ahead_blocks(blocks: u64, bytes: u64, bytes_in_flight: u64, process_threads: usize) -> usize {
+    let average_block_bytes = bytes.checked_div(blocks).map_or(1, |average| average.max(1));
+    let wanted = (process_threads as u64).max((2 * bytes_in_flight).div_ceil(average_block_bytes));
+    let memory_limit = process_info::get_max_memory_bytes() / 8;
+    wanted.min(memory_limit / average_block_bytes).clamp(1, i32::MAX as u64) as usize
 }
 
 #[cfg(test)]
@@ -757,6 +956,90 @@ mod tests {
             })
             .unwrap();
         assert_eq!(3 * bostons().len(), count.into_inner());
+    }
+
+    /// Java `ParquetReaderTest.testNothingToRead`: bounds that miss every file, and no files at all (e.g. Overture
+    /// bounds over open ocean).
+    #[test]
+    fn nothing_to_read() {
+        use crate::reader::source_feature_processor::test_support::{CollectingProfile, config, run_with_group};
+
+        let mut outside_boston = config(true);
+        outside_boston.bounds = Bounds::new(Some(crate::geo::envelope::Envelope::new(7.40, 7.44, 43.72, 43.75)));
+        let profile = Arc::new(CollectingProfile::default());
+        let files = bostons();
+        let output = run_with_group(outside_boston, profile.clone(), |group, config, dyn_profile, stats| {
+            let reader = ParquetReader::new("source", stats);
+            reader.process(&files, group, config, dyn_profile)?;
+            reader.process(&[], group, config, dyn_profile)
+        });
+        assert!(output.is_empty());
+        assert!(profile.seen.lock().is_empty());
+    }
+
+    /// Reads boston.parquet from a stub server in `mode` and from local disk, and compares the features.
+    fn remote_matches_local(mode: DownloadMode) {
+        use crate::reader::source_feature_processor::test_support::{CollectingProfile, config, run_with_group};
+        use crate::testing::stub_downloader::StubDownloader;
+
+        let url = "http://host/boston.parquet";
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/resources/parquet/boston.parquet");
+        let downloader = StubDownloader::new(PlanetilerConfig::defaults());
+        downloader.put(url, &std::fs::read(&source).unwrap());
+        // feature ids come from the file's path, so the local run reads the same path the remote one would cache to
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sources").join("boston.parquet");
+
+        let remote_profile = Arc::new(CollectingProfile::default());
+        let remote_output = run_with_group(config(true), remote_profile.clone(), |group, config, profile, stats| {
+            let urls = BTreeMap::from([(path.clone(), url.to_string())]);
+            ParquetReader::new("source", stats).process_remote(&urls, mode, false, &downloader, group, config, profile)
+        });
+        assert!(!downloader.requests().is_empty());
+        assert_eq!(mode == DownloadMode::Cached, path.exists(), "cached keeps a local copy, streaming doesn't");
+
+        if !path.exists() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::copy(&source, &path).unwrap();
+        }
+        let local_profile = Arc::new(CollectingProfile::default());
+        let local_output = run_with_group(config(true), local_profile.clone(), |group, config, profile, stats| {
+            ParquetReader::new("source", stats).process(std::slice::from_ref(&path), group, config, profile)
+        });
+
+        assert_eq!(3, local_output.len());
+        let sorted = |profile: &CollectingProfile| {
+            let mut seen = profile.seen.lock().clone();
+            seen.sort();
+            seen
+        };
+        assert_eq!(sorted(&local_profile), sorted(&remote_profile));
+        type Output = crate::reader::source_feature_processor::test_support::Output;
+        let sorted_output = |mut output: Vec<Output>| {
+            output.sort_by_key(|(tile, layer, tags)| (tile.encoded, layer.clone(), format!("{tags:?}")));
+            output
+        };
+        assert_eq!(sorted_output(local_output), sorted_output(remote_output));
+    }
+
+    #[test]
+    fn process_remote_streaming() {
+        remote_matches_local(DownloadMode::Streaming);
+    }
+
+    #[test]
+    fn process_remote_cached() {
+        remote_matches_local(DownloadMode::Cached);
+    }
+
+    #[test]
+    fn look_ahead() {
+        // at least one block per worker
+        assert_eq!(4, look_ahead_blocks(100, 100 * 1_000_000, 0, 4));
+        // enough to keep the bytes in flight busy twice over
+        assert_eq!(40, look_ahead_blocks(100, 100 * 1_000_000, 20_000_000, 4));
+        // never fewer than one
+        assert_eq!(1, look_ahead_blocks(0, 0, 0, 0));
     }
 
     #[test]

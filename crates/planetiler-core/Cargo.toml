@@ -29,6 +29,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 shapefile.workspace = true
 parquet.workspace = true
+bytes.workspace = true
 arrow.workspace = true
 csv.workspace = true
 zip.workspace = true

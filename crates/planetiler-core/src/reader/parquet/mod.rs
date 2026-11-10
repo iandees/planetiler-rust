@@ -8,3 +8,4 @@ pub mod parquet_input_file;
 pub mod parquet_primitive_converter;
 pub mod parquet_reader;
 pub mod parquet_record_converter;
+pub mod range_input_file;
