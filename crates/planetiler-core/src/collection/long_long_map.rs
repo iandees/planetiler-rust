@@ -304,6 +304,19 @@ pub(crate) mod tests {
         assert_eq!(MISSING_VALUE, map.get(0));
         assert_eq!(MISSING_VALUE, map.get(3));
         assert_eq!(vec![3, 4, i64::MAX, MISSING_VALUE], map.multi_get(&[1, 2, 1_000_000, 3]));
+        // insertClustersAcrossIndexPages: keys on both sides of 256-ID chunk and 131,072-ID index page boundaries, with
+        // gaps of empty pages in between
+        let keys = [1i64, 255, 256, 131_071, 131_072, 131_073, 1_000_000, 1_000_200];
+        let puts: Vec<(i64, i64)> = keys.iter().enumerate().map(|(i, &k)| (k, i as i64 + 1)).collect();
+        let map = with_map(create, &puts);
+        for &(k, v) in &puts {
+            assert_eq!(v, map.get(k), "key {k}");
+        }
+        for missing in
+            [0i64, 2, 254, 257, 1_000, 131_070, 131_074, 500_000, 999_999, 1_000_001, 1_000_199, 1_000_201, 2_000_000]
+        {
+            assert_eq!(MISSING_VALUE, map.get(missing), "key {missing}");
+        }
         // bigMultiInsert
         let puts: Vec<(i64, i64)> = (0..50_000).map(|i| (i * 4, i + 1)).collect();
         let map = with_map(create, &puts);
@@ -352,7 +365,7 @@ pub(crate) mod tests {
                     estimate.get(&[&crate::util::resource_usage::MEMORY])
                 };
                 if map_type != LongLongMapType::Noop {
-                    assert!(usage > 60e9 as u64 && usage < 100e9 as u64, "{variant}: {usage}");
+                    assert!(usage > 60e9 as u64 && usage < 120e9 as u64, "{variant}: {usage}");
                 }
                 let map = from(map_type, storage, &params).unwrap();
                 {

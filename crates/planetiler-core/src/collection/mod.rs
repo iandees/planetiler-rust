@@ -17,4 +17,5 @@ pub mod long_min_heap;
 pub mod sortable_feature;
 pub mod sorted_table_long_long_map;
 pub mod sparse_array_long_long_map;
+pub mod sparse_monotonic_long_map;
 pub mod storage;

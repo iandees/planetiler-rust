@@ -1,16 +1,15 @@
 //! Port of `collection/SparseArrayLongLongMap.java`: a long-long map that only stores values and uses the key as an
 //! index into the array, with some tweaks to avoid storing many sequential missing values.
 
-use super::append_store::{AppendStore, Longs};
-use super::append_store_ram::AppendStoreRam;
+use super::append_store::Longs;
 use super::long_long_map::{LongLongMap, LongLongMapWriter, MISSING_VALUE, SealOnRead, SequentialWriter};
+use super::sparse_monotonic_long_map::SparseMonotonicLongMap;
 
 struct State {
-    // The key space is broken into chunks of 256 and for each chunk, store:
-    // 1) the index in the values array for the first key in the block
-    offsets: AppendStoreRam<i64>,
-    // 2) the number of leading missing values at the start of each block
-    offset_start_pad: Vec<u8>,
+    // The key space is broken into chunks of 256 and for each chunk with keys, store the index in the values array of
+    // its first key shifted left 8 bits, plus the number of missing keys at the start of the chunk in the low 8 bits.
+    // Only chunks with keys use memory, so small extracts don't pay for every chunk up to the largest node ID.
+    offsets: SparseMonotonicLongMap,
     values: Box<dyn Longs>,
     last_chunk: i64,
     last_offset: i32,
@@ -31,10 +30,7 @@ impl State {
         if chunk != self.last_chunk {
             // new chunk, store offset and leading zeros
             self.last_offset = offset;
-            while self.offsets.size() as i64 <= chunk {
-                self.offsets.append_long(idx)?;
-                self.offset_start_pad.push(offset as u8);
-            }
+            self.offsets.add(chunk, (idx << 8) | offset as i64)?;
             self.last_chunk = chunk;
         } else {
             // same chunk, write missing values until we get to right idx
@@ -52,17 +48,17 @@ impl State {
         if key < 0 {
             return MISSING_VALUE;
         }
-        let chunk = (key >> 8) as u64;
+        let chunk = key >> 8;
         let offset = (key & 255) as u64;
-        let num_offsets = self.offsets.size();
-        if chunk >= num_offsets {
+        let entry = self.offsets.get(chunk);
+        if entry < 0 {
             return MISSING_VALUE;
         }
-        let lo = self.offsets.get_long(chunk) as u64;
+        let lo = (entry >> 8) as u64;
         let values_size = self.values.size();
-        let hi = if chunk >= num_offsets - 1 { values_size } else { self.offsets.get_long(chunk + 1) as u64 };
-        let hi = hi.min(values_size);
-        let start_pad = self.offset_start_pad[chunk as usize] as u64;
+        let next = self.offsets.next(chunk).unwrap_or(-1);
+        let hi = if next < 0 { values_size } else { ((next >> 8) as u64).min(values_size) };
+        let start_pad = (entry & 255) as u64;
         // index = lo + offset - start_pad, must be in [lo, hi)
         if offset < start_pad {
             return MISSING_VALUE;
@@ -84,8 +80,7 @@ impl SparseArrayLongLongMap {
     pub fn new(values: Box<dyn Longs>) -> SparseArrayLongLongMap {
         SparseArrayLongLongMap {
             state: SealOnRead::new(State {
-                offsets: AppendStoreRam::new(),
-                offset_start_pad: Vec::new(),
+                offsets: SparseMonotonicLongMap::new(),
                 values,
                 last_chunk: -1,
                 last_offset: 0,
@@ -123,11 +118,7 @@ impl LongLongMap for SparseArrayLongLongMap {
 
     fn estimate_memory_usage_bytes(&self) -> u64 {
         self.state
-            .peek(|s| {
-                s.values.estimate_memory_usage_bytes()
-                    + s.offsets.estimate_memory_usage_bytes()
-                    + s.offset_start_pad.capacity() as u64
-            })
+            .peek(|s| s.values.estimate_memory_usage_bytes() + s.offsets.estimate_memory_usage_bytes())
             .unwrap_or(0)
     }
 }
@@ -135,6 +126,7 @@ impl LongLongMap for SparseArrayLongLongMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collection::append_store_ram::AppendStoreRam;
 
     #[test]
     fn direct_put_and_get() {
