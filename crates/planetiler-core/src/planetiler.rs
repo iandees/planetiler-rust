@@ -1250,7 +1250,7 @@ impl Planetiler {
     fn download(&mut self, profile: &Arc<dyn Profile>, filter: impl Fn(&ToDownload) -> bool) -> anyhow::Result<()> {
         let (selected, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.to_download).into_iter().partition(filter);
         self.to_download = rest;
-        let mut downloader = Downloader::create((*self.config).clone());
+        let downloader = Downloader::create((*self.config).clone());
         // start listing the files of all sources before waiting on any, since a catalog lookup can take a few seconds
         let mut lookups = vec![];
         for to_download in selected {

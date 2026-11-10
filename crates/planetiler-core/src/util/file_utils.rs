@@ -272,6 +272,62 @@ pub fn set_length(path: &Path, size: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Reads `length` bytes at `offset` from `file` without changing its position, so it is safe to call from several
+/// threads at once.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::UnexpectedEof`] if the file ends before `offset + length`.
+pub fn read_fully(file: &std::fs::File, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+    let mut result = vec![0u8; length];
+    let mut done = 0;
+    while done < length {
+        let read = read_at(file, &mut result[done..], offset + done as u64)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("Unexpected EOF at {}", offset + done as u64),
+            ));
+        }
+        done += read;
+    }
+    Ok(result)
+}
+
+/// Writes all of `bytes` at `offset` of `file` without changing its position, so it is safe to call from several
+/// threads at once.
+pub fn write_fully(file: &std::fs::File, bytes: &[u8], offset: u64) -> io::Result<()> {
+    let mut done = 0;
+    while done < bytes.len() {
+        let written = write_at(file, &bytes[done..], offset + done as u64)?;
+        if written == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write whole buffer"));
+        }
+        done += written;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+#[cfg(unix)]
+fn write_at(file: &std::fs::File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::write_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn write_at(file: &std::fs::File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+}
+
 /// Splits a path returned by [`walk_path_with_pattern`] into a `.zip` file and the entry name within it, or `None` if
 /// the path does not point inside a zip file.
 pub fn split_zip_path(path: &Path) -> Option<(PathBuf, String)> {
@@ -584,5 +640,20 @@ mod tests {
         let a = tmp.path().join("a");
         std::fs::write(&a, "a").unwrap();
         assert!(is_newer(&a, &tmp.path().join("missing")));
+    }
+
+    #[test]
+    fn read_and_write_fully() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("file");
+        let file = std::fs::File::options().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        write_fully(&file, b"world", 6).unwrap();
+        write_fully(&file, b"hello", 0).unwrap();
+        assert_eq!(b"world".to_vec(), read_fully(&file, 6, 5).unwrap());
+        assert_eq!(b"hello".to_vec(), read_fully(&file, 0, 5).unwrap());
+        assert!(read_fully(&file, 0, 0).unwrap().is_empty());
+        // past the end of the file
+        let error = read_fully(&file, 8, 10).unwrap_err();
+        assert_eq!(io::ErrorKind::UnexpectedEof, error.kind());
     }
 }
