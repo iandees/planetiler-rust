@@ -10,9 +10,10 @@
 //! Records are read sequentially by one thread and decoded/reprojected in parallel by a pool of decode threads, then
 //! emitted to the consumer in file order.
 //!
-//! Geometries are built the same way as GeoTools: point shapefiles produce `Point`s, multipoint shapefiles
-//! `MultiPoint`s, polyline shapefiles `MultiLineString`s and polygon shapefiles `MultiPolygon`s (clockwise rings are
-//! shells, counter-clockwise rings are holes assigned to the smallest shell that contains them).
+//! Point shapefiles produce `Point`s, multipoint shapefiles `MultiPoint`s, polyline shapefiles `MultiLineString`s and
+//! polygon shapefiles `MultiPolygon`s, assembling polygon rings with
+//! [`shapefile_polygon_handler`](crate::reader::shapefile_polygon_handler) (clockwise rings are shells,
+//! counter-clockwise rings are holes assigned to the smallest shell that contains them).
 //!
 //! DBF attributes map to: `C` -> string (right-trimmed), `N` without decimals -> integer, `N`/`F` with decimals ->
 //! double, `L` -> boolean, `D` -> `YYYY-MM-DD` string (Java uses `java.util.Date`), `I`/`+` -> integer, `O` -> double;
@@ -29,12 +30,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
-use geo_types::{Coord, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
+use geo_types::{Coord, Geometry, LineString, MultiLineString, MultiPoint, Point, Polygon};
 use tracing::warn;
 
 use crate::config::bounds::Bounds;
 use crate::geo::crs::{Crs, MathTransform, decode_crs, find_math_transform};
 use crate::geo::envelope::Envelope;
+use crate::reader::shapefile_options::ShapefileOptions;
+use crate::reader::shapefile_polygon_handler;
 use crate::reader::simple_reader::{
     FeatureSink, ReaderFeature, SimpleReader, default_decode_threads, inverse_transform_envelope,
 };
@@ -100,6 +103,10 @@ pub struct ShapefileReader {
     charset: Charset,
     dbf: DbfHeader,
     decode_threads: usize,
+    /// Leave out attributes with an empty string value.
+    empty_strings_as_null: bool,
+    /// Feature IDs start counting from this offset, see [`SimpleReader::set_feature_id_offset`].
+    id_offset: i64,
     /// Records that passed `source_filter`, kept by [`SimpleReader::feature_count`] so that
     /// [`SimpleReader::read_features`] does not have to read (and inflate) the whole file again.
     filtered: Mutex<Option<Vec<RawBatch>>>,
@@ -122,6 +129,20 @@ impl ShapefileReader {
         input: &Path,
         bounds: &Bounds,
     ) -> Result<ShapefileReader> {
+        let options = ShapefileOptions::default().with_projection(source_projection);
+        Self::with_options(source_name, input, bounds, &options)
+    }
+
+    /// Opens the shapefile at `input`, only reading features whose bounding box intersects `bounds`, with the
+    /// projection override and attribute changes from `options` (`options.glob_pattern` only applies to
+    /// [`Planetiler::add_shapefile_source_with_options`](crate::planetiler::Planetiler), not here).
+    pub fn with_options(
+        source_name: &str,
+        input: &Path,
+        bounds: &Bounds,
+        options: &ShapefileOptions,
+    ) -> Result<ShapefileReader> {
+        let source_projection = options.projection.as_deref();
         let input_desc = resolve_input(input)?;
         let layer = match &input_desc {
             Input::Disk { shp, .. } => file_name(shp),
@@ -161,7 +182,12 @@ impl ShapefileReader {
         };
         let transform = if transform.is_identity() { None } else { Some(transform) };
 
-        let dbf = read_dbf_header(&input_desc, charset)?;
+        let mut dbf = read_dbf_header(&input_desc, charset)?;
+        if options.lowercase_attribute_names {
+            for field in &mut dbf.fields {
+                field.name = field.name.to_lowercase();
+            }
+        }
         Ok(ShapefileReader {
             source_name: source_name.to_string(),
             layer: layer.into(),
@@ -171,6 +197,8 @@ impl ShapefileReader {
             charset,
             dbf,
             decode_threads: default_decode_threads(),
+            empty_strings_as_null: options.empty_strings_as_null,
+            id_offset: 0,
             filtered: Mutex::new(None),
         })
     }
@@ -321,7 +349,12 @@ impl ShapefileReader {
                 Err(e) => return Err(e.context(format!("Error decoding record {} of {}", record.number, self.layer))),
             };
             let tags = self.decode_attributes(&batch.dbf[record.dbf.clone()]);
-            result.push(ReaderFeature { geometry, tags, source_layer: Some(self.layer.clone()), id: record.id });
+            result.push(ReaderFeature {
+                geometry,
+                tags,
+                source_layer: Some(self.layer.clone()),
+                id: self.id_offset + record.id,
+            });
         }
         Ok(result)
     }
@@ -332,6 +365,9 @@ impl ShapefileReader {
             let value = record
                 .get(field.offset..field.offset + field.length)
                 .map_or(Value::Null, |bytes| decode_dbf_value(field, bytes, self.charset));
+            if self.empty_strings_as_null && matches!(&value, Value::String(s) if s.is_empty()) {
+                continue;
+            }
             tags.insert(field.name.clone(), value);
         }
         tags
@@ -341,6 +377,10 @@ impl ShapefileReader {
 impl SimpleReader for ShapefileReader {
     fn source_name(&self) -> &str {
         &self.source_name
+    }
+
+    fn set_feature_id_offset(&mut self, id_offset: i64) {
+        self.id_offset = id_offset;
     }
 
     fn feature_count(&self) -> Result<u64> {
@@ -746,7 +786,10 @@ fn decode_shape(content: &[u8], transform: Option<&MathTransform>) -> Result<Opt
             for _ in 0..num_parts {
                 parts.push(cursor.count()?);
             }
-            let coords = cursor.coords(num_points, transform)?;
+            let is_polygon = matches!(shape_type, 5 | 15 | 25);
+            // rings are classified as shells or holes by their orientation in the shapefile's own coordinate system,
+            // before reprojecting
+            let coords = cursor.coords(num_points, if is_polygon { None } else { transform })?;
             let mut rings: Vec<Vec<Coord<f64>>> = Vec::with_capacity(num_parts);
             let mut coords = coords.into_iter();
             for i in 0..num_parts {
@@ -754,13 +797,24 @@ fn decode_shape(content: &[u8], transform: Option<&MathTransform>) -> Result<Opt
                 let end = parts.get(i + 1).copied().unwrap_or(num_points).clamp(start, num_points);
                 rings.push(coords.by_ref().take(end - start).collect());
             }
-            if matches!(shape_type, 3 | 13 | 23) {
+            if !is_polygon {
                 Geometry::MultiLineString(MultiLineString(rings.into_iter().map(LineString).collect()))
             } else {
-                let polygons = build_polygons(rings);
-                if polygons.0.is_empty() {
-                    // e.g. the polygons with 1 ring and no points in Geofabrik extracts (planetiler #1568)
-                    return Err(unreadable("polygon without any usable rings"));
+                // e.g. the polygons with 1 ring and no points in Geofabrik extracts (planetiler #1568)
+                let mut polygons = shapefile_polygon_handler::read_polygon(rings)
+                    .ok_or_else(|| unreadable("Polygon record has no ring with at least 4 points"))?;
+                if let Some(t) = transform {
+                    polygons.0 = polygons
+                        .0
+                        .into_iter()
+                        .map(|polygon| {
+                            let (exterior, interiors) = polygon.into_inner();
+                            Ok(Polygon::new(
+                                transform_ring(exterior, t)?,
+                                interiors.into_iter().map(|ring| transform_ring(ring, t)).collect::<Result<_>>()?,
+                            ))
+                        })
+                        .collect::<Result<_>>()?;
                 }
                 Geometry::MultiPolygon(polygons)
             }
@@ -769,91 +823,11 @@ fn decode_shape(content: &[u8], transform: Option<&MathTransform>) -> Result<Opt
     }))
 }
 
-/// Twice the signed area of a ring (positive = counter-clockwise).
-fn signed_area(ring: &[Coord<f64>]) -> f64 {
-    if ring.len() < 3 {
-        return 0.0;
+fn transform_ring(mut ring: LineString<f64>, transform: &MathTransform) -> Result<LineString<f64>> {
+    for c in &mut ring.0 {
+        *c = transform.transform(*c)?;
     }
-    // shift to the first point to reduce floating point error
-    let origin = ring[0];
-    ring.windows(2).map(|w| (w[0].x - origin.x) * (w[1].y - origin.y) - (w[1].x - origin.x) * (w[0].y - origin.y)).sum()
-}
-
-fn ring_envelope(ring: &[Coord<f64>]) -> Envelope {
-    let mut env = Envelope::null();
-    for c in ring {
-        env.expand_to_include(c.x, c.y);
-    }
-    env
-}
-
-fn point_in_ring(p: Coord<f64>, ring: &[Coord<f64>]) -> bool {
-    let mut inside = false;
-    let n = ring.len();
-    let mut j = n - 1;
-    for i in 0..n {
-        let (a, b) = (ring[i], ring[j]);
-        if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
-}
-
-/// Assemble polygon rings the way GeoTools' `PolygonHandler` does: clockwise rings are shells, counter-clockwise
-/// rings are holes, each hole goes in the smallest shell that contains it (or becomes a shell if none do).
-fn build_polygons(rings: Vec<Vec<Coord<f64>>>) -> MultiPolygon<f64> {
-    let mut shells = vec![];
-    let mut holes = vec![];
-    for mut ring in rings {
-        if ring.len() < 3 {
-            continue;
-        }
-        if ring.first() != ring.last() {
-            ring.push(ring[0]);
-        }
-        if ring.len() < 4 {
-            continue;
-        }
-        if signed_area(&ring) > 0.0 { holes.push(ring) } else { shells.push(ring) }
-    }
-    if shells.len() == 1 {
-        let shell = shells.pop().unwrap();
-        return MultiPolygon(vec![Polygon::new(LineString(shell), holes.into_iter().map(LineString).collect())]);
-    }
-    if shells.is_empty() && holes.len() == 1 {
-        return MultiPolygon(vec![Polygon::new(LineString(holes.pop().unwrap()), vec![])]);
-    }
-    let shell_envelopes: Vec<Envelope> = shells.iter().map(|s| ring_envelope(s)).collect();
-    let mut holes_for_shells: Vec<Vec<LineString<f64>>> = vec![vec![]; shells.len()];
-    let mut extra_shells = vec![];
-    for hole in holes {
-        let hole_env = ring_envelope(&hole);
-        let mut best: Option<usize> = None;
-        for (i, shell) in shells.iter().enumerate() {
-            let shell_env = &shell_envelopes[i];
-            if !shell_env.contains(&hole_env) {
-                continue;
-            }
-            let test_point = hole.iter().find(|c| !shell.contains(c)).copied().unwrap_or(hole[0]);
-            if point_in_ring(test_point, shell) && best.is_none_or(|b| shell_envelopes[b].contains(shell_env)) {
-                best = Some(i);
-            }
-        }
-        match best {
-            Some(i) => holes_for_shells[i].push(LineString(hole)),
-            None => {
-                let mut reversed = hole;
-                reversed.reverse();
-                extra_shells.push(Polygon::new(LineString(reversed), vec![]));
-            }
-        }
-    }
-    let mut polygons: Vec<Polygon<f64>> =
-        shells.into_iter().zip(holes_for_shells).map(|(shell, holes)| Polygon::new(LineString(shell), holes)).collect();
-    polygons.extend(extra_shells);
-    MultiPolygon(polygons)
+    Ok(ring)
 }
 
 /// Entry points that run a profile on shapefiles (Java's static `ShapefileReader.processWithProjection`).
@@ -873,13 +847,28 @@ impl ShapefileReader {
         profile: &std::sync::Arc<dyn crate::profile::Profile>,
         stats: crate::stats::stats::StatsRef,
     ) -> Result<()> {
-        let projection = source_projection.map(str::to_string);
+        let options = ShapefileOptions::default().with_projection(source_projection);
+        Self::process_with_options(source_name, source_paths, &options, writer, config, profile, stats)
+    }
+
+    /// Like [`ShapefileReader::process_with_projection`] with all of the `options` (Java's static
+    /// `ShapefileReader.process(sourceName, sourcePaths, options, ...)`).
+    pub fn process_with_options(
+        source_name: &str,
+        source_paths: Vec<PathBuf>,
+        options: &ShapefileOptions,
+        writer: &std::sync::Arc<crate::collection::feature_group::FeatureGroup>,
+        config: &std::sync::Arc<crate::config::planetiler_config::PlanetilerConfig>,
+        profile: &std::sync::Arc<dyn crate::profile::Profile>,
+        stats: crate::stats::stats::StatsRef,
+    ) -> Result<()> {
+        let options = options.clone();
         let name = source_name.to_string();
         let bounds = config.bounds.clone();
         crate::reader::source_feature_processor::process_files(
             source_name,
             source_paths,
-            move |path: &Path| ShapefileReader::with_bounds(projection.as_deref(), &name, path, &bounds),
+            move |path: &Path| ShapefileReader::with_options(&name, path, &bounds, &options),
             writer,
             config,
             profile,
@@ -1196,6 +1185,81 @@ mod tests {
         for (i, feature) in features.iter().enumerate() {
             assert_rectangle(feature, i as i64 + 1);
         }
+    }
+
+    #[test]
+    fn attribute_options() {
+        for with_options in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let shp_path = dir.path().join("test.shp");
+            {
+                let table = shapefile::dbase::TableWriterBuilder::new()
+                    .add_character_field(shapefile::dbase::FieldName::try_from("NAME").unwrap(), 10)
+                    .add_numeric_field(shapefile::dbase::FieldName::try_from("Rank").unwrap(), 10, 0);
+                let mut writer = shapefile::Writer::from_path(&shp_path, table).unwrap();
+                for (i, (x, name)) in [(1.0, "a"), (3.0, "")].into_iter().enumerate() {
+                    let mut record = shapefile::dbase::Record::default();
+                    record.insert("NAME".to_string(), shapefile::dbase::FieldValue::Character(Some(name.into())));
+                    record.insert("Rank".to_string(), shapefile::dbase::FieldValue::Numeric(Some(i as f64 + 1.0)));
+                    writer.write_shape_and_record(&shapefile::Point::new(x, x + 1.0), &record).unwrap();
+                }
+            }
+            let options = if with_options {
+                ShapefileOptions::default().with_lowercase_attribute_names(true).with_empty_strings_as_null(true)
+            } else {
+                ShapefileOptions::default()
+            };
+            let reader = ShapefileReader::with_options("test", &shp_path, &Bounds::world(), &options).unwrap();
+            let features = reader.read_all().unwrap();
+            assert_eq!(2, features.len());
+            if with_options {
+                assert_eq!(crate::tags! {"name" => "a", "rank" => 1}, features[0].tags);
+                assert_eq!(crate::tags! {"rank" => 2}, features[1].tags);
+            } else {
+                assert_eq!(crate::tags! {"NAME" => "a", "Rank" => 1}, features[0].tags);
+                assert_eq!(crate::tags! {"NAME" => "", "Rank" => 2}, features[1].tags);
+            }
+        }
+    }
+
+    #[test]
+    fn feature_id_offset() {
+        let mut reader = ShapefileReader::new(None, "test", &resource("shapefile.zip")).unwrap();
+        reader.set_feature_id_offset(100);
+        let ids: Vec<i64> = reader.read_all().unwrap().iter().map(|f| f.id).collect();
+        assert_eq!((101..=186).collect::<Vec<_>>(), ids);
+    }
+
+    #[test]
+    fn reprojected_polygons_keep_holes() {
+        // rings are classified as shells and holes in the shapefile's own coordinate system
+        let dir = tempfile::tempdir().unwrap();
+        let shp_path = dir.path().join("polys.shp");
+        {
+            let table = shapefile::dbase::TableWriterBuilder::new();
+            let mut writer = shapefile::Writer::from_path(&shp_path, table).unwrap();
+            let ring = |a: f64, b: f64| {
+                vec![
+                    shapefile::Point::new(a, a),
+                    shapefile::Point::new(a, b),
+                    shapefile::Point::new(b, b),
+                    shapefile::Point::new(b, a),
+                    shapefile::Point::new(a, a),
+                ]
+            };
+            let hole: Vec<_> = ring(1000.0, 2000.0).into_iter().rev().collect();
+            let polygon = shapefile::Polygon::with_rings(vec![
+                shapefile::PolygonRing::Outer(ring(0.0, 10000.0)),
+                shapefile::PolygonRing::Inner(hole),
+            ]);
+            writer.write_shape_and_record(&polygon, &shapefile::dbase::Record::default()).unwrap();
+        }
+        let reader = ShapefileReader::new(Some("EPSG:3857"), "test", &shp_path).unwrap();
+        let features = reader.read_all().unwrap();
+        let Geometry::MultiPolygon(mp) = &features[0].geometry else { panic!("{:?}", features[0].geometry) };
+        assert_eq!(1, mp.0.len());
+        assert_eq!(1, mp.0[0].interiors().len());
+        assert!(mp.0[0].exterior().0.iter().all(|c| c.x.abs() < 1.0 && c.y.abs() < 1.0));
     }
 
     #[test]

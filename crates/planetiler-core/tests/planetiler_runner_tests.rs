@@ -616,3 +616,107 @@ fn test_reuse_feature_db() {
     assert_eq!(tiles1, mbtiles_tiles(&mbtiles2));
     assert_eq!(std::fs::read(&mbtiles).unwrap(), std::fs::read(&mbtiles2).unwrap());
 }
+
+/// Runs a profile that collects the IDs of all features from a `shapes` multi-URL shapefile source.
+fn run_shapefile_multi_url_source(
+    temp: &Path,
+    shapes: PathBuf,
+    urls: &[&str],
+    extra_args: &[String],
+) -> anyhow::Result<std::collections::BTreeSet<i64>> {
+    let ids = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let collected = ids.clone();
+    let mut args = vec![tmpdir_arg(temp)];
+    args.extend(extra_args.iter().cloned());
+    let mut planetiler = Planetiler::create(Arguments::from_args(&args))?;
+    planetiler
+        .set_profile(FnProfile(move |source, _features| {
+            collected.lock().unwrap().insert(source.id());
+        }))
+        .add_shapefile_multi_url_source(
+            "shapes",
+            shapes,
+            urls,
+            planetiler_core::reader::shapefile_options::ShapefileOptions::default()
+                .with_lowercase_attribute_names(true),
+        )?
+        .set_output(temp.join("output.mbtiles"))?;
+    planetiler.run()?;
+    let ids = ids.lock().unwrap().clone();
+    Ok(ids)
+}
+
+#[test]
+fn test_shapefile_source_from_several_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let shapes = temp.path().join("shapes");
+    std::fs::create_dir_all(&shapes).unwrap();
+    // each zip holds the same 86 stations, and the second file's ids start after the first file's
+    std::fs::copy(resource("shapefile.zip"), shapes.join("one.zip")).unwrap();
+    std::fs::copy(resource("shapefile.zip"), shapes.join("two.zip")).unwrap();
+    let ids =
+        run_shapefile_multi_url_source(temp.path(), shapes, &["http://host/a/one.zip", "http://host/b/two.zip"], &[])
+            .unwrap();
+    assert_eq!(2 * 86, ids.len());
+}
+
+#[test]
+fn test_shapefile_source_from_several_urls_rejects_single_url_argument() {
+    let temp = tempfile::tempdir().unwrap();
+    let error = run_shapefile_multi_url_source(
+        temp.path(),
+        temp.path().join("shapes"),
+        &["http://host/a/one.zip", "http://host/b/two.zip"],
+        &["--shapes-url=http://host/all.sqlite.zip".to_string()],
+    )
+    .unwrap_err();
+    assert_eq!(
+        "--shapes-url is not supported since shapes reads 2 files, set --shapes-urls (comma separated) or \
+         --shapes-path to a .zip file containing all the shapefiles instead",
+        error.to_string()
+    );
+}
+
+#[test]
+fn test_shapefile_source_from_several_urls_reads_named_shapefiles_from_one_zip() {
+    // natural_earth_shapefiles.zip is laid out like Natural Earth's package, with all 22 tables OpenMapTiles reads in
+    // subdirectories, and only the 2 named like the URLs get read: 1 ocean polygon and 8 urban areas
+    let temp = tempfile::tempdir().unwrap();
+    let zip = resource("natural_earth_shapefiles.zip");
+    let ids = run_shapefile_multi_url_source(
+        temp.path(),
+        temp.path().join("shapes"),
+        &[
+            "https://naciscdn.org/naturalearth/10m/physical/ne_10m_ocean.zip",
+            "https://naciscdn.org/naturalearth/50m/cultural/ne_50m_urban_areas.zip",
+        ],
+        &[format!("--shapes-path={}", zip.display())],
+    )
+    .unwrap();
+    assert_eq!(1 + 8, ids.len());
+}
+
+#[test]
+fn test_shapefile_source_from_several_urls_fails_on_zip_without_those_shapefiles() {
+    let temp = tempfile::tempdir().unwrap();
+    let zip = resource("natural_earth_shapefiles.zip");
+    let error = run_shapefile_multi_url_source(
+        temp.path(),
+        temp.path().join("shapes"),
+        &[
+            "https://naciscdn.org/naturalearth/10m/physical/ne_10m_ocean.zip",
+            "https://naciscdn.org/naturalearth/10m/physical/ne_10m_rivers_lake_centerlines.zip",
+            "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_roads.zip",
+        ],
+        &[format!("--shapes-path={}", zip.display())],
+    )
+    .unwrap_err();
+    assert_eq!(
+        format!(
+            "{} is missing 2 of the 3 shapefiles needed (ne_10m_rivers_lake_centerlines.shp, ne_10m_roads.shp), set \
+             --shapes-path to a directory to download them into, or a .zip file containing them",
+            zip.display()
+        ),
+        error.to_string()
+    );
+}

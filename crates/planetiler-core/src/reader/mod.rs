@@ -4,6 +4,8 @@ pub mod json_conversion;
 pub mod natural_earth_reader;
 pub mod osm;
 pub mod parquet;
+pub mod shapefile_options;
+pub mod shapefile_polygon_handler;
 pub mod shapefile_reader;
 pub mod simple_feature;
 pub mod simple_reader;

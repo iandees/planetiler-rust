@@ -74,6 +74,12 @@ pub trait SimpleReader: Send + Sync {
     /// Name of the source, used in logs and stats.
     fn source_name(&self) -> &str;
 
+    /// Assigns feature IDs in the order they are read starting from `id_offset`, so readers of several files that are
+    /// processed as one source don't produce colliding IDs. Readers that don't assign their own IDs ignore this.
+    fn set_feature_id_offset(&mut self, id_offset: i64) {
+        let _ = id_offset;
+    }
+
     /// Returns the number of features to be read from this reader to use for displaying progress.
     fn feature_count(&self) -> anyhow::Result<u64>;
 
