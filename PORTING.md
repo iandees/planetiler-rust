@@ -523,6 +523,36 @@ tiles.join()?;
   parquet-mr `FilterPredicate` -> `geo_parquet_metadata::FilterPredicate` (numeric compare/and/or/not) used for row
   group pruning via statistics (`can_drop`) and row filtering (`evaluate`); IDs use the same fnv1a hashes as Java.
   `ParquetFeature` implements `WithTags` and `SourceFeature` and has `into_reader_feature()`.
+
+### Downloads and remote range files (upstream #1662, #1665, #1667, #1670, #1675)
+
+- `util::downloader::Downloader` is the Java rewrite: one shared (cheaply `Clone`-able) instance makes every
+  request through a `Transport` (Java overrides `sendOverNetwork`; `UreqTransport` is the real one,
+  `testing::stub_downloader::StubDownloader` serves files from memory), with the global `download_max_requests` and
+  `download_max_bandwidth` limits, `Retry-After` handling (`http_retry_max_wait`) and `download_fail_if_changed`
+  (`If-Match`/`If-Unmodified-Since` preconditions). Full downloads go through `CachedRangeFile`, so they resume and share
+  bytes with `download=cached` runs; servers without range support fall back to one request that restarts.
+  `util::request_planner::RequestPlanner` decides the range requests. `fetch_string`/`open_stream(url, config)` remain as
+  shims that make a short-lived downloader for the code that has no shared one yet (aws/geofabrik/overture/top tiles).
+- `reader::remote`: `RangeFile` (`Arc<dyn RangeFile>`), `LocalRangeFile`, `HttpRangeFile`, `CachedRangeFile`,
+  `DownloadMode`. `Pending::{start, get, ready}` mirror Java; `ready()` is a `worker::Done`. The `.meta` / `.ranges`
+  files have the same format as Java's (the version JSON uses `length`, `etag`, `lastModified`).
+- Java's `CompletableFuture` and virtual threads become `worker::Done` and OS threads (`Downloader::spawn`);
+  `util::completable_futures` has `in_completion_order`, `join_all_or_close` and a `Semaphore`. `CompletableFutures.await`
+  is `Done::wait` and `Exceptions` is anyhow, so neither got a file. Typed failures (`DownloadError`) are found through
+  `downloader::download_error`, which also looks inside `SharedError`.
+- Parquet: `ParquetInputFile::with_range_file` reads through a `RangeFile` via `RangeInputFile` (a parquet `ChunkReader`);
+  each row group is one `read_later` span that `Block::start_fetch_if_necessary` starts, and `ParquetReader` orders
+  blocks with `in_completion_order` (`look_ahead_blocks`) when any file is remote. `ParquetReader::process_remote`
+  opens all files on threads.
+- `Planetiler`: `--download=false|cached|streaming|full` (`true` is `cached`) and per-source `--download-<name>`;
+  `add_parquet_source_from_url(name, path, url)` (Java `addParquetSource(name, path, url)`); Overture sources read with
+  range requests in `cached`/`streaming` mode and list their files for the final map bounds, so `download()` runs in
+  two phases when the bounds come from an `.osm.pbf` that is downloaded (`needs_bounds`). `reuse_featuredb` saves
+  the bounds and OSM header metadata in `<feature.db>.sources` next to the feature DB. `set_downloader` and
+  `set_overture_stac` (`OvertureStac::with_lookup`) are for tests. Invalid `--download-<name>` values are reported when
+  `run()` starts since the `add_*` methods that read them don't return `Result`s.
+
 ### OSM reader notes (`reader::osm::osm_reader`, `osm_phaser`)
 
 How the `Planetiler` orchestrator drives it (Java `Planetiler.addOsmSource`):
