@@ -6,10 +6,11 @@
 //! # use planetiler_core::util::downloader::Downloader;
 //! # use planetiler_core::config::planetiler_config::PlanetilerConfig;
 //! # fn main() -> anyhow::Result<()> {
-//! Downloader::create(PlanetilerConfig::defaults())
+//! let mut downloader = Downloader::create(PlanetilerConfig::defaults());
+//! downloader
 //!     .add("natural_earth", "http://url/of/natural_earth.zip", "natural_earth.zip")?
-//!     .add("osm", "http://url/of/file.osm.pbf", "file.osm.pbf")?
-//!     .run()?;
+//!     .add("osm", "http://url/of/file.osm.pbf", "file.osm.pbf")?;
+//! downloader.run()?;
 //! # Ok(())
 //! # }
 //! ```
@@ -234,12 +235,13 @@ impl RateLimiter {
 }
 
 /// Downloads files to disk in parallel over HTTP.
+#[derive(Clone)]
 pub struct Downloader {
     config: PlanetilerConfig,
     to_download: Vec<Arc<ResourceToDownload>>,
     fetcher: Arc<dyn HttpFetcher>,
     chunk_size_bytes: u64,
-    rate_limiter: Option<RateLimiter>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 fn is_retryable(e: &anyhow::Error) -> bool {
@@ -256,9 +258,11 @@ impl Downloader {
 
     /// Returns a new downloader that uses `fetcher` for HTTP requests, downloading ranges of `chunk_size_bytes`.
     pub fn with_fetcher(config: PlanetilerConfig, chunk_size_bytes: u64, fetcher: Arc<dyn HttpFetcher>) -> Downloader {
-        let rate_limiter = (config.download_max_bandwidth > 0.0).then(|| RateLimiter {
-            bytes_per_second: config.download_max_bandwidth,
-            next_free: Mutex::new(Instant::now()),
+        let rate_limiter = (config.download_max_bandwidth > 0.0).then(|| {
+            Arc::new(RateLimiter {
+                bytes_per_second: config.download_max_bandwidth,
+                next_free: Mutex::new(Instant::now()),
+            })
         });
         Downloader { config, to_download: vec![], fetcher, chunk_size_bytes: chunk_size_bytes.max(1), rate_limiter }
     }
@@ -267,7 +271,7 @@ impl Downloader {
     ///
     /// `url` can also be `aws:<snapshot>`, `overture:<release>` or `geofabrik:<extract name>`, which are resolved to a
     /// download URL immediately.
-    pub fn add(mut self, id: &str, url: &str, output: impl Into<PathBuf>) -> anyhow::Result<Downloader> {
+    pub fn add(&mut self, id: &str, url: &str, output: impl Into<PathBuf>) -> anyhow::Result<&mut Downloader> {
         let url = if let Some(query) = url.strip_prefix("geofabrik:") {
             crate::util::geofabrik::get_download_url(query, &self.config)?
         } else if let Some(query) = url.strip_prefix("aws:") {
@@ -281,10 +285,14 @@ impl Downloader {
         Ok(self)
     }
 
-    /// Downloads all resources in parallel, logging progress until complete. Returns an error after all resources
-    /// finish if any failed.
-    pub fn run(self) -> anyhow::Result<()> {
-        let this = Arc::new(self);
+    /// Downloads all resources added since the last call in parallel, logging progress until complete. Returns an
+    /// error after all resources finish if any failed.
+    pub fn run(&mut self) -> anyhow::Result<()> {
+        if self.to_download.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(&mut self.to_download);
+        let this = Arc::new(Downloader { to_download: batch, ..self.clone() });
         let mut dones = vec![];
         for resource in &this.to_download {
             let done = Done::new();
@@ -771,13 +779,10 @@ mod tests {
         let fetcher = mock(false, true, Box::new(|b| b.to_vec()));
         fetcher.resources.lock().insert("http://a".to_string(), b"aaa".to_vec());
         fetcher.resources.lock().insert("http://b".to_string(), b"bb".to_vec());
-        Downloader::with_fetcher(PlanetilerConfig::defaults(), 2, fetcher)
-            .add("a", "http://a", dir.path().join("a"))
-            .unwrap()
-            .add("b", "http://b", dir.path().join("sub").join("b"))
-            .unwrap()
-            .run()
-            .unwrap();
+        let mut downloader = Downloader::with_fetcher(PlanetilerConfig::defaults(), 2, fetcher);
+        downloader.add("a", "http://a", dir.path().join("a")).unwrap();
+        downloader.add("b", "http://b", dir.path().join("sub").join("b")).unwrap();
+        downloader.run().unwrap();
         assert_eq!("aaa", read(&dir.path().join("a")));
         assert_eq!("bb", read(&dir.path().join("sub").join("b")));
     }

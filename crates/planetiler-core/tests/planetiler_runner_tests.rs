@@ -616,3 +616,42 @@ fn test_reuse_feature_db() {
     assert_eq!(tiles1, mbtiles_tiles(&mbtiles2));
     assert_eq!(std::fs::read(&mbtiles).unwrap(), std::fs::read(&mbtiles2).unwrap());
 }
+
+/// Reusing the feature DB takes the map bounds and OSM header metadata of the run that wrote it, without reading the
+/// `.osm.pbf` again.
+#[test]
+fn test_reuse_feature_db_with_osm_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let tmp_data = temp.path().join("data");
+    let tmpdir = format!("--tmpdir={}", tmp_data.display());
+    let run = |osm: PathBuf, output: &Path| {
+        let mut planetiler = Planetiler::create(Arguments::from_args(&[
+            tmpdir.clone(),
+            "--reuse_featuredb=true".into(),
+            "--force=true".into(),
+        ]))
+        .unwrap();
+        planetiler
+            .set_profile(FnProfile(|source, features| {
+                if source.is_point() && source.has_tag("name") {
+                    features.point("points").set_zoom_range(0, 14).set_attr("name", source.get_tag("name").unwrap());
+                }
+            }))
+            .add_osm_source("osm", osm)
+            .unwrap()
+            .set_output(output)
+            .unwrap();
+        planetiler.run().unwrap();
+    };
+    let first = temp.path().join("output.mbtiles");
+    let second = temp.path().join("output2.mbtiles");
+    run(resource("monaco-latest.osm.pbf"), &first);
+    run(tmp_data.join("missing.osm.pbf"), &second);
+
+    assert!(!mbtiles_tiles(&first).is_empty());
+    let db = Mbtiles::new_read_only_database(&second).unwrap();
+    let metadata = db.metadata_table().get_all();
+    assert!(metadata.contains_key("planetiler:osm:osmosisreplicationseq"), "{metadata:?}");
+    assert!(metadata.contains_key("bounds"), "{metadata:?}");
+    assert_eq!(std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap());
+}
