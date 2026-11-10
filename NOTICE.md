@@ -4,7 +4,7 @@ planetiler-rust is a Rust port of [Planetiler](https://github.com/onthegomap/pla
 Apache License, Version 2.0 (see [LICENSE](LICENSE)).
 
 Planetiler is Copyright 2021 Michael Barry and Planetiler Contributors. This port is derived from Planetiler's source
-code (commit `d88cf89`); see Planetiler's [NOTICE.md](https://github.com/onthegomap/planetiler/blob/main/NOTICE.md)
+code (commit `8a714af`); see Planetiler's [NOTICE.md](https://github.com/onthegomap/planetiler/blob/main/NOTICE.md)
 for the attributions of the code Planetiler itself adapts (imposm3, geojson-vt, java-vector-tile, osmosis, uppend,
 graphhopper, hilbert_curves, OSM-binary, Bazel, ...). Those adapted algorithms are carried over into the
 corresponding Rust files.
