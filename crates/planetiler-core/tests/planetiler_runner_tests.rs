@@ -911,12 +911,16 @@ fn run_shapefile_multi_url_source(
     shapes: PathBuf,
     urls: &[&str],
     extra_args: &[String],
+    downloader: Option<&StubDownloader>,
 ) -> anyhow::Result<std::collections::BTreeSet<i64>> {
     let ids = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
     let collected = ids.clone();
     let mut args = vec![tmpdir_arg(temp)];
     args.extend(extra_args.iter().cloned());
     let mut planetiler = Planetiler::create(Arguments::from_args(&args))?;
+    if let Some(downloader) = downloader {
+        planetiler.set_downloader(downloader.downloader());
+    }
     planetiler
         .set_profile(FnProfile(move |source, _features| {
             collected.lock().unwrap().insert(source.id());
@@ -935,16 +939,26 @@ fn run_shapefile_multi_url_source(
 }
 
 #[test]
-fn test_shapefile_source_from_several_files() {
+fn test_shapefile_source_from_several_urls() {
     let temp = tempfile::tempdir().unwrap();
     let shapes = temp.path().join("shapes");
-    std::fs::create_dir_all(&shapes).unwrap();
+    let urls = ["http://host/a/one.zip", "http://host/b/two.zip"];
+    let zip = std::fs::read(resource("shapefile.zip")).unwrap();
+    let downloader = stub_downloader();
+    for url in urls {
+        downloader.put(url, &zip);
+    }
+    let ids = run_shapefile_multi_url_source(
+        temp.path(),
+        shapes.clone(),
+        &urls,
+        &["--download".to_string()],
+        Some(&downloader),
+    )
+    .unwrap();
+    assert!(shapes.join("one.zip").exists());
+    assert!(shapes.join("two.zip").exists());
     // each zip holds the same 86 stations, and the second file's ids start after the first file's
-    std::fs::copy(resource("shapefile.zip"), shapes.join("one.zip")).unwrap();
-    std::fs::copy(resource("shapefile.zip"), shapes.join("two.zip")).unwrap();
-    let ids =
-        run_shapefile_multi_url_source(temp.path(), shapes, &["http://host/a/one.zip", "http://host/b/two.zip"], &[])
-            .unwrap();
     assert_eq!(2 * 86, ids.len());
 }
 
@@ -956,6 +970,7 @@ fn test_shapefile_source_from_several_urls_rejects_single_url_argument() {
         temp.path().join("shapes"),
         &["http://host/a/one.zip", "http://host/b/two.zip"],
         &["--shapes-url=http://host/all.sqlite.zip".to_string()],
+        None,
     )
     .unwrap_err();
     assert_eq!(
@@ -979,6 +994,7 @@ fn test_shapefile_source_from_several_urls_reads_named_shapefiles_from_one_zip()
             "https://naciscdn.org/naturalearth/50m/cultural/ne_50m_urban_areas.zip",
         ],
         &[format!("--shapes-path={}", zip.display())],
+        None,
     )
     .unwrap();
     assert_eq!(1 + 8, ids.len());
@@ -997,6 +1013,7 @@ fn test_shapefile_source_from_several_urls_fails_on_zip_without_those_shapefiles
             "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_roads.zip",
         ],
         &[format!("--shapes-path={}", zip.display())],
+        None,
     )
     .unwrap_err();
     assert_eq!(
