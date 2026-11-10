@@ -52,7 +52,8 @@ struct Inner {
     post_filter_bounds: Option<Envelope>,
     out_of_bounds: bool,
     count: u64,
-    block_count: usize,
+    /// indexes of the row groups that may contain features in bounds / matching the filter
+    row_groups: Vec<usize>,
     converter: ParquetRecordConverter,
     /// arrow column index of the primary geometry, when it is geoarrow-encoded and decoded straight from arrow
     geoarrow_column: Option<(usize, crate::reader::parquet::geo_arrow::GeoArrowEncoding)>,
@@ -79,6 +80,20 @@ pub fn hash_to_long(value: &Value) -> i64 {
     }
 }
 
+/// True if the file is long enough and ends with the parquet `PAR1` magic number.
+fn is_valid_parquet_file(mut file: &File) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let length = file.metadata()?.len();
+    if length < 8 {
+        return Ok(false);
+    }
+    let mut tail = [0u8; 4];
+    file.seek(SeekFrom::Start(length - 4))?;
+    file.read_exact(&mut tail)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(&tail == b"PAR1")
+}
+
 impl ParquetInputFile {
     /// Opens `path`, reading every feature.
     pub fn new(source: &str, layer: &str, path: &Path) -> Result<ParquetInputFile> {
@@ -97,6 +112,9 @@ impl ParquetInputFile {
         id_generator: Option<IdGenerator>,
     ) -> Result<ParquetInputFile> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        if !is_valid_parquet_file(&file)? {
+            anyhow::bail!("{} is not a valid parquet file", path.display());
+        }
         let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())
             .with_context(|| format!("reading parquet metadata from {}", path.display()))?;
         let parquet_metadata = metadata.metadata().clone();
@@ -125,17 +143,14 @@ impl ParquetInputFile {
                 post_filter_bounds = Some(bounds.lat_lon());
             }
         }
-        let count = if out_of_bounds {
-            0
+        let row_groups: Vec<usize> = if out_of_bounds {
+            vec![]
         } else {
-            parquet_metadata
-                .row_groups()
-                .iter()
-                .filter(|rg| !filter.as_ref().is_some_and(|f| f.can_drop(rg)))
-                .map(|rg| rg.num_rows().max(0) as u64)
-                .sum()
+            (0..parquet_metadata.num_row_groups())
+                .filter(|&i| !filter.as_ref().is_some_and(|f| f.can_drop(parquet_metadata.row_group(i))))
+                .collect()
         };
-        let block_count = if out_of_bounds { 0 } else { parquet_metadata.num_row_groups() };
+        let count = row_groups.iter().map(|&i| parquet_metadata.row_group(i).num_rows().max(0) as u64).sum();
         let geoarrow_column = match geometry_reader.primary_encoding() {
             Some(GeometryEncoding::GeoArrow(e)) => {
                 metadata.schema().index_of(&geometry_reader.geometry_column).ok().map(|i| (i, e))
@@ -171,7 +186,7 @@ impl ParquetInputFile {
                 post_filter_bounds,
                 out_of_bounds,
                 count,
-                block_count,
+                row_groups,
                 converter,
                 geoarrow_column,
                 interval_columns,
@@ -219,17 +234,12 @@ impl ParquetInputFile {
 
     /// Number of blocks (row groups).
     pub fn block_count(&self) -> usize {
-        self.inner.block_count
+        self.inner.row_groups.len()
     }
 
     /// The blocks of this file, which can be read independently.
     pub fn get(&self) -> Vec<Block> {
-        if self.inner.out_of_bounds {
-            return vec![];
-        }
-        (0..self.inner.metadata.metadata().num_row_groups())
-            .map(|index| Block { file: self.inner.clone(), index })
-            .collect()
+        self.inner.row_groups.iter().map(|&index| Block { file: self.inner.clone(), index }).collect()
     }
 }
 
@@ -514,6 +524,49 @@ mod tests {
 
     fn bounds(min_x: f64, max_x: f64, min_y: f64, max_y: f64) -> Bounds {
         Bounds::new(Some(Envelope::new(min_x, max_x, min_y, max_y)))
+    }
+
+    #[test]
+    fn skips_row_groups_outside_bounds() {
+        // boston.parquet has no file-level bbox, so only its row group statistics show whether it is in bounds
+        let path = parquet_resource("boston.parquet");
+        let outside = ParquetInputFile::with_options(
+            "parquet",
+            "layer",
+            &path,
+            None,
+            &bounds(-71.08, -71.075, 42.356, 42.357),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(0, outside.block_count());
+        assert_eq!(0, outside.count());
+        assert!(outside.get().is_empty());
+
+        let inside = ParquetInputFile::with_options(
+            "parquet",
+            "layer",
+            &path,
+            None,
+            &bounds(-71.075, -71.074, 42.356, 42.357),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(1, inside.block_count());
+        assert_eq!(3, inside.count());
+    }
+
+    #[test]
+    fn invalid_parquet_file_error() {
+        let dir = std::env::temp_dir().join(format!("pq-invalid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("water.parquet");
+        std::fs::write(&path, b"this is definitely not a parquet file").unwrap();
+        let err = ParquetInputFile::new("parquet", "layer", &path).err().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(format!("{} is not a valid parquet file", path.display()), err.to_string());
     }
 
     #[test]
