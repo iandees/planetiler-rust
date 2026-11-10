@@ -4,12 +4,13 @@
 //! It's not a full binary search: it keeps track of the first index of each block of 256 keys, so it can do an O(1)
 //! lookup to narrow down the search space to at most 256 values.
 
-use super::append_store::{AppendStore, Longs};
-use super::append_store_ram::AppendStoreRam;
+use super::append_store::Longs;
 use super::long_long_map::{LongLongMap, LongLongMapWriter, MISSING_VALUE, SealOnRead, SequentialWriter};
+use super::sparse_monotonic_long_map::SparseMonotonicLongMap;
 
 struct State {
-    offsets: AppendStoreRam<i64>,
+    // only chunks with keys use memory, so small extracts don't pay for every chunk up to the largest node ID
+    offsets: SparseMonotonicLongMap,
     keys: Box<dyn Longs>,
     values: Box<dyn Longs>,
     last_chunk: i64,
@@ -26,9 +27,7 @@ impl State {
         let idx = self.keys.size() as i64;
         let chunk = key >> 8;
         if chunk != self.last_chunk {
-            while self.offsets.size() as i64 <= chunk {
-                self.offsets.append_long(idx)?;
-            }
+            self.offsets.add(chunk, idx)?;
             self.last_chunk = chunk;
         }
         self.keys.append_long(key)?;
@@ -40,16 +39,16 @@ impl State {
         if key < 0 {
             return MISSING_VALUE;
         }
-        let chunk = (key >> 8) as u64;
-        let num_offsets = self.offsets.size();
-        if chunk >= num_offsets {
+        let chunk = key >> 8;
+        // use the "offsets" index to narrow search space to <256 values: [lo, hi)
+        let lo = self.offsets.get(chunk);
+        if lo < 0 {
             return MISSING_VALUE;
         }
+        let mut lo = lo as u64;
         let keys_size = self.keys.size();
-        // use the "offsets" index to narrow search space to <256 values: [lo, hi)
-        let mut lo = self.offsets.get_long(chunk) as u64;
-        let hi = if chunk >= num_offsets - 1 { keys_size } else { self.offsets.get_long(chunk + 1) as u64 };
-        let mut hi = hi.min(keys_size);
+        let next = self.offsets.next(chunk).unwrap_or(-1);
+        let mut hi = if next < 0 { keys_size } else { (next as u64).min(keys_size) };
         while lo < hi {
             let idx = (lo + hi) >> 1;
             let value = self.keys.get_long(idx);
@@ -74,7 +73,7 @@ impl SortedTableLongLongMap {
     pub fn new(keys: Box<dyn Longs>, values: Box<dyn Longs>) -> SortedTableLongLongMap {
         SortedTableLongLongMap {
             state: SealOnRead::new(State {
-                offsets: AppendStoreRam::new(),
+                offsets: SparseMonotonicLongMap::new(),
                 keys,
                 values,
                 last_chunk: -1,
