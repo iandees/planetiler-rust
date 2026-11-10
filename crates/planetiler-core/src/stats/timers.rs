@@ -50,9 +50,17 @@ pub struct Finishable {
     timer: Timer,
     last: Option<Stage>,
     timers: Timers,
+    /// The log `[stage]` prefix to go back to when this stage stops, if it set one.
+    restore_log_stage: Option<Option<String>>,
 }
 
 impl Finishable {
+    /// Makes [`Finishable::stop`] restore `previous` as the `[stage]` log prefix of this thread.
+    pub(crate) fn restore_log_stage_on_stop(mut self, previous: Option<String>) -> Finishable {
+        self.restore_log_stage = Some(previous);
+        self
+    }
+
     /// Stops the timer and logs how long the stage took, and CPU usage of each worker thread pool in the stage.
     pub fn stop(self) {
         self.timer.stop();
@@ -61,6 +69,11 @@ impl Finishable {
             tracing::info!("  {details}");
         }
         self.timers.inner.lock().current_stage = self.last.clone();
+        match self.restore_log_stage {
+            Some(Some(previous)) => crate::util::log_util::set_stage(&previous),
+            Some(None) => crate::util::log_util::clear_stage(),
+            None => {}
+        }
     }
 
     pub fn elapsed(&self) -> ProcessTime {
@@ -152,7 +165,7 @@ impl Timers {
             tracing::info!("");
             tracing::info!("Starting...");
         }
-        Finishable { name: name.to_string(), timer, last, timers: self.clone() }
+        Finishable { name: name.to_string(), timer, last, timers: self.clone(), restore_log_stage: None }
     }
 
     /// Record that a worker thread with `prefix` finished during the current stage after running for `elapsed`,
