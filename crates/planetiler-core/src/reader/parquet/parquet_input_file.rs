@@ -80,6 +80,20 @@ pub fn hash_to_long(value: &Value) -> i64 {
     }
 }
 
+/// True if the file is long enough and ends with the parquet `PAR1` magic number.
+fn is_valid_parquet_file(mut file: &File) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let length = file.metadata()?.len();
+    if length < 8 {
+        return Ok(false);
+    }
+    let mut tail = [0u8; 4];
+    file.seek(SeekFrom::Start(length - 4))?;
+    file.read_exact(&mut tail)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(&tail == b"PAR1")
+}
+
 impl ParquetInputFile {
     /// Opens `path`, reading every feature.
     pub fn new(source: &str, layer: &str, path: &Path) -> Result<ParquetInputFile> {
@@ -98,6 +112,9 @@ impl ParquetInputFile {
         id_generator: Option<IdGenerator>,
     ) -> Result<ParquetInputFile> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        if !is_valid_parquet_file(&file)? {
+            anyhow::bail!("{} is not a valid parquet file", path.display());
+        }
         let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())
             .with_context(|| format!("reading parquet metadata from {}", path.display()))?;
         let parquet_metadata = metadata.metadata().clone();
@@ -539,6 +556,17 @@ mod tests {
         .unwrap();
         assert_eq!(1, inside.block_count());
         assert_eq!(3, inside.count());
+    }
+
+    #[test]
+    fn invalid_parquet_file_error() {
+        let dir = std::env::temp_dir().join(format!("pq-invalid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("water.parquet");
+        std::fs::write(&path, b"this is definitely not a parquet file").unwrap();
+        let err = ParquetInputFile::new("parquet", "layer", &path).err().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(format!("{} is not a valid parquet file", path.display()), err.to_string());
     }
 
     #[test]
